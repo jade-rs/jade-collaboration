@@ -53,7 +53,11 @@ fn deletion_leaves_a_tombstone_that_still_anchors_inserts() {
     rga.insert(id(1, 1), None, 'a').unwrap();
     rga.insert(id(2, 1), Some(id(1, 1)), 'b').unwrap();
     assert_eq!(rga.delete(id(1, 1)), Ok(true));
-    assert_eq!(rga.delete(id(1, 1)), Ok(false), "deleting twice is idempotent");
+    assert_eq!(
+        rga.delete(id(1, 1)),
+        Ok(false),
+        "deleting twice is idempotent"
+    );
     rga.insert(id(3, 2), Some(id(1, 1)), 'c').unwrap();
     assert_eq!(text(&rga), "cb");
     assert!(rga.contains(id(1, 1)));
@@ -95,7 +99,11 @@ fn rejects_malformed_operations() {
         })
     );
     assert_eq!(rga.delete(id(7, 7)), Err(RgaError::MissingTarget(id(7, 7))));
-    assert_eq!(text(&rga), "a", "failed operations leave the sequence untouched");
+    assert_eq!(
+        text(&rga),
+        "a",
+        "failed operations leave the sequence untouched"
+    );
 }
 
 #[test]
@@ -229,7 +237,9 @@ fn spec_of(log: &[Op]) -> (Vec<spec::Insert<char>>, BTreeSet<Id>) {
     let mut deleted = BTreeSet::new();
     for op in log {
         match op {
-            Op::Insert { id, parent, value } => inserts.push(spec::Insert::new(*id, *parent, *value)),
+            Op::Insert { id, parent, value } => {
+                inserts.push(spec::Insert::new(*id, *parent, *value))
+            }
             Op::Delete { id } => {
                 deleted.insert(*id);
             }

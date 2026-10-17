@@ -23,9 +23,21 @@ fn merge(top: u64, left: u64, bottom: u64, right: u64) -> Merge {
 #[test]
 fn inserts_rows_and_columns_after_an_anchor() {
     let mut g = grid(2, 2);
-    g.apply(&GridOp::InsertRow { id: id(50), after: Some(id(1)) }).unwrap();
-    g.apply(&GridOp::InsertRow { id: id(51), after: None }).unwrap();
-    g.apply(&GridOp::InsertColumn { id: id(150), after: Some(id(102)) }).unwrap();
+    g.apply(&GridOp::InsertRow {
+        id: id(50),
+        after: Some(id(1)),
+    })
+    .unwrap();
+    g.apply(&GridOp::InsertRow {
+        id: id(51),
+        after: None,
+    })
+    .unwrap();
+    g.apply(&GridOp::InsertColumn {
+        id: id(150),
+        after: Some(id(102)),
+    })
+    .unwrap();
     assert_eq!(g.rows(), vec![id(51), id(1), id(50), id(2)]);
     assert_eq!(g.columns(), vec![id(101), id(102), id(150)]);
     assert_eq!(g.row_index(id(50)), Some(2));
@@ -35,7 +47,11 @@ fn inserts_rows_and_columns_after_an_anchor() {
 fn deleted_rows_keep_anchoring_concurrent_inserts() {
     let mut g = grid(3, 1);
     g.apply(&GridOp::DeleteRow { id: id(2) }).unwrap();
-    g.apply(&GridOp::InsertRow { id: id(60), after: Some(id(2)) }).unwrap();
+    g.apply(&GridOp::InsertRow {
+        id: id(60),
+        after: Some(id(2)),
+    })
+    .unwrap();
     assert_eq!(g.rows(), vec![id(1), id(60), id(3)]);
     assert!(g.contains_row(id(2)));
     assert_eq!(g.row_index(id(2)), None);
@@ -44,7 +60,10 @@ fn deleted_rows_keep_anchoring_concurrent_inserts() {
 #[test]
 fn refuses_to_delete_the_last_row_or_column() {
     let mut g = grid(1, 1);
-    assert_eq!(g.apply(&GridOp::DeleteRow { id: id(1) }), Err(GridError::LastRow));
+    assert_eq!(
+        g.apply(&GridOp::DeleteRow { id: id(1) }),
+        Err(GridError::LastRow)
+    );
     assert_eq!(
         g.apply(&GridOp::DeleteColumn { id: id(101) }),
         Err(GridError::LastColumn)
@@ -87,7 +106,10 @@ fn deleting_an_anchor_row_shrinks_the_merge() {
     g.apply(&GridOp::DeleteRow { id: id(1) }).unwrap();
     assert_eq!(g.merges(), &[merge(2, 101, 3, 101)]);
     g.apply(&GridOp::DeleteRow { id: id(3) }).unwrap();
-    assert!(g.merges().is_empty(), "a merge left with one cell disappears");
+    assert!(
+        g.merges().is_empty(),
+        "a merge left with one cell disappears"
+    );
     g.check_invariants().unwrap();
 }
 
@@ -96,10 +118,17 @@ fn unmerge_removes_the_region_at_its_top_left() {
     let mut g = grid(2, 2);
     g.apply(&GridOp::Merge(merge(1, 101, 2, 102))).unwrap();
     assert_eq!(
-        g.apply(&GridOp::Unmerge { top: id(2), left: id(101) }),
+        g.apply(&GridOp::Unmerge {
+            top: id(2),
+            left: id(101)
+        }),
         Err(GridError::NoSuchMerge)
     );
-    g.apply(&GridOp::Unmerge { top: id(1), left: id(101) }).unwrap();
+    g.apply(&GridOp::Unmerge {
+        top: id(1),
+        left: id(101),
+    })
+    .unwrap();
     assert!(g.merges().is_empty());
 }
 
@@ -143,9 +172,16 @@ fn op() -> impl Strategy<Value = GridOp> {
         (col.clone(), prop::option::of(col.clone()))
             .prop_map(|(id, after)| GridOp::InsertColumn { id, after }),
         col.clone().prop_map(|id| GridOp::DeleteColumn { id }),
-        (row.clone(), col.clone(), row.clone(), col.clone()).prop_map(|(top, left, bottom, right)| {
-            GridOp::Merge(Merge { top, left, bottom, right })
-        }),
+        (row.clone(), col.clone(), row.clone(), col.clone()).prop_map(
+            |(top, left, bottom, right)| {
+                GridOp::Merge(Merge {
+                    top,
+                    left,
+                    bottom,
+                    right,
+                })
+            }
+        ),
         (row, col).prop_map(|(top, left)| GridOp::Unmerge { top, left }),
     ]
 }
