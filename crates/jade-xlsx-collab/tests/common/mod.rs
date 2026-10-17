@@ -36,12 +36,18 @@ pub fn assert_agree(model: &XlsxModel, jade: &JadeXlsx, context: &str) {
                 let ours = model.value(sheet.id, *row, *column);
                 let agrees = match ours {
                     None => matches!(view.kind, CellKind::Empty | CellKind::Error),
-                    Some(CellInput::Blank) => view.kind == CellKind::Empty && view.formula.is_none(),
+                    Some(CellInput::Blank) => {
+                        view.kind == CellKind::Empty && view.formula.is_none()
+                    }
                     Some(CellInput::Formula(f)) => view.formula.as_deref() == Some(f.as_str()),
                     Some(CellInput::Number(n)) => view.formula.is_none() && view.number == Some(*n),
-                    Some(CellInput::Text(t)) => view.formula.is_none() && view.text.as_deref() == Some(t.as_str()),
+                    Some(CellInput::Text(t)) => {
+                        view.formula.is_none() && view.text.as_deref() == Some(t.as_str())
+                    }
                     Some(CellInput::Bool(b)) => {
-                        view.formula.is_none() && view.kind == CellKind::Bool && view.number == Some(f64::from(u8::from(*b)))
+                        view.formula.is_none()
+                            && view.kind == CellKind::Bool
+                            && view.number == Some(f64::from(u8::from(*b)))
                     }
                 };
                 assert!(

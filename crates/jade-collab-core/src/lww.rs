@@ -48,6 +48,13 @@ impl<T> LwwRegister<T> {
         self.entry.as_ref().map(|(_, value)| value)
     }
 
+    /// The current value, for a rewrite every replica performs identically
+    /// at the same point of the log (e.g. moving a formula's references when
+    /// rows are inserted). The stamp does not change.
+    pub fn value_mut(&mut self) -> Option<&mut T> {
+        self.entry.as_mut().map(|(_, value)| value)
+    }
+
     pub fn stamp(&self) -> Option<Id> {
         self.entry.as_ref().map(|(stamp, _)| *stamp)
     }

@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d62b7c7f8bb57c29530dd8dcdecb3bf1cdd4a1374cb30c0916dadfce0d704822 # shrinks to steps = [(0, 0, 4458975126523110175)]
+cc 082ae0049c255ffcbe06f97e89f354618aed3c5d35fa86625b78b28b93cf8efe # shrinks to fixture = "grid-operations-workbook.xlsx", choices = [15045565980224605328]
+cc e9967c0c5eac64adeda6ab835eadda8ad09882530d4cf8c25472f8445306e438 # shrinks to steps = [(0, 0, 17642330828499817680)]
+cc 54983056c2357bb4d2cd7b2d487955cff94dc977e56aa5844f17fdaa864affbe # shrinks to fixture = "grid-operations-workbook.xlsx", choices = [6213465882816207372]

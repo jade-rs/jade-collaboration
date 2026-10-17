@@ -75,11 +75,17 @@ fn setting_a_cell_names_it_in_a1() {
 fn an_older_write_changes_nothing() {
     let mut s = blank();
     s.model
-        .apply(&set(&s, 0, 0, id(5), CellInput::Text("new".into())), &ctx(1, 0, Some(1)))
+        .apply(
+            &set(&s, 0, 0, id(5), CellInput::Text("new".into())),
+            &ctx(1, 0, Some(1)),
+        )
         .unwrap();
     let effect = s
         .model
-        .apply(&set(&s, 0, 0, id(2), CellInput::Text("old".into())), &ctx(2, 0, Some(2)))
+        .apply(
+            &set(&s, 0, 0, id(2), CellInput::Text("old".into())),
+            &ctx(2, 0, Some(2)),
+        )
         .unwrap();
     assert_eq!(effect, vec![]);
     assert_eq!(
@@ -91,8 +97,14 @@ fn an_older_write_changes_nothing() {
 #[test]
 fn lanes() {
     let s = blank();
-    assert_eq!(XlsxModel::lane(&set(&s, 0, 0, id(1), CellInput::Number(1.0))), Lane::Convergent);
-    assert_eq!(XlsxModel::lane(&set(&s, 0, 0, id(1), CellInput::Blank)), Lane::Convergent);
+    assert_eq!(
+        XlsxModel::lane(&set(&s, 0, 0, id(1), CellInput::Number(1.0))),
+        Lane::Convergent
+    );
+    assert_eq!(
+        XlsxModel::lane(&set(&s, 0, 0, id(1), CellInput::Blank)),
+        Lane::Convergent
+    );
     assert_eq!(
         XlsxModel::lane(&set(&s, 0, 0, id(1), CellInput::Formula("A2".into()))),
         Lane::Sequenced
@@ -110,7 +122,10 @@ fn lanes() {
 fn inserting_a_row_moves_references_like_jade_does() {
     let mut s = blank();
     s.model
-        .apply(&set(&s, 0, 0, id(1), CellInput::Formula("=A3*2".into())), &ctx(1, 0, Some(1)))
+        .apply(
+            &set(&s, 0, 0, id(1), CellInput::Formula("=A3*2".into())),
+            &ctx(1, 0, Some(1)),
+        )
         .unwrap();
     let effect = s
         .model
@@ -158,7 +173,10 @@ fn a_formula_written_against_an_older_grid_is_rebased() {
     // …while replica 1, still at seq 0, typed a formula pointing at row 3.
     let effect = s
         .model
-        .apply(&set(&s, 0, 0, id(3), CellInput::Formula("A3".into())), &ctx(1, 0, Some(2)))
+        .apply(
+            &set(&s, 0, 0, id(3), CellInput::Formula("A3".into())),
+            &ctx(1, 0, Some(2)),
+        )
         .unwrap();
     assert_eq!(
         effect,
@@ -186,7 +204,10 @@ fn a_formula_is_not_moved_by_its_authors_own_earlier_changes() {
         )
         .unwrap();
     s.model
-        .apply(&set(&s, 0, 0, id(3), CellInput::Formula("A3".into())), &ctx(1, 0, Some(2)))
+        .apply(
+            &set(&s, 0, 0, id(3), CellInput::Formula("A3".into())),
+            &ctx(1, 0, Some(2)),
+        )
         .unwrap();
     assert_eq!(
         s.model.value(s.sheet, s.rows[0], s.columns[0]),
@@ -208,7 +229,10 @@ fn a_value_in_a_deleted_row_is_kept_but_not_shown() {
         .unwrap();
     let effect = s
         .model
-        .apply(&set(&s, 2, 0, id(4), CellInput::Number(1.0)), &ctx(1, 0, Some(2)))
+        .apply(
+            &set(&s, 2, 0, id(4), CellInput::Number(1.0)),
+            &ctx(1, 0, Some(2)),
+        )
         .unwrap();
     assert_eq!(effect, vec![]);
     assert_eq!(s.model.sheets()[0].rows.len(), 3);
@@ -252,7 +276,10 @@ fn unknown_cells_are_refused() {
 fn the_model_round_trips_through_json() {
     let mut s = blank();
     s.model
-        .apply(&set(&s, 1, 1, id(1), CellInput::Text("t".into())), &ctx(1, 0, Some(1)))
+        .apply(
+            &set(&s, 1, 1, id(1), CellInput::Text("t".into())),
+            &ctx(1, 0, Some(1)),
+        )
         .unwrap();
     let json = serde_json::to_string(&s.model).unwrap();
     assert_eq!(serde_json::from_str::<XlsxModel>(&json).unwrap(), s.model);
