@@ -145,7 +145,10 @@ fn resuming_returns_what_was_missed() {
     assert_eq!(resume.missed.len(), 1);
     assert_eq!(resume.missed[0].seq, 2);
     assert!(server.resume(ReplicaId(42), 0).is_err());
-    assert!(server.resume(a, 3).is_err(), "cannot resume from the future");
+    assert!(
+        server.resume(a, 3).is_err(),
+        "cannot resume from the future"
+    );
 }
 
 #[test]

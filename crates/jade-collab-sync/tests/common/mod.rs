@@ -20,9 +20,20 @@ pub struct ToyDoc {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ToyOp {
-    Insert { id: Id, parent: Option<Id>, ch: char },
-    Delete { id: Id },
-    SetCell { row: Id, col: Id, stamp: Id, value: i64 },
+    Insert {
+        id: Id,
+        parent: Option<Id>,
+        ch: char,
+    },
+    Delete {
+        id: Id,
+    },
+    SetCell {
+        row: Id,
+        col: Id,
+        stamp: Id,
+        value: i64,
+    },
     Grid(GridOp),
 }
 
@@ -65,7 +76,9 @@ impl Document for ToyDoc {
     fn apply(&mut self, op: &ToyOp, _ctx: &ApplyContext) -> Result<(), Rejection> {
         match op {
             ToyOp::Insert { id, parent, ch } => {
-                self.text.insert(*id, *parent, *ch).map_err(Rejection::from)?;
+                self.text
+                    .insert(*id, *parent, *ch)
+                    .map_err(Rejection::from)?;
             }
             ToyOp::Delete { id } => {
                 self.text.delete(*id).map_err(Rejection::from)?;

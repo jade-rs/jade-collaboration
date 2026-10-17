@@ -48,10 +48,14 @@ fn local_ops_show_immediately_and_stay_pending_until_acknowledged() {
 #[test]
 fn locally_invalid_ops_are_refused_before_sending() {
     let (_, mut a, _) = pair();
-    let err = a.submit(merge(10, 10)).unwrap_err();
+    let err = a.submit(merge(10, 99)).unwrap_err();
     assert!(!err.message().is_empty());
     assert_eq!(a.pending_len(), 0);
-    assert_eq!(a.next_client_seq(), 1, "a refused op does not use up a sequence number");
+    assert_eq!(
+        a.next_client_seq(),
+        1,
+        "a refused op does not use up a sequence number"
+    );
 }
 
 #[test]
