@@ -192,7 +192,11 @@ impl<D: Document> Replica<D> {
 
         if committed.origin == self.id {
             let pending = self.pending.pop_front().expect("checked above");
-            if !pending.applied {
+            // A convergent op lands the same tentatively and committed. A
+            // sequenced one may not — it may have failed in the view, or its
+            // result may depend on where it was committed — so the view is
+            // rebuilt from the authoritative application.
+            if !pending.applied || D::lane(&committed.op) == Lane::Sequenced {
                 self.rebuild();
             }
             return Ok(ReplicaEvent::Acknowledged {

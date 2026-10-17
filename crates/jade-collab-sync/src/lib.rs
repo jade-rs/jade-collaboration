@@ -85,7 +85,9 @@ pub trait Document: Clone {
 
     /// Applies `op`, or changes nothing and says why not. Must be
     /// deterministic: every replica applying the same operation to the same
-    /// state gets the same state.
+    /// state gets the same state. A convergent operation must also commute
+    /// with every other operation and must not depend on `ctx.seq` (it is
+    /// applied tentatively and never re-applied); a sequenced one may.
     fn apply(&mut self, op: &Self::Op, ctx: &ApplyContext) -> Result<Self::Effect, Rejection>;
 
     /// The greatest Lamport time of any identifier in the document, so a

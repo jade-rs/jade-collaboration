@@ -16,6 +16,10 @@ pub struct ToyDoc {
     pub text: Rga<char>,
     pub grid: Grid,
     pub cells: BTreeMap<(Id, Id), LwwRegister<i64>>,
+    /// The log position each grid op was applied at (`None` while
+    /// tentative) — state that depends on the apply context, like the xlsx
+    /// model's structure log.
+    pub grid_log: Vec<Option<u64>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -50,6 +54,7 @@ impl ToyDoc {
             text,
             grid: Grid::new([origin(10), origin(11)], [origin(20), origin(21)]),
             cells: BTreeMap::new(),
+            grid_log: Vec::new(),
         }
     }
 
@@ -73,7 +78,7 @@ impl Document for ToyDoc {
         }
     }
 
-    fn apply(&mut self, op: &ToyOp, _ctx: &ApplyContext) -> Result<(), Rejection> {
+    fn apply(&mut self, op: &ToyOp, ctx: &ApplyContext) -> Result<(), Rejection> {
         match op {
             ToyOp::Insert { id, parent, ch } => {
                 self.text
@@ -97,7 +102,10 @@ impl Document for ToyDoc {
                     .or_default()
                     .apply(*stamp, *value);
             }
-            ToyOp::Grid(op) => self.grid.apply(op).map_err(Rejection::from)?,
+            ToyOp::Grid(op) => {
+                self.grid.apply(op).map_err(Rejection::from)?;
+                self.grid_log.push(ctx.seq);
+            }
         }
         Ok(())
     }
