@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use jade_collab_core::id::ReplicaId;
 
 use crate::protocol::{Committed, Downstream, Rejected, Resume, Submission, Welcome};
-use crate::{ApplyContext, Document, Materializer, NoMaterializer, Rejection, SyncError};
+use crate::{ApplyContext, Document, Lane, Materializer, NoMaterializer, Rejection, SyncError};
 
 /// The server core for one document: a single totally ordered log.
 ///
@@ -143,7 +143,11 @@ impl<D: Document, M: Materializer<D>> Sequencer<D, M> {
             base_seq: submission.base_seq,
             seq: Some(seq),
         };
-        match self.document.apply(&submission.op, &ctx) {
+        let admitted = match D::lane(&submission.op) {
+            Lane::Sequenced => self.materializer.admit(&self.document, &submission.op),
+            Lane::Convergent => Ok(()),
+        };
+        match admitted.and_then(|()| self.document.apply(&submission.op, &ctx)) {
             Ok(effect) => {
                 if let Err(fault) = self.materializer.materialize(&self.document, effect, &ctx) {
                     self.faults.push(format!("seq {seq}: {fault}"));

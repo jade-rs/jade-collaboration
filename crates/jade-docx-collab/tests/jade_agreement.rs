@@ -6,7 +6,7 @@ mod common;
 
 use common::{generate, jade_core, open};
 use jade_collab_core::id::{Id, ReplicaId};
-use jade_collab_sync::{ApplyContext, Document, Materializer};
+use jade_collab_sync::{ApplyContext, Document, Lane, Materializer};
 use jade_docx_collab::{DocxModel, JadeDocx};
 use proptest::prelude::*;
 
@@ -119,6 +119,10 @@ proptest! {
             };
             let Some(op) = generate(&model, choice, &mut ids) else { continue };
             let ctx = ApplyContext { origin: ReplicaId(1), base_seq: 0, seq: Some(step as u64 + 1) };
+            // As the sequencer does: jade may refuse a sequenced op first.
+            if DocxModel::lane(&op) == Lane::Sequenced && jade.admit(&model, &op).is_err() {
+                continue;
+            }
             let before = model.clone();
             match model.apply(&op, &ctx) {
                 Ok(effect) => {
@@ -133,4 +137,121 @@ proptest! {
         let reloaded = JadeDocx::load(&jade.export().unwrap()).unwrap();
         prop_assert_eq!(reloaded.body_paragraph_texts(), model.paragraph_texts());
     }
+}
+
+/// Table structure end to end in jade: a new table, rows and columns in and
+/// out, text in a cell, and the table gone again.
+#[test]
+fn table_structure_is_realised_in_jade() {
+    use jade_collab_core::grid::GridOp;
+    use jade_docx_collab::{Anchor, DocxOp, StoryId};
+
+    let (mut model, mut jade) = open("jade-core/hello.docx");
+    let mut seq = 0;
+    let mut next = 1_000_000u64;
+    let mut id = || {
+        next += 1;
+        Id::new(next, ReplicaId(1))
+    };
+    let mut step = |model: &mut DocxModel, jade: &mut JadeDocx, op: DocxOp| {
+        seq += 1;
+        let ctx = ApplyContext {
+            origin: ReplicaId(1),
+            base_seq: 0,
+            seq: Some(seq),
+        };
+        jade.admit(model, &op).unwrap();
+        let effect = model
+            .apply(&op, &ctx)
+            .unwrap_or_else(|e| panic!("{op:?}: {e}"));
+        jade.materialize(model, effect, &ctx)
+            .unwrap_or_else(|e| panic!("{op:?}: {e}"));
+        assert_agree(model, jade, &format!("after {op:?}"));
+    };
+
+    // hello.docx may be a single paragraph: make a mark to anchor after.
+    let end = model.paragraphs()[0].chars.last().copied();
+    let mark = id();
+    step(
+        &mut model,
+        &mut jade,
+        DocxOp::SplitParagraph {
+            story: StoryId::Body,
+            parent: end,
+            id: mark,
+        },
+    );
+    let (table, r1, r2, c1, c2) = (id(), id(), id(), id(), id());
+    step(
+        &mut model,
+        &mut jade,
+        DocxOp::InsertTable {
+            anchor: Anchor::After(mark),
+            id: table,
+            rows: vec![r1, r2],
+            columns: vec![c1, c2],
+        },
+    );
+    let r3 = id();
+    step(
+        &mut model,
+        &mut jade,
+        DocxOp::Table {
+            table,
+            op: GridOp::InsertRow {
+                id: r3,
+                after: Some(r1),
+            },
+        },
+    );
+    let c3 = id();
+    step(
+        &mut model,
+        &mut jade,
+        DocxOp::Table {
+            table,
+            op: GridOp::InsertColumn {
+                id: c3,
+                after: None,
+            },
+        },
+    );
+    let first = id();
+    step(
+        &mut model,
+        &mut jade,
+        DocxOp::InsertText {
+            story: StoryId::Cell {
+                table,
+                row: r3,
+                column: c2,
+            },
+            parent: None,
+            first,
+            text: "cell".into(),
+        },
+    );
+    assert_eq!(model.tables()[0].rows.len(), 3);
+    assert_eq!(model.tables()[0].columns.len(), 3);
+    step(
+        &mut model,
+        &mut jade,
+        DocxOp::Table {
+            table,
+            op: GridOp::DeleteRow { id: r1 },
+        },
+    );
+    step(
+        &mut model,
+        &mut jade,
+        DocxOp::Table {
+            table,
+            op: GridOp::DeleteColumn { id: c1 },
+        },
+    );
+    assert!(model.paragraph_texts().contains(&"cell".to_string()));
+    step(&mut model, &mut jade, DocxOp::DeleteTable { table });
+    assert!(model.tables().is_empty());
+    let reloaded = JadeDocx::load(&jade.export().unwrap()).unwrap();
+    assert_eq!(reloaded.body_paragraph_texts(), model.paragraph_texts());
 }

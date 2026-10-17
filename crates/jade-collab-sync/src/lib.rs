@@ -97,6 +97,14 @@ pub trait Document: Clone {
 /// document. Called once per committed operation, in log order, with the
 /// model as it is right after the operation.
 pub trait Materializer<D: Document> {
+    /// Called before a *sequenced* operation is applied, with the model as it
+    /// is before it: the real document may refuse what the model would accept
+    /// (the rejection goes back to the origin like any other). Never called
+    /// for convergent operations, which must commit wherever they land.
+    fn admit(&self, _document: &D, _op: &D::Op) -> Result<(), Rejection> {
+        Ok(())
+    }
+
     fn materialize(
         &mut self,
         document: &D,

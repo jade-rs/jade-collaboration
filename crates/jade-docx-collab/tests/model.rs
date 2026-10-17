@@ -28,7 +28,10 @@ fn builds_paragraphs_from_text() {
     assert_eq!(texts(&model), ["Hello", "", "world"]);
     let paragraphs = model.paragraphs();
     assert!(paragraphs[0].mark.is_some());
-    assert!(paragraphs[2].mark.is_none(), "the last paragraph has no mark atom");
+    assert!(
+        paragraphs[2].mark.is_none(),
+        "the last paragraph has no mark atom"
+    );
     assert!(model.max_lamport() > 0);
 }
 
@@ -89,15 +92,33 @@ fn deleting_reports_ranges_from_the_end() {
     let p = model.paragraphs();
     let ids = vec![p[0].chars[1], p[0].chars[2], p[0].chars[4], p[1].chars[0]];
     let effect = model
-        .apply(&DocxOp::DeleteText { story: StoryId::Body, ids }, &ctx())
+        .apply(
+            &DocxOp::DeleteText {
+                story: StoryId::Body,
+                ids,
+            },
+            &ctx(),
+        )
         .unwrap();
     assert_eq!(texts(&model), ["adf", "h"]);
     assert_eq!(
         effect,
         vec![
-            DocxEffect::DeleteRange { paragraph: 1, start: 0, end: 1 },
-            DocxEffect::DeleteRange { paragraph: 0, start: 4, end: 5 },
-            DocxEffect::DeleteRange { paragraph: 0, start: 1, end: 3 },
+            DocxEffect::DeleteRange {
+                paragraph: 1,
+                start: 0,
+                end: 1
+            },
+            DocxEffect::DeleteRange {
+                paragraph: 0,
+                start: 4,
+                end: 5
+            },
+            DocxEffect::DeleteRange {
+                paragraph: 0,
+                start: 1,
+                end: 3
+            },
         ]
     );
 }
@@ -145,7 +166,13 @@ fn split_and_join() {
         )
         .unwrap();
     assert_eq!(texts(&model), ["Hello ", "world"]);
-    assert_eq!(effect, vec![DocxEffect::SplitParagraph { paragraph: 0, offset: 6 }]);
+    assert_eq!(
+        effect,
+        vec![DocxEffect::SplitParagraph {
+            paragraph: 0,
+            offset: 6
+        }]
+    );
 
     let effect = model
         .apply(
@@ -157,18 +184,33 @@ fn split_and_join() {
         )
         .unwrap();
     assert_eq!(texts(&model), ["Hello world"]);
-    assert_eq!(effect, vec![DocxEffect::JoinParagraph { paragraph: 0, offset: 6 }]);
+    assert_eq!(
+        effect,
+        vec![DocxEffect::JoinParagraph {
+            paragraph: 0,
+            offset: 6
+        }]
+    );
 }
 
 #[test]
 fn lanes() {
     let story = StoryId::Body;
     assert_eq!(
-        DocxModel::lane(&DocxOp::InsertText { story, parent: None, first: id(1), text: "a".into() }),
+        DocxModel::lane(&DocxOp::InsertText {
+            story,
+            parent: None,
+            first: id(1),
+            text: "a".into()
+        }),
         Lane::Convergent
     );
     assert_eq!(
-        DocxModel::lane(&DocxOp::SplitParagraph { story, parent: None, id: id(1) }),
+        DocxModel::lane(&DocxOp::SplitParagraph {
+            story,
+            parent: None,
+            id: id(1)
+        }),
         Lane::Convergent
     );
     assert_eq!(
@@ -283,7 +325,13 @@ fn table_rows_map_to_jade_indices() {
             &ctx(),
         )
         .unwrap();
-    assert_eq!(effect, vec![DocxEffect::DeleteTableColumn { table: 0, column: 0 }]);
+    assert_eq!(
+        effect,
+        vec![DocxEffect::DeleteTableColumn {
+            table: 0,
+            column: 0
+        }]
+    );
     assert_eq!(texts(&model), ["before", "", "", "", "after"]);
 }
 

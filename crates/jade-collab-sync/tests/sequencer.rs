@@ -168,3 +168,52 @@ fn every_outcome_has_a_downstream_message() {
     let back: Downstream<ToyOp> = serde_json::from_str(&json).unwrap();
     assert_eq!(back, message);
 }
+
+/// A materializer that refuses every merge — standing in for a real document
+/// that cannot realise something the model would accept.
+struct NoMerges;
+
+impl jade_collab_sync::Materializer<ToyDoc> for NoMerges {
+    fn admit(&self, _: &ToyDoc, op: &ToyOp) -> Result<(), jade_collab_sync::Rejection> {
+        match op {
+            ToyOp::Grid(GridOp::Merge(_)) => {
+                Err(jade_collab_sync::Rejection::new("no merges here"))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn materialize(
+        &mut self,
+        _: &ToyDoc,
+        _: (),
+        _: &jade_collab_sync::ApplyContext,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[test]
+fn the_materializer_can_refuse_sequenced_ops_before_they_apply() {
+    let mut server = Sequencer::with_materializer(ToyDoc::sample(), NoMerges);
+    let a = server.join().replica;
+    let outcome = server.submit(
+        a,
+        Submission {
+            client_seq: 1,
+            base_seq: 0,
+            op: ToyOp::Grid(GridOp::Merge(Merge {
+                top: origin(10),
+                left: origin(20),
+                bottom: origin(11),
+                right: origin(20),
+            })),
+        },
+    );
+    let SubmitOutcome::Rejected(rejected) = outcome else {
+        panic!("expected a rejection, got {outcome:?}");
+    };
+    assert_eq!(rejected.reason.message(), "no merges here");
+    assert!(server.document().grid.merges().is_empty());
+    assert_eq!(server.seq(), 0);
+}

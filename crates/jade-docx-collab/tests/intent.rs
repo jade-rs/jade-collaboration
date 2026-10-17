@@ -7,7 +7,9 @@ use jade_collab_core::id::{Id, ReplicaId};
 use jade_collab_sync::{ApplyContext, Document, Lane};
 use jade_docx_collab::intent::{lane_for_command, resolve, IntentError, IntentOp};
 use jade_docx_collab::{DocxModel, DocxOp};
-use jade_docx_headless_api::{HeadlessCommand, HeadlessDeleteDirection, HeadlessTableCellSelection};
+use jade_docx_headless_api::{
+    HeadlessCommand, HeadlessDeleteDirection, HeadlessTableCellSelection,
+};
 
 fn ids() -> impl FnMut(u64) -> Id {
     let mut next = 1_000u64;
@@ -19,14 +21,22 @@ fn ids() -> impl FnMut(u64) -> Id {
 }
 
 fn run(model: &mut DocxModel, op: IntentOp) -> Result<Vec<DocxOp>, IntentError> {
-    let ops = resolve(model, &op, &mut ids())?;
+    // Like a replica's clock: always ahead of everything in the view.
+    let mut next = model.max_lamport() + 1;
+    let ops = resolve(model, &op, &mut |n| {
+        let id = Id::new(next, ReplicaId(7));
+        next += n;
+        id
+    })?;
     let ctx = ApplyContext {
         origin: ReplicaId(7),
         base_seq: 0,
         seq: None,
     };
     for op in &ops {
-        model.apply(op, &ctx).expect("resolved ops apply to the view they came from");
+        model
+            .apply(op, &ctx)
+            .expect("resolved ops apply to the view they came from");
     }
     Ok(ops)
 }
@@ -83,7 +93,11 @@ fn rejects_offsets_inside_a_character_or_past_the_end() {
     assert!(matches!(
         resolve(
             &model,
-            &IntentOp::InsertText { paragraph: 3, offset: 0, text: "x".into() },
+            &IntentOp::InsertText {
+                paragraph: 3,
+                offset: 0,
+                text: "x".into()
+            },
             &mut ids()
         ),
         Err(IntentError::NoSuchParagraph(3))
@@ -182,8 +196,17 @@ fn intent_ops_use_the_prototype_wire_format() {
             count: 2
         }
     );
-    let op: IntentOp = serde_json::from_str(r#"{"type":"insert_paragraph_break","paragraph":1,"offset":0}"#).unwrap();
-    assert_eq!(op, IntentOp::InsertParagraphBreak { paragraph: 1, offset: 0, count: 1 });
+    let op: IntentOp =
+        serde_json::from_str(r#"{"type":"insert_paragraph_break","paragraph":1,"offset":0}"#)
+            .unwrap();
+    assert_eq!(
+        op,
+        IntentOp::InsertParagraphBreak {
+            paragraph: 1,
+            offset: 0,
+            count: 1
+        }
+    );
 }
 
 #[test]
@@ -220,5 +243,12 @@ fn headless_commands_project_into_intents_or_name_their_lane() {
         value: true,
     };
     assert_eq!(lane_for_command(&bold), Lane::Sequenced);
-    assert_eq!(lane_for_command(&HeadlessCommand::InsertText { paragraph: 0, offset: 0, text: "a".into() }), Lane::Convergent);
+    assert_eq!(
+        lane_for_command(&HeadlessCommand::InsertText {
+            paragraph: 0,
+            offset: 0,
+            text: "a".into()
+        }),
+        Lane::Convergent
+    );
 }

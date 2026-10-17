@@ -13,8 +13,9 @@ pub fn jade_core() -> PathBuf {
 
 pub fn fixture(name: &str) -> Vec<u8> {
     let root = jade_core();
-    let path = if name.contains('/') {
-        root.join(name)
+    // "jade-core/x.docx" is at the submodule root; bare names are fixtures.
+    let path = if let Some(rest) = name.strip_prefix("jade-core/") {
+        root.join(rest)
     } else {
         root.join("public/fixtures").join(name)
     };
@@ -60,9 +61,17 @@ pub fn generate(view: &DocxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
             if atoms.is_empty() {
                 return None;
             }
+            // Up to four characters, `stride` apart: a stride over 1 deletes
+            // several separate ranges in one operation.
             let start = pick(atoms.len(), 16);
-            let len = 1 + pick(3, 24);
-            let ids: Vec<Id> = atoms[start..(start + len).min(atoms.len())].to_vec();
+            let len = 1 + pick(4, 24);
+            let stride = 1 + pick(3, 28);
+            let ids: Vec<Id> = atoms[start..]
+                .iter()
+                .step_by(stride)
+                .take(len)
+                .copied()
+                .collect();
             Some(DocxOp::DeleteText {
                 story: paragraphs[p].story,
                 ids,
