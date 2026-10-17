@@ -13,14 +13,22 @@ use jade_docx_collab::{Anchor, DocxModel, DocxOp, JadeDocx, StoryId};
 use jade_xlsx_collab::{CellInput, JadeXlsx, XlsxModel, XlsxOp};
 
 fn fixture(path: &str) -> Vec<u8> {
-    std::fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../jade-core").join(path)).unwrap()
+    std::fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../jade-core")
+            .join(path),
+    )
+    .unwrap()
 }
 
 async fn start() -> (Server, String) {
     let server = Server::new();
     server.open("hello.docx", fixture("hello.docx")).unwrap();
     server
-        .open("book.xlsx", fixture("public/fixtures/grid-operations-workbook.xlsx"))
+        .open(
+            "book.xlsx",
+            fixture("public/fixtures/grid-operations-workbook.xlsx"),
+        )
         .unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -49,6 +57,7 @@ async fn a_person_and_an_agent_edit_a_docx_together() {
     let agent: Client<DocxModel> = Client::connect(&url).await.unwrap();
     assert_ne!(person.id(), agent.id());
     assert_eq!(person.view(), agent.view());
+    let original = person.view().paragraphs()[0].text.clone();
 
     // The person types at the end of the first paragraph, one key at a time.
     for ch in [" ", "w", "o", "r", "l", "d"] {
@@ -104,9 +113,18 @@ async fn a_person_and_an_agent_edit_a_docx_together() {
 
     let view = person.view();
     assert_eq!(view, agent.view());
-    let first_paragraph = &view.paragraphs()[0].text;
-    assert!(first_paragraph.starts_with("[AI] "), "{first_paragraph}");
-    assert!(first_paragraph.ends_with(" world"), "{first_paragraph}");
+    // Both edits survive. The person's " world" and the agent's paragraph
+    // break went in at the same place concurrently; which comes first is
+    // decided by their ids, identically everywhere.
+    let texts = view.paragraph_texts();
+    assert!(
+        texts[0].starts_with(&format!("[AI] {original}")),
+        "{texts:?}"
+    );
+    assert!(
+        texts.concat().contains(&format!("{original} world")),
+        "{texts:?}"
+    );
     assert_eq!(view.tables().len(), 1);
 
     // The file the server writes is the document both of them see.
@@ -134,7 +152,15 @@ async fn a_rejected_structural_edit_comes_back_to_its_author() {
     a.settle().await.unwrap();
     catch_up(&server, "hello.docx", &b).await;
 
-    // Concurrently: A puts a table after the paragraph, B joins it with the next.
+    // B goes offline and joins the paragraph with the next one…
+    let mut offline = b.disconnect().await;
+    offline
+        .submit(DocxOp::JoinParagraph {
+            story: StoryId::Body,
+            mark,
+        })
+        .unwrap();
+    // …while A puts a table right after that paragraph.
     let first = a.reserve(3);
     a.submit(DocxOp::InsertTable {
         anchor: Anchor::After(mark),
@@ -144,17 +170,17 @@ async fn a_rejected_structural_edit_comes_back_to_its_author() {
     })
     .unwrap();
     a.settle().await.unwrap();
-    b.submit(DocxOp::JoinParagraph {
-        story: StoryId::Body,
-        mark,
-    })
-    .unwrap();
+
+    // Back online, B's join reaches the server after the table: refused.
+    let b: Client<DocxModel> = Client::resume(&url, offline).await.unwrap();
     b.settle().await.unwrap();
-    let rejected = b
-        .take_events()
-        .into_iter()
-        .any(|e| matches!(e, ReplicaEvent::Rejected { .. }));
-    assert!(rejected, "the join is refused once the table is there");
+    let events = b.take_events();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, ReplicaEvent::Rejected { .. })),
+        "{events:?}"
+    );
     catch_up(&server, "hello.docx", &a).await;
     catch_up(&server, "hello.docx", &b).await;
     assert_eq!(a.view(), b.view());
@@ -225,7 +251,10 @@ async fn spreadsheet_cells_and_rows_converge() {
     let sheet_view = &view.sheets()[0];
     let r = sheet_view.rows.iter().position(|r| *r == row7).unwrap();
     let exported = JadeXlsx::open(&server.export("book.xlsx").await.unwrap()).unwrap();
-    let cell = exported.workbook().cell("Operations", &format!("D{}", r + 1)).unwrap();
+    let cell = exported
+        .workbook()
+        .cell("Operations", &format!("D{}", r + 1))
+        .unwrap();
     assert_eq!(cell.formula.map(CellInput::Formula), formula);
     assert!(server.faults("book.xlsx").await.unwrap().is_empty());
 }
@@ -257,6 +286,7 @@ async fn a_client_that_drops_resumes_where_it_left_off() {
 #[tokio::test(flavor = "multi_thread")]
 async fn unknown_documents_are_refused() {
     let (_server, base) = start().await;
-    let result: Result<Client<DocxModel>, _> = Client::connect(&format!("{base}/missing.docx/ws")).await;
+    let result: Result<Client<DocxModel>, _> =
+        Client::connect(&format!("{base}/missing.docx/ws")).await;
     assert!(result.is_err());
 }

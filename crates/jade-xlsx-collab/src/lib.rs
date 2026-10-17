@@ -8,6 +8,7 @@
 //! through the changes its author had not seen — the same function, applied
 //! in log order on every replica.
 
+pub mod intent;
 mod jade;
 mod model;
 
