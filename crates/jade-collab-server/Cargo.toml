@@ -1,0 +1,26 @@
+[package]
+name = "jade-collab-server"
+description = "WebSocket collaboration server and client for jade documents, and the jade-collab CLI"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+
+[[bin]]
+name = "jade-collab"
+path = "src/main.rs"
+
+[dependencies]
+jade-collab-core = { path = "../jade-collab-core" }
+jade-collab-sync = { path = "../jade-collab-sync" }
+jade-docx-collab = { path = "../jade-docx-collab" }
+jade-xlsx-collab = { path = "../jade-xlsx-collab" }
+axum = { version = "0.8", features = ["ws"] }
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time", "signal"] }
+tokio-tungstenite = "0.27"
+
+[dev-dependencies]
