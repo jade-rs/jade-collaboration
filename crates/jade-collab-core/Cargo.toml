@@ -1,0 +1,13 @@
+[package]
+name = "jade-collab-core"
+description = "Format-neutral collaboration primitives: identifiers, Lamport clocks, RGA sequences, LWW registers and table grids"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+serde_json.workspace = true

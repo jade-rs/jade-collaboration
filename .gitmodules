@@ -1,0 +1,3 @@
+[submodule "jade-core"]
+	path = jade-core
+	url = https://github.com/jade-rs/jade-core.git
