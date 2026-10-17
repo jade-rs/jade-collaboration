@@ -2,6 +2,7 @@
 members = [
   "crates/jade-collab-core",
   "crates/jade-collab-sync",
+  "crates/jade-docx-collab",
 ]
 # The engine is a submodule with its own workspace; its crates are used as
 # path dependencies.

@@ -1,0 +1,19 @@
+[package]
+name = "jade-docx-collab"
+description = "Collaborative DOCX model: identifier-addressed operations over jade's WordDocument"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+
+[dependencies]
+jade-collab-core = { path = "../jade-collab-core" }
+jade-collab-sync = { path = "../jade-collab-sync" }
+jade-docx-document-core = { path = "../../jade-core/crates/jade-docx-document-core" }
+jade-docx-headless-api = { path = "../../jade-core/crates/jade-docx-headless-api" }
+futures = "0.3"
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+serde_json.workspace = true
