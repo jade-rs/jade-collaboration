@@ -141,11 +141,27 @@ non-overlapping) is checked by the sequencer for every structural operation.
 ### Spreadsheets (`jade-xlsx-collab`)
 
 Sheets have row and column identifier lists (sequenced lane) and cells are
-last-writer-wins registers keyed by `(RowId, ColId)` (convergent lane).
-Formulas are sequenced: the server rejects a formula whose `base_seq` predates
-a structural change of its sheet, since its A1 references were written against
-another grid. (Next step: store formulas with identifier references and print
-them back to A1 at materialization.)
+last-writer-wins registers keyed by `(RowId, ColId)` (convergent lane; empty
+text is normalised to a blank cell, as Excel does).
+
+Formulas are the one place where index-addressed content survives: `=A5`
+names a row by position. They travel the sequenced lane and are kept in step
+with jade by reusing jade's own reference shifter
+(`jade_xlsx_reader::shift_formula`) rather than re-implementing it:
+
+* every structural change moves the references of every formula in the
+  model, exactly as jade moves them in the file;
+* a formula whose author had not seen some structural changes (committed
+  after its `base_seq` by other replicas) is moved through those changes, in
+  log order, before it is stored. The server and every replica do the same
+  thing at the same log position, so the result is deterministic — this is
+  the only transformation in the system, and it is jade's.
+
+Excel tables (ListObjects) rewrite what is typed into their header and totals
+rows (a blank header becomes `Column1`) and name or fill new rows and columns
+inserted inside them. The model cannot predict that, so those cells are
+read-only and structure inside a table is refused — on every replica, from
+state loaded with the file, so the refusal never needs the server.
 
 ## 5. Materialization into jade
 
@@ -159,6 +175,29 @@ test checks the two agree on real fixtures.
 Clients do not need jade: an AI agent, a CLI or a test works on the model. A
 jade editor client additionally applies the same effects to its local
 `WordDocument`.
+
+The real document can know things the model does not. A `Materializer` may
+therefore **refuse a sequenced operation before it is applied**
+(`Materializer::admit`); the rejection travels back like any other. jade, for
+instance, lists a text box's or a note's paragraphs between two body
+paragraphs, and a range across them would delete those paragraphs, so the
+docx materializer refuses to join paragraphs across them. `admit` is never
+consulted for convergent operations — they must commit wherever they land.
+
+Tables are matched to jade's `table_order_index` by identity: the model knows
+the body's table structure (nested tables included), jade's order also counts
+tables inside text boxes, and the materializer pairs the two by walking
+jade's parsed body.
+
+### Replica rules learnt from the property tests
+
+* A remote convergent operation is applied straight to the optimistic view.
+* A remote sequenced operation rebuilds the view (`confirmed` + pending).
+* The acknowledgement of an **own sequenced** operation also rebuilds the
+  view: its committed result can depend on where it was committed (the xlsx
+  structure log records the log position), so the tentative result is
+  replaced by the authoritative one. A convergent operation must therefore
+  never depend on its log position.
 
 ## 6. Components
 
@@ -188,10 +227,27 @@ Tests are written first. Three layers:
 3. **Example tests** — protocol edge cases, real fixtures through jade, and an
    end-to-end WebSocket session with a human-like and an agent-like client.
 
-## 8. Out of scope for the first milestone
+## 8. Status and next steps
 
-Rich-text formatting as a convergent mark CRDT (Peritext-style; for now
-formatting commands are sequenced and addressed by character identifiers),
-docx merged cells, nested tables, text boxes and notes, comments and tracked
-changes, persistence beyond export, authentication, presence/cursors, history
-compaction, and `.pptx`.
+Working: the two-lane protocol over WebSockets; docx text, paragraph
+split/join, table insertion/deletion and row/column structure on simple
+tables, text in any table cell; xlsx values, formulas (with rebasing), and
+row/column structure; index/A1-addressed intent APIs for people and agents;
+the `jade-collab` CLI; resume after a disconnect.
+
+Not yet:
+
+* Formatting (bold, styles, …) — planned as sequenced operations addressed
+  by character ids, then a Peritext-style mark CRDT for the convergent lane.
+* docx merged cells and structure of merged/ragged/nested tables (their
+  text is editable; the model already validates merges in `Grid`), text
+  boxes, notes, comments, tracked changes.
+* xlsx merges, sheets added/renamed, Excel table structure.
+* An MCP server so agents join as replicas without a shell.
+* Persistence of the log (today: export on demand, `--save` on exit),
+  snapshots and log compaction, authentication and authorization, presence.
+* Performance: RGA lookups are linear and paragraph positions are recomputed
+  by walking the model on each operation; jade's xlsx editor rereads the
+  workbook on every write. Fine for the first milestone, not for large
+  documents.
+* `.pptx`.
