@@ -1,4 +1,5 @@
 import JadeCollab.Rga
+import JadeCollab.RgaWalk
 import JadeCollab.Lww
 import JadeCollab.Sequencer
 import JadeCollab.Reconcile
