@@ -43,7 +43,9 @@ pub fn masked(theirs: &FormatChange, ours: &FormatChange) -> FormatChange {
         vertical,
         wrap_text,
     } = ours;
-    let keep = |named: bool, value: &Option<_>| if named { value.clone() } else { None };
+    fn keep<T: Clone>(named: bool, value: &Option<T>) -> Option<T> {
+        value.clone().filter(|_| named)
+    }
     FormatChange {
         bold: keep(bold.is_some(), &theirs.bold),
         italic: keep(italic.is_some(), &theirs.italic),
@@ -231,7 +233,7 @@ pub fn generate(view: &XlsxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
         )
     };
     match choice % 16 {
-        0..=6 => {
+        0..=5 => {
             let value = match (choice >> 28) % 6 {
                 0 => CellInput::Number(((choice >> 34) % 1000) as f64 / 4.0),
                 1 => CellInput::Text(["alpha", "日本語", "", " x "][pick(4, 40)].to_string()),
@@ -248,9 +250,9 @@ pub fn generate(view: &XlsxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
                 value,
             })
         }
-        7 | 8 => Some(XlsxOp::Structure {
+        6 | 7 => Some(XlsxOp::Structure {
             sheet: sheet.id,
-            op: if choice % 16 == 7 {
+            op: if choice % 16 == 6 {
                 GridOp::InsertRow {
                     id: ids(1),
                     after: (pick(4, 30) != 0).then_some(row),
@@ -262,18 +264,20 @@ pub fn generate(view: &XlsxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
                 }
             },
         }),
-        9 => Some(XlsxOp::Structure {
+        8 => Some(XlsxOp::Structure {
             sheet: sheet.id,
             op: GridOp::DeleteRow { id: row },
         }),
-        10 => Some(XlsxOp::Structure {
+        9 => Some(XlsxOp::Structure {
             sheet: sheet.id,
             op: GridOp::DeleteColumn { id: column },
         }),
-        11 | 12 => Some(XlsxOp::SetNote {
+        // Notes go to a 2 × 2 corner, so they are replaced and deleted
+        // often, not just written once.
+        10..=12 => Some(XlsxOp::SetNote {
             sheet: sheet.id,
-            row,
-            column,
+            row: sheet.rows[pick(sheet.rows.len().min(2), 12)],
+            column: sheet.columns[pick(sheet.columns.len().min(2), 20)],
             stamp: ids(1),
             note: [
                 Some("note"),
@@ -285,7 +289,7 @@ pub fn generate(view: &XlsxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
             ][pick(6, 28)]
             .map(str::to_string),
         }),
-        13 | 14 => {
+        13..=15 => {
             // A rectangle of up to 2 × 3 cells.
             let top = pick(sheet.rows.len(), 12);
             let left = pick(sheet.columns.len(), 20);
@@ -299,6 +303,6 @@ pub fn generate(view: &XlsxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
                 change: format_change(choice >> 30),
             })
         }
-        _ => None,
+        _ => unreachable!(),
     }
 }

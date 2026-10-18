@@ -157,6 +157,38 @@ with jade by reusing jade's own reference shifter
   thing at the same log position, so the result is deterministic — this is
   the only transformation in the system, and it is jade's.
 
+Notes and cell formats are convergent too. A note is a last-writer-wins
+register per cell, like a value. A format is one register per cell *and
+attribute* (bold, italic, underline, strike, font colour/size/name, fill,
+number format, horizontal/vertical alignment, wrap — exactly jade's
+`FormatChange`): jade's `set_format` is a partial change that keeps every
+attribute it does not name, so attributes are independent, concurrent
+changes to different attributes of one cell both survive, and each
+attribute converges to its newest write. jade is only told the attributes a
+write won when it arrived, so in log order the last write it sees for an
+attribute is the newest one. The model records only what was written
+through it; the formats the file already had stay in jade. Values are
+canonicalised to what `format_at` reads back (`#ff0000` → `FF0000`, an
+empty number format → `General`) and changes jade would refuse (a bad
+colour, a font size outside 1–409) are refused on every replica, so a
+convergent write never reaches a server whose jade cannot realise it.
+
+A range is formatted by one operation that names the row and column ids
+its author saw, not its corners: corners resolved at apply time would take
+in a row another replica inserted concurrently or not depending on where
+the two land in the log, which a convergent operation must not depend on.
+The server realises it with one `set_format` per rectangle of cells that
+won the same attributes.
+
+jade reports a merged cell's format at the merge's anchor, so the model
+loads the file's merges into the sheet grid, which moves them exactly as
+jade does (a line inserted inside joins the merge, a deleted corner moves
+to the next line). Formatting a covered cell is kept and shows once a
+deletion makes it the anchor, as in jade. Notes and formats in an Excel
+table's header or totals row are safe — jade leaves the header text and
+column name alone when only the format or the note changes — so unlike
+values they are not read-only there.
+
 Excel tables (ListObjects) rewrite what is typed into their header and totals
 rows (a blank header becomes `Column1`) and name or fill new rows and columns
 inserted inside them. The model cannot predict that, so those cells are
@@ -231,18 +263,23 @@ Tests are written first. Three layers:
 
 Working: the two-lane protocol over WebSockets; docx text, paragraph
 split/join, table insertion/deletion and row/column structure on simple
-tables, text in any table cell; xlsx values, formulas (with rebasing), and
-row/column structure; index/A1-addressed intent APIs for people and agents;
+tables, text in any table cell; xlsx values, formulas (with rebasing),
+row/column structure, notes, and cell formatting (per-attribute LWW, A1
+ranges); index/A1-addressed intent APIs for people and agents;
 the `jade-collab` CLI; resume after a disconnect.
 
 Not yet:
 
-* Formatting (bold, styles, …) — planned as sequenced operations addressed
-  by character ids, then a Peritext-style mark CRDT for the convergent lane.
+* docx formatting (bold, styles, …) — planned as sequenced operations
+  addressed by character ids, then a Peritext-style mark CRDT for the
+  convergent lane. (xlsx cell formatting and notes are done.)
+* xlsx borders, whole-row/column formats, conditional formats and threaded
+  comments; note authors are not modelled (jade records `jade`).
 * docx merged cells and structure of merged/ragged/nested tables (their
   text is editable; the model already validates merges in `Grid`), text
   boxes, notes, comments, tracked changes.
-* xlsx merges, sheets added/renamed, Excel table structure.
+* Creating or removing xlsx merges (the file's merges are loaded and
+  follow structural changes), sheets added/renamed, Excel table structure.
 * An MCP server so agents join as replicas without a shell.
 * Persistence of the log (today: export on demand, `--save` on exit),
   snapshots and log compaction, authentication and authorization, presence.

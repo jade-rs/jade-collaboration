@@ -1,17 +1,20 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use jade_collab_core::grid::{Grid, GridOp};
+use jade_collab_core::grid::{Grid, GridOp, Merge};
 use jade_collab_core::id::{Id, ReplicaId};
 use jade_collab_core::lww::LwwRegister;
 use jade_collab_sync::{ApplyContext, Document, Lane, Rejection};
 use jade_xlsx_headless_api::{CellInput, CellKind, CellView};
-use jade_xlsx_headless_editor::HeadlessWorkbook;
-use jade_xlsx_reader::{shift_formula, Axis, StructureChange};
+use jade_xlsx_headless_editor::{FormatChange, HeadlessWorkbook};
+use jade_xlsx_reader::{
+    shift_formula, Axis, HorizontalAlignment, StructureChange, VerticalAlignment,
+};
 use serde::{Deserialize, Serialize};
 
-/// How much of each sheet the model covers: the used range, at least this
-/// big (so there is room to type), at most [`LoadOptions::MAX_ROWS`] ×
-/// [`LoadOptions::MAX_COLUMNS`]. Cells outside are left to jade untouched.
+/// How much of each sheet the model covers: the used range and its merged
+/// regions, at least this big (so there is room to type), at most
+/// [`LoadOptions::MAX_ROWS`] × [`LoadOptions::MAX_COLUMNS`]. Cells outside
+/// are left to jade untouched.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LoadOptions {
     pub min_rows: u32,
@@ -46,12 +49,218 @@ struct Sheet {
     grid: Grid,
     #[serde(with = "pairs")]
     cells: BTreeMap<(Id, Id), LwwRegister<CellInput>>,
+    /// Cell notes (legacy comments); `None` once deleted.
+    #[serde(with = "pairs")]
+    notes: BTreeMap<(Id, Id), LwwRegister<Option<String>>>,
+    /// The format attributes written through the model. What the file had
+    /// is left to jade: an attribute nobody wrote here is not modelled.
+    #[serde(with = "pairs")]
+    formats: BTreeMap<(Id, Id), CellFormat>,
     /// Header and totals cells of Excel tables. Excel rewrites what is typed
     /// there (a blank header becomes "Column1"), so they are read-only.
     protected: BTreeSet<(Id, Id)>,
     /// Excel tables. Rows and columns cannot be inserted or deleted inside
     /// one: Excel would name new columns and fill calculated ones.
     tables: Vec<TableRegion>,
+}
+
+/// Calls `$then!` with every attribute of jade's [`FormatChange`]. The
+/// users destructure and build `FormatChange` without `..`, so an attribute
+/// jade adds is a compile error here rather than one silently dropped.
+macro_rules! each_attribute {
+    ($then:ident) => {
+        $then!(
+            bold,
+            italic,
+            underline,
+            strike,
+            font_color,
+            font_size,
+            font_name,
+            fill_color,
+            number_format,
+            horizontal,
+            vertical,
+            wrap_text
+        )
+    };
+}
+
+/// One cell's format as a last-writer-wins register per attribute.
+///
+/// jade's `set_format` is a partial change — every attribute it does not
+/// name keeps what the cell has — so attributes are independent, and a
+/// register each makes concurrent changes to different attributes of one
+/// cell both survive while each attribute keeps its newest write. Registers
+/// commute and are keyed by row and column ids, so formatting is
+/// convergent: it never depends on where in the log it lands. jade sees,
+/// in log order, exactly the writes that won when they arrived; the last of
+/// those for an attribute is the newest, so jade ends where the registers do.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct CellFormat {
+    bold: LwwRegister<bool>,
+    italic: LwwRegister<bool>,
+    underline: LwwRegister<bool>,
+    strike: LwwRegister<bool>,
+    font_color: LwwRegister<String>,
+    font_size: LwwRegister<f32>,
+    font_name: LwwRegister<String>,
+    fill_color: LwwRegister<String>,
+    number_format: LwwRegister<String>,
+    horizontal: LwwRegister<HorizontalAlignment>,
+    vertical: LwwRegister<VerticalAlignment>,
+    wrap_text: LwwRegister<bool>,
+}
+
+impl CellFormat {
+    /// Writes every attribute `change` names with `stamp`; returns the ones
+    /// that won.
+    fn apply(&mut self, stamp: Id, change: &FormatChange) -> FormatChange {
+        macro_rules! apply {
+            ($($name:ident),*) => {{
+                let FormatChange { $($name),* } = change;
+                FormatChange {
+                    $($name: match $name {
+                        Some(value) if self.$name.apply(stamp, value.clone()) => Some(value.clone()),
+                        _ => None,
+                    },)*
+                }
+            }};
+        }
+        each_attribute!(apply)
+    }
+
+    fn current(&self) -> FormatChange {
+        macro_rules! current {
+            ($($name:ident),*) => {
+                FormatChange { $($name: self.$name.get().cloned(),)* }
+            };
+        }
+        each_attribute!(current)
+    }
+}
+
+/// `change` as jade's `format_at` reads it back — colours as upper-case
+/// `RRGGBB`, General for an empty or any-case `general` number format — or
+/// why `set_format` would refuse it. Checked on every replica, from the
+/// operation alone, so a convergent write never reaches a server whose jade
+/// cannot realise it.
+fn canonical_format(change: &FormatChange) -> Result<FormatChange, Rejection> {
+    fn rgb(text: &str) -> Result<String, Rejection> {
+        let hex = text.strip_prefix('#').unwrap_or(text);
+        if hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            Ok(hex.to_ascii_uppercase())
+        } else {
+            Err(reject(format!("{text:?} is not an RRGGBB colour")))
+        }
+    }
+    if change.is_empty() {
+        return Err(reject("a format change has to name an attribute"));
+    }
+    let mut change = change.clone();
+    if let Some(color) = &mut change.font_color {
+        *color = rgb(color)?;
+    }
+    if let Some(color) = change.fill_color.as_mut().filter(|c| !c.is_empty()) {
+        *color = rgb(color)?;
+    }
+    if let Some(code) = &mut change.number_format {
+        if code.is_empty() || code.eq_ignore_ascii_case("General") {
+            *code = "General".to_string();
+        }
+    }
+    // Excel's limits, which jade enforces.
+    if change
+        .font_size
+        .is_some_and(|size| !size.is_finite() || !(1.0..=409.0).contains(&size))
+    {
+        return Err(reject("font sizes run from 1 to 409 points"));
+    }
+    if change.font_name.as_deref().is_some_and(str::is_empty) {
+        return Err(reject("a font needs a name"));
+    }
+    Ok(change)
+}
+
+/// Cells and the attributes each won, as few `set_format` calls as equal
+/// changes allow: runs along each row, stacked while consecutive rows have
+/// the same run. The rectangles are disjoint, so their order is immaterial.
+fn rectangles(sheet: &str, cells: BTreeMap<(usize, usize), FormatChange>) -> Vec<XlsxEffect> {
+    let mut runs: Vec<(usize, usize, usize, FormatChange)> = Vec::new();
+    for ((r, c), change) in cells {
+        match runs.last_mut() {
+            Some((row, _, right, last)) if *row == r && *right + 1 == c && *last == change => {
+                *right = c
+            }
+            _ => runs.push((r, c, c, change)),
+        }
+    }
+    // (top, bottom, left, right, change)
+    let mut rectangles: Vec<(usize, usize, usize, usize, FormatChange)> = Vec::new();
+    for (r, left, right, change) in runs {
+        let above = rectangles.iter_mut().find(|(_, bottom, l, rt, c)| {
+            *bottom + 1 == r && *l == left && *rt == right && *c == change
+        });
+        match above {
+            Some(rectangle) => rectangle.1 = r,
+            None => rectangles.push((r, r, left, right, change)),
+        }
+    }
+    rectangles
+        .into_iter()
+        .map(|(top, bottom, left, right, change)| {
+            let corner = |r: usize, c: usize| format!("{}{}", column_label(c as u32), r + 1);
+            let range = if (top, left) == (bottom, right) {
+                corner(top, left)
+            } else {
+                format!("{}:{}", corner(top, left), corner(bottom, right))
+            };
+            XlsxEffect::SetFormat {
+                sheet: sheet.to_string(),
+                range,
+                change,
+            }
+        })
+        .collect()
+}
+
+impl Sheet {
+    /// `B3` for a cell in alive lines.
+    fn reference(&self, row: Id, column: Id) -> Option<String> {
+        let r = self.grid.row_index(row)?;
+        let c = self.grid.column_index(column)?;
+        Some(format!("{}{}", column_label(c as u32), r + 1))
+    }
+
+    fn contains(&self, row: Id, column: Id) -> bool {
+        self.grid.contains_row(row) && self.grid.contains_column(column)
+    }
+
+    /// The cell whose format shows at `(row, column)`: the top-left cell of
+    /// the merged region covering it, as in Excel and jade's `format_at`.
+    /// The grid moves merges as jade does — a line inserted inside one joins
+    /// it, a deleted corner moves to the next line, a merge left with one
+    /// cell is gone.
+    fn format_anchor(&self, row: Id, column: Id) -> (Id, Id) {
+        let (Some(r), Some(c)) = (self.grid.row_index(row), self.grid.column_index(column)) else {
+            return (row, column);
+        };
+        let span = |first: Option<usize>, last: Option<usize>, at: usize| {
+            first.zip(last).is_some_and(|(a, b)| a <= at && at <= b)
+        };
+        self.grid
+            .merges()
+            .iter()
+            .find(|m| {
+                span(self.grid.row_index(m.top), self.grid.row_index(m.bottom), r)
+                    && span(
+                        self.grid.column_index(m.left),
+                        self.grid.column_index(m.right),
+                        c,
+                    )
+            })
+            .map_or((row, column), |m| (m.top, m.left))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -102,6 +311,29 @@ pub enum XlsxOp {
     },
     /// Sequenced: insert or delete a row or column.
     Structure { sheet: Id, op: GridOp },
+    /// Convergent: the cell's note, a last-writer-wins register like a
+    /// value; `None` (or empty text) deletes it.
+    SetNote {
+        sheet: Id,
+        row: Id,
+        column: Id,
+        stamp: Id,
+        note: Option<String>,
+    },
+    /// Convergent: every attribute `change` names, on every cell of
+    /// `rows` × `columns`, each a last-writer-wins register of its own.
+    ///
+    /// A range carries the ids of the cells its author saw rather than its
+    /// corners: corners resolved at apply time would take in rows another
+    /// replica inserted concurrently or not depending on where the two land
+    /// in the log, which a convergent operation must not depend on.
+    SetFormat {
+        sheet: Id,
+        rows: Vec<Id>,
+        columns: Vec<Id>,
+        stamp: Id,
+        change: FormatChange,
+    },
 }
 
 /// What jade must do; indices are 0-based.
@@ -128,6 +360,18 @@ pub enum XlsxEffect {
     DeleteColumn {
         sheet: String,
         at: u32,
+    },
+    /// `None` deletes the note.
+    SetNote {
+        sheet: String,
+        reference: String,
+        note: Option<String>,
+    },
+    /// `range` is `B3` or `B3:D5`.
+    SetFormat {
+        sheet: String,
+        range: String,
+        change: FormatChange,
     },
 }
 
@@ -203,6 +447,8 @@ impl XlsxModel {
                     (0..*columns).map(|_| id()).collect::<Vec<_>>(),
                 ),
                 cells: BTreeMap::new(),
+                notes: BTreeMap::new(),
+                formats: BTreeMap::new(),
                 protected: BTreeSet::new(),
                 tables: Vec::new(),
             })
@@ -217,15 +463,27 @@ impl XlsxModel {
     /// The model of `book`, with ids owned by [`ReplicaId::ORIGIN`].
     pub fn from_workbook(book: &HeadlessWorkbook, options: LoadOptions) -> Result<Self, LoadError> {
         let summary = book.summary();
+        let merges_of = |name: &str| {
+            book.workbook()
+                .sheets
+                .iter()
+                .find(|s| s.name == name)
+                .map(|s| s.merges.as_slice())
+                .unwrap_or_default()
+        };
         let shapes: Vec<(&str, u32, u32)> = summary
             .sheets
             .iter()
             .map(|s| {
+                let merges = merges_of(&s.name);
+                let rows = merges.iter().map(|m| m.end.row + 1);
+                let columns = merges.iter().map(|m| m.end.column + 1);
                 (
                     s.name.as_str(),
-                    s.used_rows.max(options.min_rows).min(LoadOptions::MAX_ROWS),
-                    s.used_columns
-                        .max(options.min_columns)
+                    rows.fold(s.used_rows.max(options.min_rows), u32::max)
+                        .min(LoadOptions::MAX_ROWS),
+                    columns
+                        .fold(s.used_columns.max(options.min_columns), u32::max)
                         .min(LoadOptions::MAX_COLUMNS),
                 )
             })
@@ -261,8 +519,35 @@ impl XlsxModel {
                             LwwRegister::new(Id::new(stamp, ReplicaId::ORIGIN), value),
                         );
                     }
+                    if let Some(note) = &view.comment {
+                        stamp += 1;
+                        sheet.notes.insert(
+                            (row_ids[r], column_ids[c]),
+                            LwwRegister::new(
+                                Id::new(stamp, ReplicaId::ORIGIN),
+                                Some(note.text.clone()),
+                            ),
+                        );
+                    }
                 }
             }
+            // The file's merges, clipped to the part of the sheet modelled.
+            let merges = merges_of(name)
+                .iter()
+                .filter(|m| m.start.row < *rows && m.start.column < *columns)
+                .map(|m| {
+                    let bottom = m.end.row.min(rows - 1) as usize;
+                    let right = m.end.column.min(columns - 1) as usize;
+                    Merge {
+                        top: row_ids[m.start.row as usize],
+                        left: column_ids[m.start.column as usize],
+                        bottom: row_ids[bottom],
+                        right: column_ids[right],
+                    }
+                })
+                .filter(|m| (m.top, m.left) != (m.bottom, m.right))
+                .collect();
+            sheet.grid = Grid::with_merges_unchecked(row_ids.clone(), column_ids.clone(), merges);
             sheet.tables = tables
                 .into_values()
                 .map(|(top, bottom, left, right)| TableRegion {
@@ -297,6 +582,31 @@ impl XlsxModel {
             .cells
             .get(&(row, column))?
             .get()
+    }
+
+    /// The note on a cell (also for cells in deleted rows or columns).
+    pub fn note(&self, sheet: Id, row: Id, column: Id) -> Option<&str> {
+        self.sheets
+            .iter()
+            .find(|s| s.id == sheet)?
+            .notes
+            .get(&(row, column))?
+            .get()?
+            .as_deref()
+    }
+
+    /// The format attributes written through the model that show at a cell:
+    /// its own, or its merged region's anchor's, as jade's `format_at` and
+    /// Excel show it. An attribute nobody wrote is `None` — it is whatever
+    /// the file has.
+    pub fn format(&self, sheet: Id, row: Id, column: Id) -> FormatChange {
+        let Some(s) = self.sheets.iter().find(|s| s.id == sheet) else {
+            return FormatChange::default();
+        };
+        s.formats
+            .get(&s.format_anchor(row, column))
+            .map(CellFormat::current)
+            .unwrap_or_default()
     }
 
     /// `(sheet, row, column)` ids of `reference` (`B3`) on the sheet named `sheet`.
@@ -368,6 +678,81 @@ impl XlsxModel {
             reference: format!("{}{}", column_label(c as u32), r + 1),
             value,
         }])
+    }
+
+    fn set_note(
+        &mut self,
+        sheet: Id,
+        row: Id,
+        column: Id,
+        stamp: Id,
+        note: &Option<String>,
+    ) -> Result<Vec<XlsxEffect>, Rejection> {
+        let index = self.sheet_index(sheet)?;
+        if !self.sheets[index].contains(row, column) {
+            return Err(reject("no such cell"));
+        }
+        let note = note.clone().filter(|text| !text.is_empty());
+        self.max_lamport = self.max_lamport.max(stamp.lamport);
+        let sheet = &mut self.sheets[index];
+        if !sheet
+            .notes
+            .entry((row, column))
+            .or_default()
+            .apply(stamp, note.clone())
+        {
+            return Ok(Vec::new());
+        }
+        Ok(sheet
+            .reference(row, column)
+            .map(|reference| XlsxEffect::SetNote {
+                sheet: sheet.name.clone(),
+                reference,
+                note,
+            })
+            .into_iter()
+            .collect())
+    }
+
+    fn set_format(
+        &mut self,
+        sheet: Id,
+        rows: &[Id],
+        columns: &[Id],
+        stamp: Id,
+        change: &FormatChange,
+    ) -> Result<Vec<XlsxEffect>, Rejection> {
+        let index = self.sheet_index(sheet)?;
+        let change = canonical_format(change)?;
+        let s = &self.sheets[index];
+        if rows.is_empty()
+            || columns.is_empty()
+            || !rows.iter().all(|row| s.grid.contains_row(*row))
+            || !columns.iter().all(|column| s.grid.contains_column(*column))
+        {
+            return Err(reject("no such cell"));
+        }
+        self.max_lamport = self.max_lamport.max(stamp.lamport);
+        let sheet = &mut self.sheets[index];
+        // Alive cells by index, with the attributes they won.
+        let mut won = BTreeMap::new();
+        for row in rows {
+            for column in columns {
+                let attributes = sheet
+                    .formats
+                    .entry((*row, *column))
+                    .or_default()
+                    .apply(stamp, &change);
+                let at = sheet
+                    .grid
+                    .row_index(*row)
+                    .zip(sheet.grid.column_index(*column));
+                if let (false, Some(at)) = (attributes.is_empty(), at) {
+                    won.insert(at, attributes);
+                }
+            }
+        }
+        Ok(rectangles(&sheet.name, won))
     }
 
     fn structure(
@@ -470,6 +855,9 @@ impl Document for XlsxModel {
             } => Lane::Sequenced,
             XlsxOp::SetCell { .. } => Lane::Convergent,
             XlsxOp::Structure { .. } => Lane::Sequenced,
+            // Id-keyed last-writer-wins registers (per attribute for
+            // formats) commute and do not depend on the log position.
+            XlsxOp::SetNote { .. } | XlsxOp::SetFormat { .. } => Lane::Convergent,
         }
     }
 
@@ -483,6 +871,20 @@ impl Document for XlsxModel {
                 value,
             } => self.set_cell(*sheet, *row, *column, *stamp, value, ctx),
             XlsxOp::Structure { sheet, op } => self.structure(*sheet, op, ctx),
+            XlsxOp::SetNote {
+                sheet,
+                row,
+                column,
+                stamp,
+                note,
+            } => self.set_note(*sheet, *row, *column, *stamp, note),
+            XlsxOp::SetFormat {
+                sheet,
+                rows,
+                columns,
+                stamp,
+                change,
+            } => self.set_format(*sheet, rows, columns, *stamp, change),
         }
     }
 

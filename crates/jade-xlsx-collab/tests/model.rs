@@ -474,7 +474,7 @@ fn the_newest_write_of_an_attribute_wins_in_either_order() {
     let mut results = Vec::new();
     for swap in [false, true] {
         let mut s = blank();
-        let mut ops = vec![
+        let mut ops = [
             format(&s, &[0], &[0], id(7), fill("00FF00")),
             format(&s, &[0], &[0], id(4), fill("0000FF")),
         ];
