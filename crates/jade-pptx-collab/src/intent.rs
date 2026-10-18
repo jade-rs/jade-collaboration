@@ -13,7 +13,9 @@
 use jade_collab_core::id::Id;
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Geometry, GeometryEdit, Paragraph, PptxModel, PptxOp, StoryId};
+use crate::model::{
+    Alignment, CharFormat, Geometry, GeometryEdit, Paragraph, PptxModel, PptxOp, StoryId,
+};
 
 fn one() -> usize {
     1
@@ -120,6 +122,25 @@ pub enum PptxIntent {
         slide: usize,
         shape: u32,
     },
+    /// Gives the characters between two carets of a shape's text one
+    /// attribute (a convergent mark: text typed at its end takes it too).
+    FormatText {
+        slide: usize,
+        shape: u32,
+        start_paragraph: usize,
+        start_offset: usize,
+        end_paragraph: usize,
+        end_offset: usize,
+        format: CharFormat,
+    },
+    /// Aligns paragraphs `start_paragraph..=end_paragraph` of a shape.
+    AlignParagraphs {
+        slide: usize,
+        shape: u32,
+        start_paragraph: usize,
+        end_paragraph: usize,
+        alignment: Alignment,
+    },
     /// Hides a slide from the slide show, or shows it again.
     SetSlideHidden {
         slide: usize,
@@ -143,6 +164,10 @@ pub enum IntentError {
     InvertedRange,
     #[error("there is no slide position {0}")]
     BadPosition(usize),
+    #[error("the range holds no characters to format")]
+    NothingToFormat,
+    #[error("invalid format: {0}")]
+    InvalidFormat(String),
 }
 
 fn slide_id(view: &PptxModel, number: usize) -> Result<Id, IntentError> {
@@ -416,6 +441,67 @@ pub fn resolve(
         PptxIntent::DeleteShape { slide, shape } => {
             let (slide, shape) = shape_id(view, *slide, *shape)?;
             Ok(vec![PptxOp::DeleteShape { slide, shape }])
+        }
+        PptxIntent::FormatText {
+            slide,
+            shape,
+            start_paragraph,
+            start_offset,
+            end_paragraph,
+            end_offset,
+            format,
+        } => {
+            format.validate().map_err(IntentError::InvalidFormat)?;
+            let story = story(view, *slide, Target::Shape(*shape))?;
+            let paragraphs = view.paragraphs(story).expect("resolved");
+            let start = caret(&paragraphs, *start_paragraph, *start_offset)?;
+            let end = caret(&paragraphs, *end_paragraph, *end_offset)?;
+            if start.index > end.index {
+                return Err(IntentError::InvertedRange);
+            }
+            let chars: Vec<Id> = atoms(&paragraphs)[start.index..end.index]
+                .iter()
+                .filter_map(|a| a.ok())
+                .collect();
+            let (Some(first), Some(last)) = (chars.first(), chars.last()) else {
+                return Err(IntentError::NothingToFormat);
+            };
+            let (start, end) = view
+                .mark_anchors(story, *first, *last, format.key().expand())
+                .expect("a view's characters are in their story, in order");
+            Ok(vec![PptxOp::Mark {
+                story,
+                id: ids(1),
+                start,
+                end,
+                format: format.clone(),
+            }])
+        }
+        PptxIntent::AlignParagraphs {
+            slide,
+            shape,
+            start_paragraph,
+            end_paragraph,
+            alignment,
+        } => {
+            let story = story(view, *slide, Target::Shape(*shape))?;
+            let paragraphs = view.paragraphs(story).expect("resolved");
+            for n in [*start_paragraph, *end_paragraph] {
+                if n >= paragraphs.len() {
+                    return Err(IntentError::NoSuchParagraph(n));
+                }
+            }
+            if start_paragraph > end_paragraph {
+                return Err(IntentError::InvertedRange);
+            }
+            // A paragraph is named by the mark that ends the one before it.
+            let after = |n: usize| n.checked_sub(1).and_then(|k| paragraphs[k].mark);
+            Ok(vec![PptxOp::AlignParagraphs {
+                story,
+                from: after(*start_paragraph),
+                to: after(*end_paragraph),
+                alignment: *alignment,
+            }])
         }
         PptxIntent::SetSlideHidden { slide, hidden } => Ok(vec![PptxOp::SetSlideHidden {
             slide: slide_id(view, *slide)?,

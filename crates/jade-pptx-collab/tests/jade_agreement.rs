@@ -502,11 +502,22 @@ fn formatting_is_realised_over_jades_base() {
     };
     let base_before = s.jade.bytes().to_vec();
     format(&mut s, CharFormat::Bold { value: true }, 1, 3);
-    assert_eq!(s.jade.bytes(), &base_before[..], "marks never reach jade's document");
+    assert_eq!(
+        s.jade.bytes(),
+        &base_before[..],
+        "marks never reach jade's document"
+    );
     format(&mut s, CharFormat::Italic { value: true }, 0, 2);
     format(&mut s, CharFormat::Underline { value: true }, 2, 4);
     format(&mut s, CharFormat::Size { hundredths: 3150 }, 0, 4);
-    format(&mut s, CharFormat::Font { typeface: "Georgia".into() }, 1, 2);
+    format(
+        &mut s,
+        CharFormat::Font {
+            typeface: "Georgia".into(),
+        },
+        1,
+        2,
+    );
     format(
         &mut s,
         CharFormat::EastAsianFont {
@@ -547,8 +558,13 @@ fn formatting_is_realised_over_jades_base() {
     let x = s.model.paragraphs(story).unwrap()[0].chars[4];
     let w = s.model.paragraphs(story).unwrap()[0].chars[1];
     let marked = s.model.char_formats(story).unwrap();
-    assert!(marked[&x].contains(&CharFormat::Bold { value: true }), "typed at the end");
-    assert!(!marked.get(&w).is_some_and(|f| f.contains(&CharFormat::Bold { value: true })));
+    assert!(
+        marked[&x].contains(&CharFormat::Bold { value: true }),
+        "typed at the end"
+    );
+    assert!(!marked
+        .get(&w)
+        .is_some_and(|f| f.contains(&CharFormat::Bold { value: true })));
 
     s.intent(PptxIntent::AlignParagraphs {
         slide: 1,
@@ -563,7 +579,9 @@ fn formatting_is_realised_over_jades_base() {
         .shapes
         .iter()
         .find_map(|item| match item {
-            jade_pptx_reader::ShapeItem::Shape(sh) if sh.id == Some(shape.number) => sh.text.clone(),
+            jade_pptx_reader::ShapeItem::Shape(sh) if sh.id == Some(shape.number) => {
+                sh.text.clone()
+            }
             _ => None,
         })
         .unwrap();

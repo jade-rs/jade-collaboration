@@ -23,6 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use jade_collab_core::id::{Id, ReplicaId};
 use jade_collab_core::lww::LwwRegister;
+use jade_collab_core::marks::{self, Boundary, Expand, Mark, MarkSet};
 use jade_collab_core::rga::Rga;
 use jade_collab_sync::{ApplyContext, Document, Lane, Rejection};
 use serde::{Deserialize, Serialize};
@@ -101,16 +102,208 @@ impl GeometryEdit {
     }
 }
 
+/// A character attribute a mark sets in a shape's text — the run
+/// properties jade's pptx writer formats (`TextFormat`), one per mark.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "attribute", rename_all = "snake_case")]
+pub enum CharFormat {
+    Bold {
+        value: bool,
+    },
+    Italic {
+        value: bool,
+    },
+    Underline {
+        value: bool,
+    },
+    /// In hundredths of a point, as DrawingML stores sizes (`1800` is
+    /// 18pt): 1pt to 4000pt.
+    Size {
+        hundredths: u32,
+    },
+    /// The Latin typeface.
+    Font {
+        typeface: String,
+    },
+    /// The East Asian typeface.
+    EastAsianFont {
+        typeface: String,
+    },
+    /// `#RRGGBB`.
+    Color {
+        color: String,
+    },
+}
+
+/// The attribute a [`CharFormat`] sets: concurrent marks of one attribute
+/// resolve to the newest, different attributes are independent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarkKey {
+    Bold,
+    Italic,
+    Underline,
+    Size,
+    Font,
+    EastAsianFont,
+    Color,
+}
+
+impl MarkKey {
+    /// Every attribute, in order.
+    pub const ALL: [MarkKey; 7] = [
+        MarkKey::Bold,
+        MarkKey::Italic,
+        MarkKey::Underline,
+        MarkKey::Size,
+        MarkKey::Font,
+        MarkKey::EastAsianFont,
+        MarkKey::Color,
+    ];
+
+    /// As in docx (and PowerPoint): text typed at the end of formatted
+    /// text takes its formatting, so every attribute expands at its end.
+    pub fn expand(self) -> Expand {
+        Expand::End
+    }
+}
+
+/// PowerPoint's `ST_TextFontSize`, in hundredths of a point.
+const FONT_HUNDREDTHS: std::ops::RangeInclusive<u32> = 100..=400_000;
+
+impl CharFormat {
+    pub fn key(&self) -> MarkKey {
+        match self {
+            Self::Bold { .. } => MarkKey::Bold,
+            Self::Italic { .. } => MarkKey::Italic,
+            Self::Underline { .. } => MarkKey::Underline,
+            Self::Size { .. } => MarkKey::Size,
+            Self::Font { .. } => MarkKey::Font,
+            Self::EastAsianFont { .. } => MarkKey::EastAsianFont,
+            Self::Color { .. } => MarkKey::Color,
+        }
+    }
+
+    /// The value as jade's writer takes it.
+    pub fn to_jade(&self) -> jade_pptx_writer::TextFormat {
+        let mut format = jade_pptx_writer::TextFormat::default();
+        match self {
+            Self::Bold { value } => format.bold = Some(*value),
+            Self::Italic { value } => format.italic = Some(*value),
+            Self::Underline { value } => format.underline = Some(*value),
+            Self::Size { hundredths } => format.size_pt = Some(f64::from(*hundredths) / 100.0),
+            Self::Font { typeface } => format.font = Some(typeface.clone()),
+            Self::EastAsianFont { typeface } => format.east_asian_font = Some(typeface.clone()),
+            Self::Color { color } => format.color = Some(color.clone()),
+        }
+        format
+    }
+
+    /// Refuses what jade would not write, by jade's own check.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Self::Size { hundredths } = self {
+            if !FONT_HUNDREDTHS.contains(hundredths) {
+                return Err(format!(
+                    "{hundredths} is not a font size from 1pt to 4000pt"
+                ));
+            }
+        }
+        self.to_jade().validate().map_err(|e| e.to_string())
+    }
+}
+
+/// Paragraph alignment (`algn`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Alignment {
+    Left,
+    Center,
+    Right,
+    Justify,
+    Distributed,
+}
+
+impl Alignment {
+    pub fn to_jade(self) -> jade_pptx_writer::ParagraphAlignment {
+        use jade_pptx_writer::ParagraphAlignment as A;
+        match self {
+            Self::Left => A::Left,
+            Self::Center => A::Center,
+            Self::Right => A::Right,
+            Self::Justify => A::Justify,
+            Self::Distributed => A::Distributed,
+        }
+    }
+}
+
+/// A run of characters of one paragraph a mark sets one attribute of: what
+/// the materializer formats on the file it writes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FormatRun {
+    /// The visible slide's position.
+    pub slide: usize,
+    pub shape: ShapeRef,
+    pub paragraph: usize,
+    /// UTF-8 byte offsets of model text.
+    pub start: usize,
+    pub end: usize,
+    pub format: CharFormat,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Story {
     pub(crate) flow: Rga<Atom>,
     /// False when jade will not edit the text (locked, or holding fields).
     pub(crate) editable: bool,
+    /// Character formatting made in the session (shape text only).
+    #[serde(default, skip_serializing_if = "MarkSet::is_empty")]
+    pub(crate) marks: MarkSet<MarkKey, CharFormat>,
 }
 
 impl Story {
     pub(crate) fn new(flow: Rga<Atom>, editable: bool) -> Self {
-        Self { flow, editable }
+        Self {
+            flow,
+            editable,
+            marks: MarkSet::new(),
+        }
+    }
+
+    /// What the marks give each visible character, per attribute.
+    fn marked(&self) -> BTreeMap<(Id, MarkKey), CharFormat> {
+        let mut out = BTreeMap::new();
+        if self.marks.is_empty() {
+            return out;
+        }
+        let order = self.flow.ids();
+        for span in self.marks.effective(&self.flow) {
+            let Some(value) = span.value else { continue };
+            for index in span.range {
+                let id = order[index];
+                if self
+                    .flow
+                    .get(id)
+                    .is_some_and(|n| !n.deleted && n.value != Atom::Mark)
+                {
+                    out.insert((id, span.key), value.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// The paragraph holding the position right after `atom` (`None`: the
+    /// story's start), counting visible paragraph marks — so a joined
+    /// mark's paragraph is the one it was merged into.
+    fn paragraph_after(&self, atom: Option<Id>) -> Option<usize> {
+        let Some(atom) = atom else { return Some(0) };
+        let position = self.flow.position(atom)?;
+        Some(
+            self.flow
+                .nodes_in(..=position)
+                .filter(|n| !n.deleted && n.value == Atom::Mark)
+                .count(),
+        )
     }
 }
 
@@ -378,6 +571,35 @@ pub enum PptxOp {
     /// concurrent writes need no coordination; the newest stamp wins, as
     /// for geometry.
     SetSlideHidden { slide: Id, stamp: Id, hidden: bool },
+    /// Convergent. Character formatting as a Peritext mark, as in docx:
+    /// `format` holds from `start` to `end` (sides of atoms of a shape's
+    /// text, or its ends) and the newest mark of an attribute wins on each
+    /// character it covers. The intent API anchors it before the first
+    /// character and before the atom after the last one (or at the end), so
+    /// typing at its end is covered. Marks never reach jade's document:
+    /// they are realised on the file when it is written. Speaker notes take
+    /// none (jade formats slide text only).
+    Mark {
+        story: StoryId,
+        id: Id,
+        start: Boundary,
+        end: Boundary,
+        format: CharFormat,
+    },
+    /// Sequenced. Aligns the paragraphs from the one beginning after atom
+    /// `from` through the one beginning after `to` (`None`: the first
+    /// paragraph), resolved in log order: paragraph properties live on
+    /// paragraph marks, which concurrent splits and joins create and merge
+    /// (jade keeps the first paragraph's on a join), so every copy of the
+    /// file has to see them in one order. Naming a paragraph by the atom
+    /// before it reaches an empty last paragraph too; a joined mark names
+    /// the paragraph it was merged into.
+    AlignParagraphs {
+        story: StoryId,
+        from: Option<Id>,
+        to: Option<Id>,
+        alignment: Alignment,
+    },
     /// Sequenced. Deletes a top-level shape (a group with its children).
     /// jade refuses shapes other parts of the slide depend on in ways it
     /// cannot untangle, which only the file shows.
@@ -424,6 +646,13 @@ pub enum PptxEffect {
         slide: usize,
         shape: ShapeRef,
         geometry: Geometry,
+    },
+    /// Aligns one paragraph of a shape's text.
+    AlignParagraph {
+        slide: usize,
+        shape: ShapeRef,
+        paragraph: usize,
+        alignment: Alignment,
     },
     /// The slide's `show` attribute after the write.
     SetSlideHidden {
@@ -962,6 +1191,158 @@ impl PptxModel {
         Ok(effects)
     }
 
+    fn shape_text(&self, story: StoryId) -> Result<&Story, Rejection> {
+        if let StoryId::Notes { .. } = story {
+            return Err(reject("jade formats the text of slide shapes only"));
+        }
+        self.editable_story(story)
+    }
+
+    /// Applies a mark. The checks depend only on the op and on atoms that
+    /// exist and never reorder, so every replica decides alike wherever the
+    /// mark lands in the log.
+    fn mark(
+        &mut self,
+        story: StoryId,
+        id: Id,
+        start: Boundary,
+        end: Boundary,
+        format: &CharFormat,
+        ctx: &ApplyContext,
+    ) -> Result<Vec<PptxEffect>, Rejection> {
+        format.validate().map_err(reject)?;
+        let target = self.shape_text(story)?;
+        if target.marks.iter().any(|m| m.id == id) {
+            return Err(reject(format!("mark {id} already exists")));
+        }
+        let mark = Mark::new(id, format.key(), start, end, Some(format.clone()));
+        MarkSet::validate(&target.flow, &mark)?;
+        for (k, copy) in self.reach(story, ctx).into_iter().enumerate() {
+            let Some(target) = self.story_mut(copy) else {
+                continue;
+            };
+            // A copy always has the anchors its author saw, but is left
+            // alone rather than failing the mark if not.
+            if k > 0 && MarkSet::validate(&target.flow, &mark).is_err() {
+                continue;
+            }
+            let _ = target.marks.insert(mark.clone());
+        }
+        self.observe([id]);
+        Ok(Vec::new())
+    }
+
+    /// The boundaries of a mark over the atoms `first ..= last` of `story`
+    /// under `expand`, as the intent API makes them.
+    pub fn mark_anchors(
+        &self,
+        story: StoryId,
+        first: Id,
+        last: Id,
+        expand: Expand,
+    ) -> Option<(Boundary, Boundary)> {
+        marks::anchors(&self.story(story)?.flow, first, last, expand)
+    }
+
+    /// The formats the marks set on each visible character of a story, in
+    /// attribute order; characters no mark covers are left out (they show
+    /// jade's formatting).
+    pub fn char_formats(&self, story: StoryId) -> Option<BTreeMap<Id, Vec<CharFormat>>> {
+        let mut out: BTreeMap<Id, Vec<CharFormat>> = BTreeMap::new();
+        for ((id, _), format) in self.story(story)?.marked() {
+            out.entry(id).or_default().push(format);
+        }
+        Some(out)
+    }
+
+    /// What makes a file show the marks: maximal runs of one value, per
+    /// visible shape, paragraph and attribute, in that order.
+    pub fn formatting(&self) -> Vec<FormatRun> {
+        let mut out = Vec::new();
+        for (index, slide_id) in self.order.iter().enumerate() {
+            for (key, shape) in self.slides[slide_id].visible_shapes() {
+                let Some(story) = shape.text.as_ref().filter(|s| !s.marks.is_empty()) else {
+                    continue;
+                };
+                let shape_ref = ShapeRef {
+                    slide: *slide_id,
+                    shape: *key,
+                    number: shape.number,
+                };
+                let marked = story.marked();
+                for (p, paragraph) in paragraphs_of(&story.flow).iter().enumerate() {
+                    for attribute in MarkKey::ALL {
+                        let mut run: Option<FormatRun> = None;
+                        let mut offset = 0;
+                        for (ch, c) in paragraph.text.chars().zip(&paragraph.chars) {
+                            let next = offset + ch.len_utf8();
+                            match marked.get(&(*c, attribute)) {
+                                Some(format) => match &mut run {
+                                    Some(r) if r.end == offset && r.format == *format => {
+                                        r.end = next
+                                    }
+                                    _ => {
+                                        out.extend(run.take());
+                                        run = Some(FormatRun {
+                                            slide: index,
+                                            shape: shape_ref,
+                                            paragraph: p,
+                                            start: offset,
+                                            end: next,
+                                            format: format.clone(),
+                                        });
+                                    }
+                                },
+                                None => out.extend(run.take()),
+                            }
+                            offset = next;
+                        }
+                        out.extend(run);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Aligns paragraphs in the story and in the copies its author had not
+    /// seen.
+    fn align(
+        &mut self,
+        story: StoryId,
+        from: Option<Id>,
+        to: Option<Id>,
+        alignment: Alignment,
+        ctx: &ApplyContext,
+    ) -> Result<Vec<PptxEffect>, Rejection> {
+        let target = self.shape_text(story)?;
+        for atom in [from, to].into_iter().flatten() {
+            if !target.flow.contains(atom) {
+                return Err(reject(format!("{atom} is not in this text")));
+            }
+        }
+        let mut effects = Vec::new();
+        for copy in self.reach(story, ctx) {
+            let Some(target) = self.story(copy) else {
+                continue;
+            };
+            let (Some(first), Some(last)) =
+                (target.paragraph_after(from), target.paragraph_after(to))
+            else {
+                continue;
+            };
+            if let Some((slide, TextTarget::Shape(shape))) = self.realised(copy) {
+                effects.extend((first..=last).map(|paragraph| PptxEffect::AlignParagraph {
+                    slide,
+                    shape,
+                    paragraph,
+                    alignment,
+                }));
+            }
+        }
+        Ok(effects)
+    }
+
     fn set_geometry(
         &mut self,
         slide_id: Id,
@@ -1292,8 +1673,10 @@ impl Document for PptxModel {
             | PptxOp::DeleteText { .. }
             | PptxOp::SplitParagraph { .. }
             | PptxOp::SetGeometry { .. }
-            | PptxOp::SetSlideHidden { .. } => Lane::Convergent,
+            | PptxOp::SetSlideHidden { .. }
+            | PptxOp::Mark { .. } => Lane::Convergent,
             PptxOp::JoinParagraph { .. }
+            | PptxOp::AlignParagraphs { .. }
             | PptxOp::InsertSlide { .. }
             | PptxOp::DeleteSlide { .. }
             | PptxOp::MoveSlide { .. }
@@ -1324,6 +1707,19 @@ impl Document for PptxModel {
                 stamp,
                 hidden,
             } => self.set_hidden(*slide, *stamp, *hidden, ctx),
+            PptxOp::Mark {
+                story,
+                id,
+                start,
+                end,
+                format,
+            } => self.mark(*story, *id, *start, *end, format, ctx),
+            PptxOp::AlignParagraphs {
+                story,
+                from,
+                to,
+                alignment,
+            } => self.align(*story, *from, *to, *alignment, ctx),
             PptxOp::JoinParagraph { story, mark } => self.join(*story, *mark, ctx),
             PptxOp::InsertSlide { id, after } => self.insert_slide(*id, *after),
             PptxOp::DeleteSlide { slide } => self.delete_slide(*slide),

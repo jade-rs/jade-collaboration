@@ -194,8 +194,12 @@ fn marks_jade_cannot_write_are_refused() {
     let before = model.clone();
     let bad = [
         CharFormat::Size { hundredths: 99 },
-        CharFormat::Size { hundredths: 400_001 },
-        CharFormat::Color { color: "red".into() },
+        CharFormat::Size {
+            hundredths: 400_001,
+        },
+        CharFormat::Color {
+            color: "red".into(),
+        },
         CharFormat::Color {
             color: "#12345G".into(),
         },
@@ -212,7 +216,9 @@ fn marks_jade_cannot_write_are_refused() {
     }
     let good = [
         CharFormat::Size { hundredths: 100 },
-        CharFormat::Size { hundredths: 400_000 },
+        CharFormat::Size {
+            hundredths: 400_000,
+        },
         CharFormat::Italic { value: true },
         CharFormat::Underline { value: true },
         CharFormat::Font {

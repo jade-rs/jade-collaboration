@@ -17,6 +17,6 @@ mod model;
 pub use jade::JadePptx;
 pub use load::LoadError;
 pub use model::{
-    Atom, Geometry, GeometryEdit, Paragraph, PptxEffect, PptxModel, PptxOp, ShapeKind, ShapeRef,
-    ShapeView, SlideView, StoryId, TextTarget,
+    Alignment, Atom, CharFormat, FormatRun, Geometry, GeometryEdit, MarkKey, Paragraph, PptxEffect,
+    PptxModel, PptxOp, ShapeKind, ShapeRef, ShapeView, SlideView, StoryId, TextTarget,
 };

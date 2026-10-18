@@ -190,12 +190,13 @@ impl Hosted for Pptx {
         Ok((model, jade))
     }
 
-    fn export(_: &PptxModel, materializer: &JadePptx) -> Result<Vec<u8>, String> {
-        materializer.export()
+    fn export(model: &PptxModel, materializer: &JadePptx) -> Result<Vec<u8>, String> {
+        materializer.export(model)
     }
 
+    /// The base file: the model's marks are in the checkpoint's model.
     fn checkpoint_file(materializer: &JadePptx) -> Result<Vec<u8>, String> {
-        materializer.export()
+        Ok(materializer.export_base())
     }
 }
 

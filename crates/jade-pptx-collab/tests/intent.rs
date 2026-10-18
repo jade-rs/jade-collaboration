@@ -423,9 +423,14 @@ fn formatting_by_shape_id_and_byte_offsets() {
         start_offset: 0,
         end_paragraph: 0,
         end_offset: 3,
-        format: CharFormat::Color { color: "red".into() },
+        format: CharFormat::Color {
+            color: "red".into(),
+        },
     };
-    assert!(matches!(run(&mut model, bad), Err(IntentError::InvalidFormat(_))));
+    assert!(matches!(
+        run(&mut model, bad),
+        Err(IntentError::InvalidFormat(_))
+    ));
 
     // Alignment of every paragraph, the empty last one included.
     let ops = run(

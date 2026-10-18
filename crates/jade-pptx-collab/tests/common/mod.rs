@@ -261,7 +261,7 @@ pub fn generate(view: &PptxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
         }
         // Character formatting over a random range of a shape's text.
         18..=19 => {
-            let shapes: Vec<_> = stories(view)
+            let shapes: Vec<_> = stories
                 .into_iter()
                 .filter_map(|(number, target, story)| match target {
                     Target::Shape(shape) => Some((number, shape, story)),
@@ -312,7 +312,7 @@ pub fn generate(view: &PptxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
         }
         // Aligning a few paragraphs of a shape.
         _ => {
-            let shapes: Vec<_> = stories(view)
+            let shapes: Vec<_> = stories
                 .into_iter()
                 .filter_map(|(number, target, story)| match target {
                     Target::Shape(shape) => Some((number, shape, story)),
@@ -382,7 +382,11 @@ impl RunLook {
                 self.east_asian_font.as_deref() == Some(typeface)
             }
             CharFormat::Color { color } => {
-                self.color == Some(format!("{:?}", jade_pptx_reader::Color::Srgb(color[1..].to_ascii_uppercase())))
+                self.color
+                    == Some(format!(
+                        "{:?}",
+                        jade_pptx_reader::Color::Srgb(color[1..].to_ascii_uppercase())
+                    ))
             }
         }
     }
@@ -456,7 +460,9 @@ pub fn looks(deck: &jade_pptx_reader::Deck, index: usize, id: u32) -> Vec<(char,
 /// never sees a mark).
 pub fn assert_formatted(model: &PptxModel, jade: &JadePptx, context: &str) {
     let base = jade_pptx_reader::read_deck(jade.bytes()).unwrap();
-    let written = jade.export(model).unwrap_or_else(|e| panic!("{context}: {e}"));
+    let written = jade
+        .export(model)
+        .unwrap_or_else(|e| panic!("{context}: {e}"));
     let formatted = jade_pptx_reader::read_deck(&written).unwrap();
     for (index, slide) in model.slides().iter().enumerate() {
         for shape in &slide.shapes {
@@ -476,7 +482,10 @@ pub fn assert_formatted(model: &PptxModel, jade: &JadePptx, context: &str) {
             let before = looks(&base, index, id);
             let after = looks(&formatted, index, id);
             let shown: String = after.iter().map(|(c, _)| *c).collect();
-            assert_eq!(&shown, text, "text of shape {id} on slide {index} {context}");
+            assert_eq!(
+                &shown, text,
+                "text of shape {id} on slide {index} {context}"
+            );
             assert_eq!(before.len(), after.len(), "{context}");
             let marked = model.char_formats(story).unwrap();
             let chars = model
