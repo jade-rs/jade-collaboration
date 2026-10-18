@@ -108,18 +108,18 @@ enum Choice {
 fn choice() -> impl Strategy<Value = Choice> {
     let n = any::<u8>();
     prop_oneof![
-        2 => (n.clone(), n.clone()).prop_map(|(a, b)| Choice::InsertRow(a, b)),
-        1 => n.clone().prop_map(Choice::DeleteRow),
-        2 => (n.clone(), n.clone()).prop_map(|(a, b)| Choice::InsertColumn(a, b)),
-        1 => n.clone().prop_map(Choice::DeleteColumn),
-        4 => (n.clone(), n.clone(), n.clone(), n.clone()).prop_map(|(a, b, c, d)| Choice::Merge(a, b, c, d)),
+        2 => (n, n).prop_map(|(a, b)| Choice::InsertRow(a, b)),
+        1 => n.prop_map(Choice::DeleteRow),
+        2 => (n, n).prop_map(|(a, b)| Choice::InsertColumn(a, b)),
+        1 => n.prop_map(Choice::DeleteColumn),
+        4 => (n, n, n, n).prop_map(|(a, b, c, d)| Choice::Merge(a, b, c, d)),
         2 => n.prop_map(Choice::Unmerge),
     ]
 }
 
 /// A line of `lines` picked by `k`, or now and then an id that is not one.
 fn pick(lines: &[Id], k: u8, unknown: u64) -> Id {
-    if k % 13 == 0 || lines.is_empty() {
+    if k.is_multiple_of(13) || lines.is_empty() {
         id(unknown)
     } else {
         lines[k as usize % lines.len()]
@@ -134,23 +134,23 @@ fn resolve(grid: &Grid, choice: &Choice, fresh: &mut u64) -> GridOp {
     };
     match *choice {
         Choice::InsertRow(a, b) => GridOp::InsertRow {
-            id: if a % 17 == 0 {
+            id: if a.is_multiple_of(17) {
                 pick(&rows, a, 99)
             } else {
                 new()
             },
-            after: (b % 5 != 0).then(|| pick(&rows, b, 98)),
+            after: (!b.is_multiple_of(5)).then(|| pick(&rows, b, 98)),
         },
         Choice::DeleteRow(a) => GridOp::DeleteRow {
             id: pick(&rows, a, 97),
         },
         Choice::InsertColumn(a, b) => GridOp::InsertColumn {
-            id: if a % 17 == 0 {
+            id: if a.is_multiple_of(17) {
                 pick(&columns, a, 199)
             } else {
                 new()
             },
-            after: (b % 5 != 0).then(|| pick(&columns, b, 198)),
+            after: (!b.is_multiple_of(5)).then(|| pick(&columns, b, 198)),
         },
         Choice::DeleteColumn(a) => GridOp::DeleteColumn {
             id: pick(&columns, a, 197),
@@ -162,7 +162,7 @@ fn resolve(grid: &Grid, choice: &Choice, fresh: &mut u64) -> GridOp {
             right: pick(&columns, d, 195),
         }),
         Choice::Unmerge(a) => match grid.merges().get(a as usize % grid.merges().len().max(1)) {
-            Some(m) if a % 7 != 0 => GridOp::Unmerge {
+            Some(m) if !a.is_multiple_of(7) => GridOp::Unmerge {
                 top: m.top,
                 left: m.left,
             },
