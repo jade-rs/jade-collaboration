@@ -65,6 +65,8 @@ fn read_document_lists_formats_and_borders_written_in_the_session() {
         json!({ "type": "set_borders", "sheet": "S", "range": "A1:B1",
                 "borders": { "outline": { "style": "thin", "color": "FF0000" } } }),
         json!({ "type": "set_format", "sheet": "S", "range": "C3", "change": { "bold": true } }),
+        json!({ "type": "set_format", "sheet": "S", "range": "B:B", "change": { "italic": true } }),
+        json!({ "type": "set_format", "sheet": "S", "range": "3:3", "change": { "fill_color": "FFFF00" } }),
     ] {
         let intent: XlsxIntent = serde_json::from_value(intent).unwrap();
         let op = resolve(&model, &intent, &mut |n| {
@@ -85,8 +87,17 @@ fn read_document_lists_formats_and_borders_written_in_the_session() {
         read["sheets"][0]["formats"],
         json!({
             "A1": { "border_left": line, "border_top": line, "border_bottom": line },
-            "B1": { "border_right": line, "border_top": line, "border_bottom": line },
-            "C3": { "bold": true },
+            "B1": { "border_right": line, "border_top": line, "border_bottom": line, "italic": true },
+            "C3": { "bold": true, "fill_color": "FFFF00" },
         })
+    );
+    // Whole rows and columns are listed by their own labels.
+    assert_eq!(
+        read["sheets"][0]["column_formats"],
+        json!({ "B": { "italic": true } })
+    );
+    assert_eq!(
+        read["sheets"][0]["row_formats"],
+        json!({ "3": { "fill_color": "FFFF00" } })
     );
 }

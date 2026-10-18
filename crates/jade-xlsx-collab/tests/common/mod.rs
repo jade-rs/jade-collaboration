@@ -6,7 +6,7 @@ use jade_collab_core::grid::{GridOp, Merge};
 use jade_collab_core::id::Id;
 use jade_xlsx_collab::{
     column_label, BorderLine, BorderStyle, CellInput, FormatChange, HorizontalAlignment, JadeXlsx,
-    LoadOptions, RangeBorders, VerticalAlignment, XlsxModel, XlsxOp,
+    LineAxis, LoadOptions, RangeBorders, VerticalAlignment, XlsxModel, XlsxOp,
 };
 use jade_xlsx_headless_api::CellKind;
 
@@ -303,7 +303,7 @@ pub fn generate(view: &XlsxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
             1 + pick(sheet.rows.len(), salt + 6)
         )
     };
-    match choice % 22 {
+    match choice % 23 {
         0..=5 => {
             let value = match (choice >> 28) % 6 {
                 0 => CellInput::Number(((choice >> 34) % 1000) as f64 / 4.0),
@@ -323,7 +323,7 @@ pub fn generate(view: &XlsxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
         }
         6 | 7 => Some(XlsxOp::Structure {
             sheet: sheet.id,
-            op: if choice % 22 == 6 {
+            op: if choice % 23 == 6 {
                 GridOp::InsertRow {
                     id: ids(1),
                     after: (pick(4, 30) != 0).then_some(row),
@@ -445,6 +445,23 @@ pub fn generate(view: &XlsxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
                     diagonal_up: (choice >> 60 & 1 == 1).then_some(choice >> 61 & 1 == 1),
                     ..RangeBorders::default()
                 },
+            })
+        }
+        22 => {
+            // Up to two whole rows or columns.
+            let (axis, lines) = if choice >> 12 & 1 == 0 {
+                (LineAxis::Rows, &sheet.rows)
+            } else {
+                (LineAxis::Columns, &sheet.columns)
+            };
+            let first = pick(lines.len(), 13);
+            let last = (first + pick(2, 19)).min(lines.len() - 1);
+            Some(XlsxOp::SetLineFormat {
+                sheet: sheet.id,
+                axis,
+                lines: lines[first..=last].to_vec(),
+                stamp: ids(1),
+                change: format_change(choice >> 30),
             })
         }
         _ => unreachable!(),
