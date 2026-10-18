@@ -104,6 +104,7 @@ async fn a_restarted_server_resumes_every_replica_where_it_was() {
     // Restarts from a checkpoint taken mid-session plus the journal after it.
     let options = StorageOptions {
         checkpoint_every: 5,
+        ..StorageOptions::default()
     };
     let server = Server::with_storage_options(dir.path(), options).unwrap();
     server.open("hello.docx", fixture("hello.docx")).unwrap();
@@ -203,6 +204,8 @@ async fn checkpoints_bound_the_log_and_replicas_behind_them_must_rejoin() {
     let dir = tempfile::tempdir().unwrap();
     let options = StorageOptions {
         checkpoint_every: 3,
+        keep_tail: 0,
+        ..StorageOptions::default()
     };
     let server = Server::with_storage_options(dir.path(), options).unwrap();
     server.open("hello.docx", fixture("hello.docx")).unwrap();
@@ -262,6 +265,68 @@ async fn checkpoints_bound_the_log_and_replicas_behind_them_must_rejoin() {
     assert!(error.to_string().contains("join again"), "{error}");
     let rejoined: Client<DocxModel> = Client::connect(&url, None).await.unwrap();
     assert_eq!(rejoined.view(), writer.view());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn replicas_just_behind_a_checkpoint_resume_from_the_kept_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = StorageOptions {
+        checkpoint_every: 3,
+        keep_tail: 4,
+        ..StorageOptions::default()
+    };
+    let server = Server::with_storage_options(dir.path(), options).unwrap();
+    server.open("hello.docx", fixture("hello.docx")).unwrap();
+    let (base, task) = listen(&server).await;
+    let url = format!("{base}/hello.docx/ws");
+
+    let far: Client<DocxModel> = Client::connect(&url, None).await.unwrap();
+    let far_live = Client::<DocxModel>::connect(&url, None).await.unwrap();
+    let (far, far_live) = (far.disconnect().await, far_live.disconnect().await);
+    let writer: Client<DocxModel> = Client::connect(&url, None).await.unwrap();
+    for i in 0..6 {
+        type_text(&writer, 0, &format!("{i}"));
+        writer.settle().await.unwrap();
+    }
+    let near: Client<DocxModel> = Client::connect(&url, None).await.unwrap();
+    let near_live = Client::<DocxModel>::connect(&url, None).await.unwrap();
+    let (near, near_live) = (near.disconnect().await, near_live.disconnect().await);
+    assert_eq!(near.seq(), 6);
+    for i in 6..9 {
+        type_text(&writer, 0, &format!("{i}"));
+        writer.settle().await.unwrap();
+    }
+    catch_up(&server, "hello.docx", &writer).await;
+
+    // Three behind, across checkpoints: resumed, not asked to join again.
+    let near_live = Client::resume(&url, near_live, None).await.unwrap();
+    assert_eq!(near_live.seq(), 9);
+    assert_eq!(near_live.view(), writer.view());
+    // Nine behind is further than the four kept.
+    let error = Client::resume(&url, far_live, None)
+        .await
+        .err()
+        .expect("refused");
+    assert!(matches!(error, ClientError::Rejoin(_)), "{error}");
+
+    let view = writer.view();
+    drop(near_live);
+    drop(writer);
+    task.abort();
+    drop(server);
+
+    // The tail is on disk: after a restart the same replica still resumes.
+    let server = Server::with_storage_options(dir.path(), options).unwrap();
+    let (base, _task) = listen(&server).await;
+    let url = format!("{base}/hello.docx/ws");
+    let near = Client::resume(&url, near, None).await.unwrap();
+    assert_eq!(near.seq(), 9);
+    assert_eq!(near.view(), view);
+    let error = Client::resume(&url, far, None)
+        .await
+        .err()
+        .expect("refused");
+    assert!(matches!(error, ClientError::Rejoin(_)), "{error}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

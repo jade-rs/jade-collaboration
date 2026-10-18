@@ -347,22 +347,24 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(48))]
 
         /// Whatever was appended, checkpointed and torn, reopening gives the
-        /// newest checkpoint, its file, and exactly the complete records
-        /// after it — and keeps one generation on disk.
+        /// newest checkpoint, the tail kept with it, its file, and exactly
+        /// the complete records after it — and keeps one generation on disk.
         #[test]
         fn reopening_reads_back_the_newest_checkpoint_and_journal(
             checkpoint_every in 1..8u64,
+            keep_tail in 0..4usize,
             steps in steps(),
         ) {
             let root = tempfile::tempdir().unwrap();
             let dir = root.path().join("doc.docx");
-            let options = StorageOptions { checkpoint_every };
+            let options = StorageOptions { checkpoint_every, keep_tail, ..StorageOptions::default() };
             let mut checkpoints = 0;
             let mut expected_checkpoint = checkpoint(checkpoints);
             let mut store = DocumentStore::create(
                 dir.clone(), Format::Docx, options, &expected_checkpoint, b"file 0",
             ).unwrap();
             let mut expected_file = b"file 0".to_vec();
+            let mut expected_tail: Vec<Committed<String>> = Vec::new();
             let mut expected_journal: Vec<Record<String>> = Vec::new();
             for step in steps {
                 match step {
@@ -374,7 +376,15 @@ mod tests {
                             checkpoints += 1;
                             expected_checkpoint = checkpoint(checkpoints);
                             expected_file = format!("file {checkpoints}").into_bytes();
-                            store.checkpoint(&expected_checkpoint, &expected_file).unwrap();
+                            let committed: Vec<Committed<String>> = expected_journal
+                                .iter()
+                                .filter_map(|record| match record {
+                                    Record::Committed(c) => Some(c.clone()),
+                                    _ => None,
+                                })
+                                .collect();
+                            expected_tail = committed[committed.len().saturating_sub(keep_tail)..].to_vec();
+                            store.checkpoint(&expected_checkpoint, &expected_tail, &expected_file).unwrap();
                             expected_journal.clear();
                         }
                     }
@@ -390,6 +400,7 @@ mod tests {
                             DocumentStore::open::<String, String>(dir.clone(), Format::Docx, options).unwrap();
                         store = reopened;
                         prop_assert_eq!(&stored.checkpoint, &expected_checkpoint);
+                        prop_assert_eq!(&stored.tail, &expected_tail);
                         prop_assert_eq!(&stored.file, &expected_file);
                         prop_assert_eq!(&stored.journal, &expected_journal);
                     }
@@ -398,6 +409,7 @@ mod tests {
             let (_, stored) =
                 DocumentStore::open::<String, String>(dir.clone(), Format::Docx, options).unwrap();
             prop_assert_eq!(stored.checkpoint, expected_checkpoint);
+            prop_assert_eq!(stored.tail, expected_tail);
             prop_assert_eq!(stored.file, expected_file);
             prop_assert_eq!(stored.journal, expected_journal);
             let mut names: Vec<String> = fs::read_dir(&dir).unwrap()
@@ -407,5 +419,23 @@ mod tests {
             let n = checkpoints + 1;
             prop_assert_eq!(names, vec![log_name(n), snapshot_file(n, Format::Docx), snapshot_json(n)]);
         }
+    }
+
+    #[test]
+    fn a_snapshot_written_before_tails_existed_reads_back_with_none() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("doc.docx");
+        fs::create_dir_all(&dir).unwrap();
+        let json = serde_json::json!({"format": "docx", "checkpoint": checkpoint(3)});
+        fs::write(dir.join(snapshot_json(1)), json.to_string()).unwrap();
+        fs::write(dir.join(snapshot_file(1, Format::Docx)), b"file").unwrap();
+        let (_, stored) = DocumentStore::open::<String, String>(
+            dir,
+            Format::Docx,
+            StorageOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(stored.checkpoint, checkpoint(3));
+        assert!(stored.tail.is_empty());
     }
 }
