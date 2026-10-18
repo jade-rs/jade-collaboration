@@ -304,6 +304,11 @@ fn spot_check(rga: &Rga<char>, naive: &Naive<char>, seed: usize) -> Result<(), T
     prop_assert_eq!(rga.is_empty(), naive.nodes.is_empty());
     prop_assert_eq!(rga.visible_len(), naive.visible_len());
     prop_assert_eq!(rga.max_lamport(), naive.max_lamport());
+    // Interleaving `nodes()` with edits checks that every edit drops the
+    // materialized slice.
+    if seed.is_multiple_of(4) {
+        prop_assert_eq!(rga.nodes(), naive.nodes.as_slice());
+    }
     if let Some(node) = naive.nodes.get(seed % (naive.nodes.len() + 1)) {
         let id = node.id;
         prop_assert_eq!(rga.position(id), naive.position(id));
@@ -495,6 +500,14 @@ proptest! {
         }
         prop_assert_eq!(&x, &y);
         prop_assert_eq!(&x.clone(), &y);
+        // …and different sequences are different.
+        if let Some(last) = cmds.last() {
+            let (mut z, mut shorter) = (fresh(b), Naive::new());
+            for cmd in &cmds[..cmds.len() - 1] {
+                step(&mut z, &mut shorter, cmd)?;
+            }
+            prop_assert_eq!(x == z, naive == shorter, "after dropping {:?}", last);
+        }
     }
 }
 
