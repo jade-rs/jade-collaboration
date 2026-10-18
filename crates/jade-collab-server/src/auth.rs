@@ -251,12 +251,23 @@ pub(crate) async fn authenticate(
             request.extensions_mut().insert(Presented(token));
             next.run(request).await
         }
-        None => (
-            StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Bearer")],
-            "a valid token is required",
-        )
-            .into_response(),
+        None => {
+            // The path only: a socket's URL may carry the token.
+            server.audit().record(
+                "refused",
+                serde_json::json!({
+                    "path": request.uri().path(),
+                    "token": null,
+                    "status": StatusCode::UNAUTHORIZED.as_u16(),
+                }),
+            );
+            (
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, "Bearer")],
+                "a valid token is required",
+            )
+                .into_response()
+        }
     }
 }
 

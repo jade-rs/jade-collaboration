@@ -32,7 +32,7 @@ fn submit(
 /// The server, stopped and brought back from its checkpoint and the file
 /// jade wrote at that point, as a durable server restarts.
 fn restart(server: &Sequencer<DocxModel, JadeDocx>) -> Sequencer<DocxModel, JadeDocx> {
-    let bytes = server.materializer().export().unwrap();
+    let bytes = server.materializer().export_base().unwrap();
     Sequencer::restore(server.checkpoint(), JadeDocx::load(&bytes).unwrap())
 }
 

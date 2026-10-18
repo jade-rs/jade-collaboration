@@ -1,0 +1,11 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c3781c88f754365049231c370971674b47c4136374474d0ab956eb665177f7e3 # shrinks to fixture_name = "jade-core/hello.docx", steps = [(1, 7349055877032202796), (1, 1005455756786233279)]
+cc 55208f6eb9116dc63d9596110351605f87ff7b7754d005bc6f14c8aadd33edc8 # shrinks to fixture_name = "review.docx", steps = [(1, 9105354808354728005), (1, 781713088552337997)]
+cc fcacc2ddaa65a89b4116d5af09eb5406bb459aa79cb28c300be11df293b28881 # shrinks to fixture_name = "textbox.docx", steps = [(1, 747074598997901128), (1, 8561389725384605785), (1, 1916570140792060634), (1, 4593303259593967204)]
+cc deebddf4f2351f0aec45066947b55ba9e625e0a3e903b643ecc02c83052eae24 # shrinks to fixture_name = "footnote.docx", steps = [(1, 15037394347147502994)]
+cc c61d5f5225970dc7dbc0529c8ca651d69cbf8a6546b3394df401c92ec74a5b30 # shrinks to fixture_name = "footnote.docx", steps = [(1, 6959319800859821456), (1, 16978155584903466591), (1, 3066081161145779307), (1, 16547207546434340425)]

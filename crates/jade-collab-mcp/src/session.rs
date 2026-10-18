@@ -4,10 +4,10 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use jade_collab_core::id::Id;
+use jade_collab_core::id::{Id, ReplicaId};
 use jade_collab_server::{Client, ClientError, Format};
 use jade_collab_sync::{Document, ReplicaEvent};
-use jade_docx_collab::intent::{resolve as resolve_docx, IntentOp};
+use jade_docx_collab::intent::{resolve_with as resolve_docx, word_date, Context, IntentOp};
 use jade_docx_collab::DocxModel;
 use jade_pptx_collab::intent::{resolve as resolve_pptx, PptxIntent};
 use jade_pptx_collab::PptxModel;
@@ -35,23 +35,31 @@ enum Outcome {
     Submitted(Vec<u64>),
 }
 
-/// Resolves one edit against a view into operations; `ids(n)` reserves `n`
-/// fresh identifiers.
+/// Resolves one edit against a view into operations on behalf of a replica;
+/// `ids(n)` reserves `n` fresh identifiers.
 type Resolve<D> =
-    fn(&D, Value, &mut dyn FnMut(u64) -> Id) -> Result<Vec<<D as Document>::Op>, String>;
+    fn(&D, Value, ReplicaId, &mut dyn FnMut(u64) -> Id) -> Result<Vec<<D as Document>::Op>, String>;
 
+/// docx edits are the agent's own: with tracking on, its deletions remove
+/// its own tracked insertions outright, and its changes are dated now.
 fn docx_ops(
     view: &DocxModel,
     edit: Value,
+    replica: ReplicaId,
     ids: &mut dyn FnMut(u64) -> Id,
 ) -> Result<Vec<<DocxModel as Document>::Op>, String> {
     let intent: IntentOp = serde_json::from_value(edit).map_err(|e| e.to_string())?;
-    resolve_docx(view, &intent, ids).map_err(|e| e.to_string())
+    let context = Context {
+        replica: Some(replica),
+        date: Some(word_date(std::time::SystemTime::now())),
+    };
+    resolve_docx(view, &intent, &context, ids).map_err(|e| e.to_string())
 }
 
 fn xlsx_ops(
     view: &XlsxModel,
     edit: Value,
+    _: ReplicaId,
     ids: &mut dyn FnMut(u64) -> Id,
 ) -> Result<Vec<<XlsxModel as Document>::Op>, String> {
     let intent: XlsxIntent = serde_json::from_value(edit).map_err(|e| e.to_string())?;
@@ -63,6 +71,7 @@ fn xlsx_ops(
 fn pptx_ops(
     view: &PptxModel,
     edit: Value,
+    _: ReplicaId,
     ids: &mut dyn FnMut(u64) -> Id,
 ) -> Result<Vec<<PptxModel as Document>::Op>, String> {
     let intent: PptxIntent = serde_json::from_value(edit).map_err(|e| e.to_string())?;
@@ -88,7 +97,7 @@ where
     let mut outcomes = Vec::with_capacity(edits.len());
     for edit in edits {
         let view = client.view();
-        let ops = match resolve(&view, edit, &mut |n| client.reserve(n)) {
+        let ops = match resolve(&view, edit, client.id(), &mut |n| client.reserve(n)) {
             Ok(ops) => ops,
             Err(error) => {
                 outcomes.push(Outcome::Invalid(error));

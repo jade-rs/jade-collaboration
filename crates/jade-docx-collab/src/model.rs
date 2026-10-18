@@ -15,8 +15,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+mod tracked;
+
 use jade_collab_core::grid::{Grid, GridOp, Merge};
 use jade_collab_core::id::{Id, ReplicaId};
+use jade_collab_core::marks::{self, Boundary, Expand, Mark, MarkSet};
 use jade_collab_core::rga::Rga;
 use jade_collab_sync::{ApplyContext, Document, Lane, Rejection};
 pub use jade_docx_document_core::word_document::ParagraphStory;
@@ -139,6 +142,9 @@ pub(crate) struct Story {
     /// table, an empty text box, a text box inside a text box); such a story
     /// is read-only.
     pub(crate) has_paragraph: bool,
+    /// Character formatting made in the session, anchored to `flow`'s atoms.
+    #[serde(default, skip_serializing_if = "MarkSet::is_empty")]
+    pub(crate) marks: MarkSet<MarkKey, FormatChange>,
 }
 
 impl Story {
@@ -147,6 +153,7 @@ impl Story {
             flow: Rga::new(),
             blocks: Vec::new(),
             has_paragraph: true,
+            marks: MarkSet::new(),
         }
     }
 }
@@ -221,18 +228,17 @@ impl Table {
         self.layout.insert((row, column), vec![key]);
     }
 
+    /// A cell a merge covers: its story exists (an edit made before the
+    /// merge was seen still lands somewhere) but no position shows it.
+    fn add_hidden_cell(&mut self, row: Id, column: Id) {
+        self.stories
+            .insert(StoryKey::Cell(row, column), Story::empty_paragraph());
+    }
+
     /// Alive (row, column) positions of `merge`, row by row.
     fn positions(&self, merge: &Merge) -> Vec<(Id, Id)> {
-        let between = |lines: Vec<Id>, first: Id, last: Id| {
-            let a = lines.iter().position(|l| *l == first);
-            let b = lines.iter().position(|l| *l == last);
-            match (a, b) {
-                (Some(a), Some(b)) if a <= b => lines[a..=b].to_vec(),
-                _ => Vec::new(),
-            }
-        };
-        let rows = between(self.grid.rows(), merge.top, merge.bottom);
-        let columns = between(self.grid.columns(), merge.left, merge.right);
+        let rows = lines_between(&self.grid.rows(), merge.top, merge.bottom);
+        let columns = lines_between(&self.grid.columns(), merge.left, merge.right);
         rows.iter()
             .flat_map(|r| columns.iter().map(move |c| (*r, *c)))
             .collect()
@@ -252,6 +258,16 @@ impl Table {
                 ))
             })
             .collect()
+    }
+}
+
+/// The lines of `lines` from `first` through `last`, in order.
+fn lines_between(lines: &[Id], first: Id, last: Id) -> Vec<Id> {
+    let a = lines.iter().position(|l| *l == first);
+    let b = lines.iter().position(|l| *l == last);
+    match (a, b) {
+        (Some(a), Some(b)) if a <= b => lines[a..=b].to_vec(),
+        _ => Vec::new(),
     }
 }
 
@@ -277,7 +293,76 @@ pub struct DocxModel {
     /// operations find it by its id.
     #[serde(default, with = "pairs")]
     pub(crate) comments: BTreeMap<Id, Comment>,
+    /// Word's Track Changes button: whether edits made through the intent
+    /// API become revisions. Operations never depend on it.
+    #[serde(default)]
+    pub(crate) tracking: bool,
+    /// Who each replica is, as the server says (`SetAuthor`).
+    #[serde(default, with = "pairs")]
+    pub(crate) authors: BTreeMap<ReplicaId, String>,
+    /// Every revision ever made or loaded, decided ones included.
+    #[serde(default, with = "pairs")]
+    pub(crate) revisions: BTreeMap<Id, Revision>,
+    /// Character → the tracked insertion that made it, until accepted.
+    #[serde(default, with = "pairs")]
+    pub(crate) inserted: BTreeMap<Id, Id>,
+    /// Character → every tracked deletion that named it (grow-only under
+    /// the convergent lane; a rejection removes one).
+    #[serde(default, with = "pairs")]
+    pub(crate) deleted: BTreeMap<Id, BTreeSet<Id>>,
     pub(crate) max_lamport: u64,
+}
+
+/// What a revision does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RevisionKind {
+    Insertion,
+    Deletion,
+}
+
+/// One tracked change: a tracked insertion or deletion made in the session
+/// (named by its first character's id, or the id its author gave the
+/// deletion), or the revisions of one kind, `w:id`, author and date loaded
+/// from the file.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Revision {
+    pub kind: RevisionKind,
+    /// The name the server had given the author's replica when the
+    /// revision was made; `None` for an anonymous one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    /// As the author's client gave it (`w:date`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date: Option<String>,
+    /// The replica that made it ([`ReplicaId::ORIGIN`] for the file's).
+    pub replica: ReplicaId,
+    /// jade's `w:id` of a revision loaded from the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
+    /// A move (`w:moveFrom` / `w:moveTo`) loaded from the file.
+    #[serde(default)]
+    pub moved: bool,
+}
+
+/// A revision with characters left, as [`DocxModel::revisions`] lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RevisionView {
+    pub id: Id,
+    pub revision: Revision,
+    /// Its characters' text, in document order.
+    pub text: String,
+    /// The paragraph ordinals holding them.
+    pub paragraphs: Vec<usize>,
+}
+
+/// A character's tracked changes, as Word shows them: the insertion that
+/// made it and the deletion it is attributed to (the least of the
+/// deletions that named it).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Tracked {
+    pub inserted: Option<Id>,
+    pub deleted: Option<Id>,
 }
 
 /// A comment's text and who wrote it, as jade's comment commands take them.
@@ -427,6 +512,49 @@ pub enum FormatChange {
 
 /// The sizes jade draws a new text box at, in pixels.
 const TEXT_BOX_PX: std::ops::RangeInclusive<u32> = 12..=4096;
+/// A character attribute that travels the convergent lane as a mark: a
+/// simple run property whose value replaces the previous one. Concurrent
+/// marks of one attribute resolve to the newest; different attributes are
+/// independent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarkKey {
+    Bold,
+    Italic,
+    Underline,
+    Strike,
+    FontSize,
+    FontFamily,
+    FontColor,
+    Highlight,
+}
+
+impl MarkKey {
+    /// Every attribute, in order.
+    pub const ALL: [MarkKey; 8] = [
+        MarkKey::Bold,
+        MarkKey::Italic,
+        MarkKey::Underline,
+        MarkKey::Strike,
+        MarkKey::FontSize,
+        MarkKey::FontFamily,
+        MarkKey::FontColor,
+        MarkKey::Highlight,
+    ];
+
+    /// How a mark of this attribute grows: like Word, text typed at the end
+    /// of formatted text takes its formatting, so every one of them expands
+    /// at its end (and none at its start).
+    pub fn expand(self) -> Expand {
+        Expand::End
+    }
+
+    /// The attributes a clear unsets: all but the highlight, which Word's
+    /// Ctrl+Space (and jade's clear) leave in place.
+    pub fn cleared(self) -> bool {
+        self != MarkKey::Highlight
+    }
+}
 
 /// Word's limits: 1pt to 1638pt.
 const FONT_HALF_POINTS: std::ops::RangeInclusive<u32> = 2..=3276;
@@ -475,6 +603,24 @@ const UNDERLINE_STYLES: &[&str] = &[
 ];
 
 impl FormatChange {
+    /// The attribute a simple character change sets, which makes it a mark;
+    /// `None` for clearing and paragraph changes.
+    pub fn mark_key(&self) -> Option<MarkKey> {
+        Some(match self {
+            Self::Bold { .. } => MarkKey::Bold,
+            Self::Italic { .. } => MarkKey::Italic,
+            Self::Underline { .. } => MarkKey::Underline,
+            Self::Strike { .. } => MarkKey::Strike,
+            Self::FontSize { .. } => MarkKey::FontSize,
+            Self::FontFamily { .. } => MarkKey::FontFamily,
+            Self::FontColor { .. } => MarkKey::FontColor,
+            Self::Highlight { .. } => MarkKey::Highlight,
+            Self::ClearFormatting | Self::Alignment { .. } | Self::ParagraphStyle { .. } => {
+                return None
+            }
+        })
+    }
+
     /// Whether the change applies to whole paragraphs.
     pub fn is_paragraph_level(&self) -> bool {
         matches!(self, Self::Alignment { .. } | Self::ParagraphStyle { .. })
@@ -508,6 +654,17 @@ impl FormatChange {
     }
 }
 
+/// A character change the file must show on `start..end` (UTF-8 bytes of
+/// the model's text) of one paragraph: what the marks give those
+/// characters.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextFormat {
+    pub paragraph: ParagraphStory,
+    pub start: usize,
+    pub end: usize,
+    pub change: FormatChange,
+}
+
 /// One paragraph as the model walks it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Paragraph {
@@ -521,6 +678,9 @@ pub struct Paragraph {
     pub at: ParagraphStory,
     /// Its text boxes and note references, in order.
     pub anchors: Vec<AnchorView>,
+    /// Each character's tracked changes (one per `chars` entry). Text a
+    /// tracked deletion removed is still in `text`: jade counts it.
+    pub tracked: Vec<Tracked>,
 }
 
 /// A text box or note reference in a paragraph.
@@ -543,6 +703,7 @@ impl Paragraph {
             chars: Vec::new(),
             at: ParagraphStory::Body { index: 0 },
             anchors: Vec::new(),
+            tracked: Vec::new(),
         }
     }
 
@@ -595,7 +756,13 @@ pub enum DocxOp {
         rows: Vec<Id>,
         columns: Vec<Id>,
     },
-    /// Sequenced. Row and column structure of a top-level table.
+    /// Sequenced. Row and column structure of a top-level table. Rows and
+    /// columns go through merged cells as in Word: a line inserted strictly
+    /// inside a merge joins it (its cells there are covered, a vertical
+    /// merge's new follower is empty), a deleted edge line moves the edge
+    /// inward — deleting the top row deletes what the merged cell shows,
+    /// deleting the left column keeps it — and a merge left with one cell is
+    /// an ordinary cell.
     Table { table: Id, op: GridOp },
     /// Sequenced. Merges a rectangle of cells as Word and jade do: the
     /// top-left cell shows every covered cell's content, row by row; each
@@ -613,6 +780,23 @@ pub enum DocxOp {
     },
     /// Sequenced.
     DeleteTable { table: Id },
+    /// Convergent. Character formatting as a mark (Peritext): `change` (a
+    /// simple attribute, [`FormatChange::mark_key`]) holds from `start` to
+    /// `end`, sides of atoms of `story` or its ends, and the newest mark of
+    /// an attribute wins on each character it covers. The intent API makes
+    /// the boundaries with the attribute's expand rule (before the first
+    /// character; before the atom after the last one, or the story's end).
+    /// [`FormatChange::ClearFormatting`] unsets every attribute but the
+    /// highlight instead, returning the characters to the formatting jade
+    /// has for them. The model refuses a mark whose anchors it does not have
+    /// or that covers nothing, as every replica does.
+    Mark {
+        story: StoryId,
+        id: Id,
+        start: Boundary,
+        end: Boundary,
+        change: FormatChange,
+    },
     /// Sequenced. Formats the atoms from `start` through `end` (characters,
     /// or paragraph marks to reach an empty paragraph) of one story. The
     /// range is resolved when the operation is applied: characters deleted
@@ -686,6 +870,38 @@ pub enum DocxOp {
     /// made in the session. Only the server commits these, right after the
     /// operation that made it.
     Numbered { item: Numbered, file_id: String },
+    /// Convergent. Like `InsertText`, as a tracked insertion: revision
+    /// `first`, authored by the origin replica's name.
+    TrackInsertText {
+        story: StoryId,
+        parent: Option<Id>,
+        first: Id,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        date: Option<String>,
+    },
+    /// Convergent. A tracked deletion `revision` of characters (never
+    /// marks or anchors): they stay, shown as deleted. Characters already
+    /// removed take the revision too, so it commutes with removals.
+    TrackDeleteText {
+        story: StoryId,
+        ids: Vec<Id>,
+        revision: Id,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        date: Option<String>,
+    },
+    /// Sequenced. The document's tracking mode (Word's Track Changes).
+    SetTracking { on: bool },
+    /// Sequenced, the server's only: `replica`'s author name, which the
+    /// revisions it makes from now on carry.
+    SetAuthor { replica: ReplicaId, name: String },
+    /// Sequenced. Accepts whole revisions: an insertion's characters become
+    /// plain, a deletion's go. Refused when empty or naming an unknown
+    /// revision; a decided one is left as it is.
+    AcceptRevisions { revisions: Vec<Id> },
+    /// Sequenced. Rejects whole revisions: an insertion's characters go, a
+    /// deletion stops applying to its characters.
+    RejectRevisions { revisions: Vec<Id> },
 }
 
 /// Something jade numbers itself when it is made.
@@ -847,6 +1063,55 @@ pub enum DocxEffect {
         item: Numbered,
         file_id: String,
     },
+    /// `InsertText` with jade's revision session on for `author` and `date`.
+    TrackInsertText {
+        paragraph: ParagraphStory,
+        offset: usize,
+        text: String,
+        #[serde(default)]
+        anchors: usize,
+        #[serde(default)]
+        author: Option<String>,
+        #[serde(default)]
+        date: Option<String>,
+    },
+    /// `DeleteRange` with jade's revision session on: the text stays, as
+    /// deleted by `author`. No anchor lies inside the range.
+    TrackDeleteRange {
+        paragraph: ParagraphStory,
+        start: usize,
+        end: usize,
+        #[serde(default)]
+        anchors: usize,
+        #[serde(default)]
+        author: Option<String>,
+        #[serde(default)]
+        date: Option<String>,
+    },
+    /// Rejects the deletion jade shows on `start..end` (offsets in the
+    /// runs' text): the characters come back (inserted ones as insertions).
+    RestoreRange {
+        paragraph: ParagraphStory,
+        start: usize,
+        end: usize,
+    },
+    /// Accepts the deletion jade shows on `start..end` (offsets in the
+    /// runs' text): the characters go.
+    RemoveDeletedRange {
+        paragraph: ParagraphStory,
+        start: usize,
+        end: usize,
+    },
+    /// Accepts the insertion jade shows on `start..end` (offsets in the
+    /// runs' text): the characters become plain (or plainly deleted).
+    AcceptInsertionRange {
+        paragraph: ParagraphStory,
+        start: usize,
+        end: usize,
+    },
+    SetTracking {
+        on: bool,
+    },
 }
 
 #[derive(Default)]
@@ -937,12 +1202,18 @@ impl DocxModel {
                 flow,
                 blocks: Vec::new(),
                 has_paragraph: true,
+                marks: MarkSet::new(),
             },
             tables: BTreeMap::new(),
             footnotes: BTreeMap::new(),
             endnotes: BTreeMap::new(),
             text_boxes: BTreeMap::new(),
             comments: BTreeMap::new(),
+            tracking: false,
+            authors: BTreeMap::new(),
+            revisions: BTreeMap::new(),
+            inserted: BTreeMap::new(),
+            deleted: BTreeMap::new(),
             max_lamport: next - 1,
         }
     }
@@ -1004,6 +1275,7 @@ impl DocxModel {
                 Atom::Char(c) => {
                     current.text.push(c);
                     current.chars.push(node.id);
+                    current.tracked.push(self.tracked(node.id));
                 }
                 Atom::Anchor(placement) => current.anchors.push(AnchorView {
                     id: node.id,
@@ -1348,37 +1620,88 @@ impl DocxModel {
                 Some(_) => {}
             }
         }
-        let positions = self.locate(&ids.iter().copied().collect());
+        let effects = self.removal(&ids.iter().copied().collect());
         let flow = &mut self.story_mut(story).expect("checked").flow;
         for id in ids {
             flow.delete(*id)?;
         }
-        // Merge adjacent characters into ranges — never across an anchor, so
-        // jade gets no range holding a text box's or a reference's run — and
-        // apply from the end so earlier offsets stay valid.
-        let mut spans: Vec<(usize, usize, usize, usize)> = positions
-            .values()
-            .map(|at| (at.ordinal, at.offset, at.offset + at.len, at.anchors))
+        Ok(effects)
+    }
+
+    /// Where the visible characters among `ids` are, merged into ranges of
+    /// adjacent characters — never across an anchor, so jade gets no range
+    /// holding a text box's or a reference's run — in document order, as
+    /// (paragraph ordinal, start, end, anchors before).
+    pub(crate) fn ranges(&self, ids: &BTreeSet<Id>) -> Vec<(usize, usize, usize, usize)> {
+        self.classified_ranges(ids, |_| false)
+            .into_iter()
+            .map(|(_, range)| range)
+            .collect()
+    }
+
+    /// [`Self::ranges`], never merging characters `class` tells apart.
+    #[allow(clippy::type_complexity)]
+    fn classified_ranges(
+        &self,
+        ids: &BTreeSet<Id>,
+        class: impl Fn(Id) -> bool,
+    ) -> Vec<(bool, (usize, usize, usize, usize))> {
+        let mut spans: Vec<((usize, usize, usize, usize), bool)> = self
+            .locate(ids)
+            .iter()
+            .filter(|(_, at)| at.len > 0)
+            .map(|(id, at)| {
+                (
+                    (at.ordinal, at.offset, at.offset + at.len, at.anchors),
+                    class(*id),
+                )
+            })
             .collect();
         spans.sort();
-        let mut ranges: Vec<(usize, usize, usize, usize)> = Vec::new();
-        for (p, start, end, anchors) in spans {
+        let mut ranges: Vec<(bool, (usize, usize, usize, usize))> = Vec::new();
+        for ((p, start, end, anchors), kind) in spans {
             match ranges.last_mut() {
-                Some(last) if last.0 == p && last.2 == start && last.3 == anchors => last.2 = end,
-                _ => ranges.push((p, start, end, anchors)),
+                Some((last_kind, last))
+                    if *last_kind == kind
+                        && last.0 == p
+                        && last.2 == start
+                        && last.3 == anchors =>
+                {
+                    last.2 = end
+                }
+                _ => ranges.push((kind, (p, start, end, anchors))),
             }
         }
+        ranges
+    }
+
+    /// jade's commands removing the visible characters among `ids`, from
+    /// the end so earlier offsets stay valid. jade's text deletion leaves
+    /// text a tracked deletion holds, so that text goes by accepting the
+    /// deletion jade shows on it.
+    pub(crate) fn removal(&self, ids: &BTreeSet<Id>) -> Vec<DocxEffect> {
         let paragraphs = self.paragraphs();
-        Ok(ranges
+        self.classified_ranges(ids, |id| self.tracked(id).deleted.is_some())
             .into_iter()
             .rev()
-            .map(|(p, start, end, anchors)| DocxEffect::DeleteRange {
-                paragraph: paragraphs[p].at.clone(),
-                start,
-                end,
-                anchors,
+            .map(|(deleted, (p, start, end, anchors))| {
+                let paragraph = paragraphs[p].at.clone();
+                if deleted {
+                    DocxEffect::RemoveDeletedRange {
+                        paragraph,
+                        start,
+                        end,
+                    }
+                } else {
+                    DocxEffect::DeleteRange {
+                        paragraph,
+                        start,
+                        end,
+                        anchors,
+                    }
+                }
             })
-            .collect())
+            .collect()
     }
 
     fn split(
@@ -1552,57 +1875,76 @@ impl DocxModel {
                 "merge and unmerge cells with merge_cells / unmerge_cells",
             ));
         }
-        // Rows and columns stay clear of merged regions: jade would have to
-        // split or grow the merge, which the model does not follow.
+        // Rows and columns go through merged regions as in Word and jade: a
+        // line inserted strictly inside a merge joins it, a deleted edge
+        // moves inward, a merge left with one cell is gone (the grid; Lean:
+        // `Grid.insertRow_covers`, `Grid.deleteRow_covers`).
         let mut grid = table.grid.clone();
         let deleted_at = match op {
             GridOp::DeleteRow { id } => table.grid.row_index(*id),
             GridOp::DeleteColumn { id } => table.grid.column_index(*id),
             _ => None,
         };
+        // A merged cell's `w:tc` sits in its left column; deleting that
+        // column leaves the `w:tc` (one column narrower) in the next one, so
+        // what the merged cell and its followers show moves there.
+        let moved: Vec<(Id, Id, Vec<Id>)> = match op {
+            GridOp::DeleteColumn { id } => table
+                .grid
+                .merges()
+                .iter()
+                .filter(|m| m.left == *id)
+                .filter_map(|m| {
+                    let columns = lines_between(&table.grid.columns(), m.left, m.right);
+                    let next = *columns.get(1)?;
+                    Some((
+                        *id,
+                        next,
+                        lines_between(&table.grid.rows(), m.top, m.bottom),
+                    ))
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
         grid.apply(op)?;
-        let rows_axis = matches!(op, GridOp::InsertRow { .. } | GridOp::DeleteRow { .. });
         let at = match op {
             GridOp::InsertRow { id, .. } => grid.row_index(*id),
             GridOp::InsertColumn { id, .. } => grid.column_index(*id),
             _ => deleted_at,
         }
         .expect("the grid validated the line");
-        let inserted = matches!(op, GridOp::InsertRow { .. } | GridOp::InsertColumn { .. });
-        let merges = table.merge_indices();
-        let span = |(top, left, bottom, right): (usize, usize, usize, usize)| {
-            if rows_axis {
-                (top, bottom)
-            } else {
-                (left, right)
-            }
-        };
-        let through = merges.iter().any(|m| {
-            let (first, last) = span(*m);
-            if inserted {
-                first < at && at <= last
-            } else {
-                first <= at && at <= last
-            }
-        });
-        if through {
-            return Err(reject("rows and columns cannot go through merged cells"));
-        }
         // A new line copies its neighbour's formatting, unless the neighbour
-        // is part of a merge (jade would copy its spans).
+        // is part of a merge (jade would take a merged cell's width).
+        let rows_axis = matches!(op, GridOp::InsertRow { .. } | GridOp::DeleteRow { .. });
         let template = at.checked_sub(1).filter(|i| {
-            !merges.iter().any(|m| {
-                let (first, last) = span(*m);
-                first <= *i && *i <= last
-            })
+            !table
+                .merge_indices()
+                .iter()
+                .any(|&(top, left, bottom, right)| {
+                    let (first, last) = if rows_axis {
+                        (top, bottom)
+                    } else {
+                        (left, right)
+                    };
+                    first <= *i && *i <= last
+                })
         });
         let (all_rows, all_columns) = (table.grid.all_rows(), table.grid.all_columns());
         let table = self.tables.get_mut(&table_id).expect("checked");
         table.grid = grid;
+        // A new cell a merge covers (not in the merge's left column) has no
+        // `w:tc`: its story exists, hidden, like a merged cell's.
+        let covered = |grid: &Grid, row: Id, column: Id| {
+            grid.merge_at(row, column).is_some_and(|m| m.left != column)
+        };
         let effect = match op {
             GridOp::InsertRow { id, .. } => {
                 for column in &all_columns {
-                    table.add_cell(*id, *column, Story::empty_paragraph());
+                    if covered(&table.grid, *id, *column) {
+                        table.add_hidden_cell(*id, *column);
+                    } else {
+                        table.add_cell(*id, *column, Story::empty_paragraph());
+                    }
                 }
                 DocxEffect::InsertTableRow {
                     table: order,
@@ -1612,7 +1954,11 @@ impl DocxModel {
             }
             GridOp::InsertColumn { id, .. } => {
                 for row in &all_rows {
-                    table.add_cell(*row, *id, Story::empty_paragraph());
+                    if covered(&table.grid, *row, *id) {
+                        table.add_hidden_cell(*row, *id);
+                    } else {
+                        table.add_cell(*row, *id, Story::empty_paragraph());
+                    }
                 }
                 DocxEffect::InsertTableColumn {
                     table: order,
@@ -1624,10 +1970,19 @@ impl DocxModel {
                 table: order,
                 row: at,
             },
-            GridOp::DeleteColumn { .. } => DocxEffect::DeleteTableColumn {
-                table: order,
-                column: at,
-            },
+            GridOp::DeleteColumn { .. } => {
+                for (from, to, rows) in &moved {
+                    for row in rows {
+                        if let Some(shown) = table.layout.remove(&(*row, *from)) {
+                            table.layout.insert((*row, *to), shown);
+                        }
+                    }
+                }
+                DocxEffect::DeleteTableColumn {
+                    table: order,
+                    column: at,
+                }
+            }
             GridOp::Merge(_) | GridOp::Unmerge { .. } => unreachable!("handled above"),
         };
         if let GridOp::InsertRow { id, .. } | GridOp::InsertColumn { id, .. } = op {
@@ -1827,6 +2182,167 @@ impl DocxModel {
                 change: change.clone(),
             })
             .collect())
+    }
+
+    /// Applies a mark: one entry per attribute it sets or unsets, all under
+    /// its id. The checks depend only on atoms that exist and never
+    /// reorder, so every replica decides alike wherever the mark lands in
+    /// the log.
+    fn mark(
+        &mut self,
+        story: StoryId,
+        id: Id,
+        start: Boundary,
+        end: Boundary,
+        change: &FormatChange,
+    ) -> Result<Vec<DocxEffect>, Rejection> {
+        let entries: Vec<(MarkKey, Option<FormatChange>)> = match change.mark_key() {
+            Some(key) => {
+                change.validate().map_err(reject)?;
+                vec![(key, Some(change.clone()))]
+            }
+            None if *change == FormatChange::ClearFormatting => MarkKey::ALL
+                .into_iter()
+                .filter(|key| key.cleared())
+                .map(|key| (key, None))
+                .collect(),
+            None => {
+                return Err(reject(format!(
+                    "{change:?} is not character formatting; it travels as Format"
+                )))
+            }
+        };
+        let target = self.editable_story(story)?;
+        if target.marks.iter().any(|m| m.id == id) {
+            return Err(reject(format!("mark {id} already exists")));
+        }
+        let marks: Vec<Mark<MarkKey, FormatChange>> = entries
+            .into_iter()
+            .map(|(key, value)| Mark::new(id, key, start, end, value))
+            .collect();
+        for mark in &marks {
+            MarkSet::validate(&target.flow, mark)?;
+        }
+        let set = &mut self.story_mut(story).expect("checked").marks;
+        for mark in marks {
+            set.insert(mark)?;
+        }
+        self.observe([id]);
+        // jade's own document keeps the base formatting; the materializer
+        // realises the marks on the file it writes.
+        Ok(Vec::new())
+    }
+
+    /// The boundaries of a mark over the atoms `first ..= last` of `story`
+    /// under `expand`, as the intent API makes them; `None` when either
+    /// atom is missing or they are out of order.
+    pub fn mark_anchors(
+        &self,
+        story: StoryId,
+        first: Id,
+        last: Id,
+        expand: Expand,
+    ) -> Option<(Boundary, Boundary)> {
+        marks::anchors(&self.story(story)?.flow, first, last, expand)
+    }
+
+    /// Every story the walk lists paragraphs of, with its id.
+    fn stories(&self) -> Vec<(StoryId, &Story)> {
+        let mut out = vec![(StoryId::Body, &self.body)];
+        for (table, entry) in &self.tables {
+            for (key, story) in &entry.stories {
+                out.push((story_id(*table, *key), story));
+            }
+        }
+        for (id, note) in &self.footnotes {
+            out.push((StoryId::Footnote { id: *id }, &note.story));
+        }
+        for (id, note) in &self.endnotes {
+            out.push((StoryId::Endnote { id: *id }, &note.story));
+        }
+        for (id, story) in &self.text_boxes {
+            out.push((StoryId::TextBox { id: *id }, story));
+        }
+        out
+    }
+
+    /// What the marks give each visible character: (character, attribute)
+    /// → the newest covering mark's value, `None` when that mark unsets it.
+    fn marked(&self) -> BTreeMap<(Id, MarkKey), Option<FormatChange>> {
+        let mut out = BTreeMap::new();
+        for (_, story) in self.stories() {
+            if story.marks.is_empty() {
+                continue;
+            }
+            let order = story.flow.ids();
+            for span in story.marks.effective(&story.flow) {
+                for index in span.range {
+                    if story.flow.is_visible(order[index]) {
+                        out.insert((order[index], span.key), span.value.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The formatting the marks set on each character of a visible
+    /// paragraph (attributes they unset, or never touched, are left out:
+    /// those keep the formatting jade has), in attribute order.
+    pub fn character_formats(&self) -> BTreeMap<Id, Vec<FormatChange>> {
+        let mut out: BTreeMap<Id, Vec<FormatChange>> = BTreeMap::new();
+        let marked = self.marked();
+        if marked.is_empty() {
+            return out;
+        }
+        for paragraph in self.paragraphs() {
+            for c in &paragraph.chars {
+                for key in MarkKey::ALL {
+                    if let Some(Some(change)) = marked.get(&(*c, key)) {
+                        out.entry(*c).or_default().push(change.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The character changes that make jade's document show the marks:
+    /// maximal runs of one value per paragraph and attribute, in paragraph
+    /// order (jade's story positions), then attribute, then offset.
+    pub fn formatting(&self) -> Vec<TextFormat> {
+        let marked = self.marked();
+        let mut out = Vec::new();
+        if marked.is_empty() {
+            return out;
+        }
+        for paragraph in self.paragraphs() {
+            for key in MarkKey::ALL {
+                let mut run: Option<TextFormat> = None;
+                let mut offset = 0;
+                for (ch, c) in paragraph.text.chars().zip(&paragraph.chars) {
+                    let next = offset + ch.len_utf8();
+                    match marked.get(&(*c, key)) {
+                        Some(Some(change)) => match &mut run {
+                            Some(r) if r.end == offset && r.change == *change => r.end = next,
+                            _ => {
+                                out.extend(run.take());
+                                run = Some(TextFormat {
+                                    paragraph: paragraph.at.clone(),
+                                    start: offset,
+                                    end: next,
+                                    change: change.clone(),
+                                });
+                            }
+                        },
+                        _ => out.extend(run.take()),
+                    }
+                    offset = next;
+                }
+                out.extend(run);
+            }
+        }
+        out
     }
 
     /// Every live comment, oldest id first.
@@ -2283,7 +2799,10 @@ impl Document for DocxModel {
         match op {
             DocxOp::InsertText { .. }
             | DocxOp::DeleteText { .. }
-            | DocxOp::SplitParagraph { .. } => Lane::Convergent,
+            | DocxOp::SplitParagraph { .. }
+            | DocxOp::TrackInsertText { .. }
+            | DocxOp::TrackDeleteText { .. }
+            | DocxOp::Mark { .. } => Lane::Convergent,
             DocxOp::JoinParagraph { .. }
             | DocxOp::InsertTable { .. }
             | DocxOp::Table { .. }
@@ -2300,7 +2819,11 @@ impl Document for DocxModel {
             | DocxOp::DeleteNote { .. }
             | DocxOp::InsertTextBox { .. }
             | DocxOp::DeleteTextBox { .. }
-            | DocxOp::Numbered { .. } => Lane::Sequenced,
+            | DocxOp::Numbered { .. }
+            | DocxOp::SetTracking { .. }
+            | DocxOp::SetAuthor { .. }
+            | DocxOp::AcceptRevisions { .. }
+            | DocxOp::RejectRevisions { .. } => Lane::Sequenced,
         }
     }
 
@@ -2342,6 +2865,13 @@ impl Document for DocxModel {
                 self.drop_comments_in_removed_cells();
                 Ok(effects)
             }
+            DocxOp::Mark {
+                story,
+                id,
+                start,
+                end,
+                change,
+            } => self.mark(*story, *id, *start, *end, change),
             DocxOp::Format {
                 story,
                 start,
@@ -2383,6 +2913,26 @@ impl Document for DocxModel {
             } => self.insert_text_box(*story, *parent, *id, text, (*width_px, *height_px)),
             DocxOp::DeleteTextBox { text_box } => self.delete_text_box(*text_box),
             DocxOp::Numbered { item, file_id } => self.numbered(*item, file_id, ctx),
+            DocxOp::TrackInsertText {
+                story,
+                parent,
+                first,
+                text,
+                date,
+            } => self.track_insert(*story, *parent, *first, text, date, ctx.origin),
+            DocxOp::TrackDeleteText {
+                story,
+                ids,
+                revision,
+                date,
+            } => self.track_delete(*story, ids, *revision, date, ctx.origin),
+            DocxOp::SetTracking { on } => {
+                self.tracking = *on;
+                Ok(vec![DocxEffect::SetTracking { on: *on }])
+            }
+            DocxOp::SetAuthor { replica, name } => self.set_author(*replica, name, ctx.origin),
+            DocxOp::AcceptRevisions { revisions } => self.decide(revisions, true),
+            DocxOp::RejectRevisions { revisions } => self.decide(revisions, false),
         }
     }
 

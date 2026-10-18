@@ -8,9 +8,9 @@ are each fine can overlap, a paragraph join can swallow a table, a formula
 typed against an old grid points at the wrong row. jade-collaboration
 combines a CRDT with a central sequencer:
 
-* **Convergent lane** — text, paragraph splits and cell values are CRDT
-  operations addressed by stable ids. They apply immediately everywhere and
-  are never rolled back.
+* **Convergent lane** — text, paragraph splits, character formatting
+  (Peritext-style marks) and cell values are CRDT operations addressed by
+  stable ids. They apply immediately everywhere and are never rolled back.
 * **Sequenced lane** — table structure, paragraph joins, formulas and other
   operations that need coordination are validated by the server, in one
   order, against the authoritative state; a conflicting one is rejected and
@@ -90,7 +90,7 @@ claude mcp add jade-collab -- jade-collab-mcp   # or any MCP client's config
 | --- | --- |
 | `list_documents` | `{server: "http://host:port"}` → names, formats and socket URLs |
 | `join_document` | `{url: "ws://…/documents/<name>/ws"}` → `session_id`, format, replica id, seq |
-| `read_document` | the session's view, paged: docx paragraphs (with their story) and tables, xlsx non-blank cells in A1 form |
+| `read_document` | the session's view, paged: docx paragraphs (with their story) and tables, xlsx non-blank cells in A1 form with the cell, row and column formats written in the session |
 | `apply_edits` | the CLI's edit JSON, applied in order; each reported `applied`, `rejected` (reason), `invalid` (error) or `pending` |
 | `wait_for_changes` | returns once someone's edit arrives (seq > `after_seq`) or on timeout |
 | `leave_document` | disconnects the session |
@@ -188,10 +188,10 @@ sender receives `{"type":"presence_rejected","reason":…}`
 Tests come first. Three layers:
 
 * **Lean 4** ([lean/](lean/README.md)) proves strong eventual consistency of
-  the RGA and LWW specifications, that the sequencer preserves any validity
-  predicate, that the CRDT union of two valid merges breaks the table
-  invariant, and that the client's fast path for convergent operations is
-  sound.
+  the RGA, mark (rich-text formatting) and LWW specifications and the
+  marks' expand rules, that the sequencer preserves any validity predicate,
+  that the CRDT union of two valid merges breaks the table invariant, and
+  that the client's fast path for convergent operations is sound.
 * **Property-based tests** check the RGA implementation against its
   specification, random multi-client sessions over a simulated network for
   convergence, grid invariants under random structure edits, the model

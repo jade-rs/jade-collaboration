@@ -1,6 +1,6 @@
 [package]
 name = "jade-collab-core"
-description = "Format-neutral collaboration primitives: identifiers, Lamport clocks, RGA sequences, LWW registers and table grids"
+description = "Format-neutral collaboration primitives: identifiers, Lamport clocks, RGA sequences, marks, LWW registers and table grids"
 version.workspace = true
 edition.workspace = true
 license-file.workspace = true

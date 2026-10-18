@@ -178,6 +178,7 @@ fn sample(schema: &Value) -> Value {
         Some("number") => json!(1.5),
         Some("boolean") => json!(true),
         Some("string") => json!("B"),
+        Some("array") => json!([sample(&schema["items"])]),
         Some("object") => {
             let mut object = serde_json::Map::new();
             for name in schema["required"].as_array().into_iter().flatten() {
@@ -276,7 +277,10 @@ async fn advertised_edits_match_the_intent_apis() {
             "insert_text_box",
             "delete_text_box",
             "merge_table_cells",
-            "unmerge_table_cells"
+            "unmerge_table_cells",
+            "set_tracking",
+            "accept_revisions",
+            "reject_revisions"
         ]
     );
     assert_eq!(
@@ -290,6 +294,7 @@ async fn advertised_edits_match_the_intent_apis() {
             "set_note",
             "delete_note",
             "set_format",
+            "set_borders",
             "merge_cells",
             "unmerge_cells",
             "add_sheet",

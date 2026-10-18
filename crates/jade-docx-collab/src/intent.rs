@@ -16,22 +16,41 @@
 //! offset is before them, as jade types there, except at a paragraph's
 //! start, where typing goes after them, as in jade.
 //!
-//! Formatting and comments are named the same way: a range becomes the ids
-//! of its first and last character, so text edited concurrently moves with
-//! it. Comments are named by the model's id (`lamport@rN`, as
+//! Formatting and comments are named the same way, so text edited
+//! concurrently moves with them. Character formatting (bold, italic,
+//! underline, strike, font size and family, colour, highlight) becomes a
+//! convergent [`DocxOp::Mark`] per story, anchored before the range's first
+//! character and before the atom after its last one (the attributes expand
+//! at their end, as in Word); clearing becomes a mark that unsets them plus
+//! the sequenced clear of the file's own formatting; paragraph formatting
+//! and comments name the ids of the range's first and last atoms and are
+//! sequenced. Comments are named by the model's id (`lamport@rN`, as
 //! [`DocxModel::comments`] lists them) or, for a comment that came with the
 //! file, by jade's `w:id`.
 
+use std::collections::BTreeSet;
+
 use jade_collab_core::grid::Merge;
-use jade_collab_core::id::Id;
+use jade_collab_core::id::{Id, ReplicaId};
+use jade_collab_core::marks::Expand;
 use jade_collab_sync::Lane;
 use jade_docx_headless_api::{HeadlessCommand, HeadlessDeleteDirection};
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
     CommentContent, DocxModel, DocxOp, FormatChange, NoteKind, Paragraph, ParagraphAlignment,
-    StoryId,
+    RevisionKind, StoryId,
 };
+
+/// Who resolves an edit, and when: the replica whose own tracked insertions
+/// a deletion removes outright, and the date its tracked changes carry
+/// (`w:date`). The author's name is not here: the server says who a replica
+/// is.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Context {
+    pub replica: Option<ReplicaId>,
+    pub date: Option<String>,
+}
 
 fn one() -> usize {
     1
@@ -182,6 +201,29 @@ pub enum IntentOp {
         row: usize,
         column: usize,
     },
+    /// Switches the document's Track Changes on or off for everyone.
+    SetTracking {
+        on: bool,
+    },
+    /// Accepts the listed revisions (model ids or the file's `w:id`s), or
+    /// those touching paragraphs `start_paragraph..=end_paragraph`, or all.
+    AcceptRevisions {
+        #[serde(default)]
+        revision_ids: Option<Vec<String>>,
+        #[serde(default)]
+        start_paragraph: Option<usize>,
+        #[serde(default)]
+        end_paragraph: Option<usize>,
+    },
+    /// Rejects revisions, chosen as for `AcceptRevisions`.
+    RejectRevisions {
+        #[serde(default)]
+        revision_ids: Option<Vec<String>>,
+        #[serde(default)]
+        start_paragraph: Option<usize>,
+        #[serde(default)]
+        end_paragraph: Option<usize>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -210,6 +252,10 @@ pub enum IntentError {
     NoSuchTable(usize),
     #[error("cell ({row}, {column}) is outside the table or starts no merge")]
     NoSuchCell { row: usize, column: usize },
+    #[error("no revision {0:?}")]
+    NoSuchRevision(String),
+    #[error("there are no revisions to decide")]
+    NoRevisions,
 }
 
 /// A headless command with no collaborative intent form.
@@ -477,6 +523,34 @@ impl TryFrom<HeadlessCommand> for IntentOp {
                 paragraph,
                 text_box,
             }),
+            // The author is the server's to say; jade's session fields are
+            // not carried.
+            HeadlessCommand::StartChangeTracking { .. } => Ok(Self::SetTracking { on: true }),
+            HeadlessCommand::StopChangeTracking => Ok(Self::SetTracking { on: false }),
+            HeadlessCommand::AcceptRevisions {
+                kind: None,
+                start_paragraph,
+                end_paragraph,
+                revision_id,
+                revision_ids,
+                revision_targets: None,
+            } => Ok(Self::AcceptRevisions {
+                revision_ids: revision_ids.or(revision_id.map(|id| vec![id])),
+                start_paragraph,
+                end_paragraph,
+            }),
+            HeadlessCommand::RejectRevisions {
+                kind: None,
+                start_paragraph,
+                end_paragraph,
+                revision_id,
+                revision_ids,
+                revision_targets: None,
+            } => Ok(Self::RejectRevisions {
+                revision_ids: revision_ids.or(revision_id.map(|id| vec![id])),
+                start_paragraph,
+                end_paragraph,
+            }),
             other => Err(UnsupportedCommand {
                 command_name: other.name(),
                 lane,
@@ -495,17 +569,27 @@ fn format(start: (usize, usize), end: (usize, usize), change: FormatChange) -> I
     }
 }
 
-/// The lane a headless command needs. Plain text edits commute; everything
-/// else — formatting, structure, comments, revisions, page setup — rewrites
-/// state other edits depend on and goes through the sequencer. (Formatting
-/// and comments are sequenced so jade applies them in one order: two
-/// concurrent formats of overlapping ranges must end the same everywhere.)
+/// The lane a headless command needs. Plain text edits and simple character
+/// formatting (a mark: concurrent marks resolve to the newest per attribute
+/// on every replica) commute; everything else — clearing the file's
+/// formatting, paragraph formatting, structure, comments, revisions, page
+/// setup — rewrites state other edits depend on and goes through the
+/// sequencer.
 pub fn lane_for_command(command: &HeadlessCommand) -> Lane {
     match command {
         HeadlessCommand::InsertText { .. }
         | HeadlessCommand::ReplaceRange { .. }
         | HeadlessCommand::DeleteText { .. }
-        | HeadlessCommand::InsertParagraphBreak { .. } => Lane::Convergent,
+        | HeadlessCommand::InsertParagraphBreak { .. }
+        | HeadlessCommand::ApplyBold { .. }
+        | HeadlessCommand::SetBold { .. }
+        | HeadlessCommand::ApplyItalic { .. }
+        | HeadlessCommand::ApplyUnderline { .. }
+        | HeadlessCommand::ApplyStrike { .. }
+        | HeadlessCommand::SetFontSize { .. }
+        | HeadlessCommand::SetFontFamily { .. }
+        | HeadlessCommand::SetFontColor { .. }
+        | HeadlessCommand::SetHighlightColor { .. } => Lane::Convergent,
         _ => Lane::Sequenced,
     }
 }
@@ -567,12 +651,32 @@ fn caret(paragraphs: &[Paragraph], paragraph: usize, offset: usize) -> Result<Ca
     })
 }
 
-/// Deleting `atoms`: one text deletion, then a join per mark.
-fn deletion(story: StoryId, atoms: &[Result<Id, Id>]) -> Vec<DocxOp> {
-    let ids: Vec<Id> = atoms.iter().filter_map(|a| a.ok()).collect();
+/// Deleting `atoms`: the characters (one plain deletion, and with tracking
+/// on one tracked deletion), then a join per mark.
+fn deletion(
+    view: &DocxModel,
+    story: StoryId,
+    atoms: &[Result<Id, Id>],
+    context: &Context,
+    ids: &mut dyn FnMut(u64) -> Id,
+) -> Vec<DocxOp> {
+    let chars: Vec<Id> = atoms.iter().filter_map(|a| a.ok()).collect();
+    let (plain, tracked) = if view.tracking() {
+        tracked_deletion(view, &chars, context)
+    } else {
+        (chars, Vec::new())
+    };
     let mut ops = Vec::new();
-    if !ids.is_empty() {
-        ops.push(DocxOp::DeleteText { story, ids });
+    if !plain.is_empty() {
+        ops.push(DocxOp::DeleteText { story, ids: plain });
+    }
+    if !tracked.is_empty() {
+        ops.push(DocxOp::TrackDeleteText {
+            story,
+            ids: tracked,
+            revision: ids(1),
+            date: context.date.clone(),
+        });
     }
     ops.extend(
         atoms
@@ -583,15 +687,144 @@ fn deletion(story: StoryId, atoms: &[Result<Id, Id>]) -> Vec<DocxOp> {
     ops
 }
 
+/// Splits characters a tracked deletion names into (removed outright,
+/// tracked): characters already shown as deleted are left alone; one's own
+/// still-tracked insertions go (Word's rule); the rest are tracked.
+fn tracked_deletion(view: &DocxModel, chars: &[Id], context: &Context) -> (Vec<Id>, Vec<Id>) {
+    let me = context.replica;
+    let my_name = me.and_then(|me| view.author(me));
+    let own = |revision: Id| {
+        view.revision(revision)
+            .is_some_and(|r| match (&r.author, my_name) {
+                (Some(author), Some(name)) => author == name,
+                _ => Some(r.replica) == me,
+            })
+    };
+    let named: BTreeSet<Id> = chars.iter().copied().collect();
+    let (mut plain, mut tracked) = (Vec::new(), Vec::new());
+    for paragraph in view.paragraphs() {
+        for (id, marks) in paragraph.chars.iter().zip(&paragraph.tracked) {
+            if !named.contains(id) || marks.deleted.is_some() {
+                continue;
+            }
+            if marks.inserted.is_some_and(own) {
+                plain.push(*id);
+            } else {
+                tracked.push(*id);
+            }
+        }
+    }
+    (plain, tracked)
+}
+
+/// The revisions an accept or reject names: listed by id, touching the
+/// paragraphs, or all.
+fn chosen_revisions(
+    view: &DocxModel,
+    revision_ids: &Option<Vec<String>>,
+    start_paragraph: Option<usize>,
+    end_paragraph: Option<usize>,
+) -> Result<Vec<Id>, IntentError> {
+    let live = view.revisions();
+    let paragraphs = view.paragraphs().len();
+    for n in [start_paragraph, end_paragraph].into_iter().flatten() {
+        if n >= paragraphs {
+            return Err(IntentError::NoSuchParagraph(n));
+        }
+    }
+    let range = match (start_paragraph, end_paragraph) {
+        (None, None) => None,
+        (start, end) => {
+            let (start, end) = (start.unwrap_or(0), end.unwrap_or(paragraphs - 1));
+            if start > end {
+                return Err(IntentError::InvertedRange);
+            }
+            Some(start..=end)
+        }
+    };
+    let mut chosen: Vec<Id> = match revision_ids {
+        Some(keys) => {
+            let mut chosen = Vec::new();
+            for key in keys {
+                let parsed = parse_id(key);
+                let found: Vec<Id> = live
+                    .iter()
+                    .filter(|r| Some(r.id) == parsed || r.revision.file_id.as_deref() == Some(key))
+                    .map(|r| r.id)
+                    .collect();
+                if found.is_empty() {
+                    return Err(IntentError::NoSuchRevision(key.clone()));
+                }
+                chosen.extend(found);
+            }
+            chosen
+        }
+        None => live.iter().map(|r| r.id).collect(),
+    };
+    if let Some(range) = range {
+        chosen.retain(|id| {
+            live.iter()
+                .any(|r| r.id == *id && r.paragraphs.iter().any(|p| range.contains(p)))
+        });
+    }
+    let mut seen = BTreeSet::new();
+    chosen.retain(|id| seen.insert(*id));
+    if chosen.is_empty() {
+        return Err(IntentError::NoRevisions);
+    }
+    Ok(chosen)
+}
+
+/// `lamport@rN`.
+fn parse_id(key: &str) -> Option<Id> {
+    key.split_once('@').and_then(|(lamport, replica)| {
+        Some(Id::new(
+            lamport.parse().ok()?,
+            ReplicaId(replica.strip_prefix('r')?.parse().ok()?),
+        ))
+    })
+}
+
 /// Resolves `op` against `view`. `ids(n)` must reserve `n` consecutive fresh
 /// identifiers (see `Replica::reserve`). The operations are meant to be
-/// submitted in order.
+/// submitted in order. Tracked changes, if the view's tracking is on, carry
+/// no date and treat no insertion as one's own; see [`resolve_with`].
 pub fn resolve(
     view: &DocxModel,
     op: &IntentOp,
     ids: &mut dyn FnMut(u64) -> Id,
 ) -> Result<Vec<DocxOp>, IntentError> {
+    resolve_with(view, op, &Context::default(), ids)
+}
+
+/// [`resolve`] on behalf of `context`'s replica, dating tracked changes
+/// with `context.date`.
+pub fn resolve_with(
+    view: &DocxModel,
+    op: &IntentOp,
+    context: &Context,
+    ids: &mut dyn FnMut(u64) -> Id,
+) -> Result<Vec<DocxOp>, IntentError> {
     let paragraphs = view.paragraphs();
+    // Typing: a tracked insertion when the document tracks changes.
+    let typing = |story: StoryId, parent: Option<Id>, first: Id, text: &str| {
+        if view.tracking() {
+            DocxOp::TrackInsertText {
+                story,
+                parent,
+                first,
+                text: text.to_string(),
+                date: context.date.clone(),
+            }
+        } else {
+            DocxOp::InsertText {
+                story,
+                parent,
+                first,
+                text: text.to_string(),
+            }
+        }
+    };
     match op {
         IntentOp::InsertText {
             paragraph,
@@ -602,12 +835,12 @@ pub fn resolve(
             if text.is_empty() {
                 return Ok(Vec::new());
             }
-            Ok(vec![DocxOp::InsertText {
-                story: at.story,
-                parent: at.typing,
-                first: ids(text.chars().count() as u64),
-                text: text.clone(),
-            }])
+            Ok(vec![typing(
+                at.story,
+                at.typing,
+                ids(text.chars().count() as u64),
+                text,
+            )])
         }
         IntentOp::InsertParagraphBreak {
             paragraph,
@@ -641,7 +874,7 @@ pub fn resolve(
                 HeadlessDeleteDirection::Forward => at.index..(at.index + count).min(atoms.len()),
                 HeadlessDeleteDirection::Backward => at.index.saturating_sub(*count)..at.index,
             };
-            Ok(deletion(at.story, &atoms[range]))
+            Ok(deletion(view, at.story, &atoms[range], context, ids))
         }
         IntentOp::ReplaceRange {
             start_paragraph,
@@ -659,14 +892,20 @@ pub fn resolve(
                 return Err(IntentError::InvertedRange);
             }
             let atoms = story_atoms(&paragraphs, start.story);
-            let mut ops = deletion(start.story, &atoms[start.index..end.index]);
+            let mut ops = deletion(
+                view,
+                start.story,
+                &atoms[start.index..end.index],
+                context,
+                ids,
+            );
             if !text.is_empty() {
-                ops.push(DocxOp::InsertText {
-                    story: start.story,
-                    parent: start.typing,
-                    first: ids(text.chars().count() as u64),
-                    text: text.clone(),
-                });
+                ops.push(typing(
+                    start.story,
+                    start.typing,
+                    ids(text.chars().count() as u64),
+                    text,
+                ));
             }
             Ok(ops)
         }
@@ -683,32 +922,63 @@ pub fn resolve(
             if (*start_paragraph, *start_offset) > (*end_paragraph, *end_offset) {
                 return Err(IntentError::InvertedRange);
             }
-            // Each paragraph's slice of the range: characters, and the mark
-            // when the range runs past it.
-            let slices = (*start_paragraph..=*end_paragraph).map(|n| {
-                let p = &paragraphs[n];
-                let from = if n == *start_paragraph {
-                    chars_before(p, *start_offset)
-                } else {
-                    0
-                };
-                let to = if n == *end_paragraph {
-                    chars_before(p, *end_offset)
-                } else {
-                    p.chars.len()
-                };
-                let mark = p.mark.filter(|_| n < *end_paragraph);
-                (p.story, p.chars[from..to].iter().copied().chain(mark))
-            });
-            Ok(per_story(slices)
-                .into_iter()
-                .map(|(story, first, last)| DocxOp::Format {
-                    story,
-                    start: first,
-                    end: last,
-                    change: change.clone(),
+            // Each paragraph's slice of the range: its characters, and its
+            // mark when the range runs past it.
+            let slices: Vec<(StoryId, &[Id], Option<Id>)> = (*start_paragraph..=*end_paragraph)
+                .map(|n| {
+                    let p = &paragraphs[n];
+                    let from = if n == *start_paragraph {
+                        chars_before(p, *start_offset)
+                    } else {
+                        0
+                    };
+                    let to = if n == *end_paragraph {
+                        chars_before(p, *end_offset)
+                    } else {
+                        p.chars.len()
+                    };
+                    (
+                        p.story,
+                        &p.chars[from..to],
+                        p.mark.filter(|_| n < *end_paragraph),
+                    )
                 })
-                .collect())
+                .collect();
+            let mut ops = Vec::new();
+            if change.mark_key().is_some() || *change == FormatChange::ClearFormatting {
+                // A mark per story, over its first through last character.
+                let expand = change.mark_key().map_or(Expand::End, |key| key.expand());
+                let chars = slices
+                    .iter()
+                    .map(|(story, chars, _)| (*story, chars.iter().copied()));
+                for (story, first, last) in per_story(chars) {
+                    let (start, end) = view
+                        .mark_anchors(story, first, last, expand)
+                        .expect("a view's characters are in their story, in order");
+                    ops.push(DocxOp::Mark {
+                        story,
+                        id: ids(1),
+                        start,
+                        end,
+                        change: change.clone(),
+                    });
+                }
+            }
+            if change.mark_key().is_none() {
+                // Clearing the file's formatting, or paragraph formatting.
+                let atoms = slices
+                    .iter()
+                    .map(|(story, chars, mark)| (*story, chars.iter().copied().chain(*mark)));
+                ops.extend(per_story(atoms).into_iter().map(|(story, first, last)| {
+                    DocxOp::Format {
+                        story,
+                        start: first,
+                        end: last,
+                        change: change.clone(),
+                    }
+                }));
+            }
+            Ok(ops)
         }
         IntentOp::FormatParagraphs {
             start_paragraph,
@@ -951,6 +1221,55 @@ pub fn resolve(
                 first: ids(freed.max(1)),
             }])
         }
+        IntentOp::SetTracking { on } => Ok(vec![DocxOp::SetTracking { on: *on }]),
+        IntentOp::AcceptRevisions {
+            revision_ids,
+            start_paragraph,
+            end_paragraph,
+        } => Ok(vec![DocxOp::AcceptRevisions {
+            revisions: chosen_revisions(view, revision_ids, *start_paragraph, *end_paragraph)?,
+        }]),
+        IntentOp::RejectRevisions {
+            revision_ids,
+            start_paragraph,
+            end_paragraph,
+        } => Ok(vec![DocxOp::RejectRevisions {
+            revisions: chosen_revisions(view, revision_ids, *start_paragraph, *end_paragraph)?,
+        }]),
+    }
+}
+
+/// `time` as Word dates a tracked change (`w:date`, UTC to the second):
+/// `2026-10-18T09:30:00Z`.
+pub fn word_date(time: std::time::SystemTime) -> String {
+    let seconds = time
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (days, rest) = (seconds / 86_400, seconds % 86_400);
+    // Howard Hinnant's civil_from_days, for days since 1970-01-01.
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rest / 3_600,
+        rest % 3_600 / 60,
+        rest % 60
+    )
+}
+
+/// The kinds of revisions, for callers listing them.
+pub fn revision_kind_name(kind: RevisionKind) -> &'static str {
+    match kind {
+        RevisionKind::Insertion => "insertion",
+        RevisionKind::Deletion => "deletion",
     }
 }
 
@@ -978,12 +1297,7 @@ fn per_story<I: IntoIterator<Item = Id>>(
 /// A live comment named by its model id (`lamport@rN`) or its `w:id` in the
 /// file.
 fn comment(view: &DocxModel, key: &str) -> Result<Id, IntentError> {
-    let parsed = key.split_once('@').and_then(|(lamport, replica)| {
-        Some(Id::new(
-            lamport.parse().ok()?,
-            jade_collab_core::id::ReplicaId(replica.strip_prefix('r')?.parse().ok()?),
-        ))
-    });
+    let parsed = parse_id(key);
     view.comments()
         .into_iter()
         .find(|c| Some(c.id) == parsed || c.file_id.as_deref() == Some(key))

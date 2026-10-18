@@ -6,7 +6,7 @@
 mod common;
 
 use common::fixture;
-use jade_collab_mcp::read_docx;
+use jade_collab_mcp::{read_docx, read_xlsx};
 use jade_docx_collab::{DocxModel, JadeDocx};
 use serde_json::json;
 
@@ -78,5 +78,92 @@ fn read_document_lists_comments() {
                 "resolved": false,
             },
         ])
+    );
+}
+
+/// Tracked changes: the document's mode and every live revision, and on
+/// each paragraph the byte spans each revision covers.
+#[test]
+fn read_document_shows_tracked_insertions_and_deletions() {
+    let jade = JadeDocx::load(&fixture("public/fixtures/review.docx")).unwrap();
+    let model = DocxModel::from_word_document(jade.word()).unwrap();
+    let read = read_docx(&model, 0, 100);
+    assert_eq!(read["tracking"], json!(false));
+    let revisions = read["revisions"].as_array().unwrap();
+    assert_eq!(revisions.len(), 2);
+    let insertion = &revisions[0];
+    assert_eq!(insertion["kind"], json!("insertion"));
+    assert_eq!(insertion["author"], json!("植木 智之"));
+    assert_eq!(insertion["date"], json!("2025-11-12T19:17:00Z"));
+    assert_eq!(insertion["file_id"], json!("0"));
+    assert_eq!(insertion["text"], json!("Hello "));
+    assert_eq!(insertion["paragraphs"], json!([0]));
+    let id = insertion["id"].as_str().unwrap().to_string();
+    assert!(id.contains("@r0"), "{id}");
+    assert_eq!(revisions[1]["kind"], json!("deletion"));
+    assert_eq!(revisions[1]["text"], json!("World"));
+    let deletion = revisions[1]["id"].as_str().unwrap().to_string();
+    // On the paragraph: which bytes each revision covers.
+    let paragraph = &read["paragraphs"][0];
+    assert_eq!(paragraph["text"], json!("Hello World"));
+    assert_eq!(
+        paragraph["revisions"],
+        json!([
+            { "kind": "insertion", "revision": id, "start": 0, "end": 6 },
+            { "kind": "deletion", "revision": deletion, "start": 6, "end": 11 },
+        ])
+    );
+    assert!(read["paragraphs"][1].get("revisions").is_none());
+}
+
+/// An xlsx read lists, per sheet, the formats written through the
+/// collaboration — borders included — by A1 reference.
+#[test]
+fn read_document_lists_formats_and_borders_written_in_the_session() {
+    use jade_collab_core::id::{Id, ReplicaId};
+    use jade_collab_sync::{ApplyContext, Document};
+    use jade_xlsx_collab::intent::{resolve, XlsxIntent};
+    use jade_xlsx_collab::XlsxModel;
+
+    let mut model = XlsxModel::blank(&[("S", 3, 3)]);
+    let mut next = 100;
+    for intent in [
+        json!({ "type": "set_borders", "sheet": "S", "range": "A1:B1",
+                "borders": { "outline": { "style": "thin", "color": "FF0000" } } }),
+        json!({ "type": "set_format", "sheet": "S", "range": "C3", "change": { "bold": true } }),
+        json!({ "type": "set_format", "sheet": "S", "range": "B:B", "change": { "italic": true } }),
+        json!({ "type": "set_format", "sheet": "S", "range": "3:3", "change": { "fill_color": "FFFF00" } }),
+    ] {
+        let intent: XlsxIntent = serde_json::from_value(intent).unwrap();
+        let op = resolve(&model, &intent, &mut |n| {
+            next += n;
+            Id::new(next, ReplicaId(2))
+        })
+        .unwrap();
+        let ctx = ApplyContext {
+            origin: ReplicaId(2),
+            base_seq: 0,
+            seq: None,
+        };
+        model.apply(&op, &ctx).unwrap();
+    }
+    let read = read_xlsx(&model, 0, 100);
+    let line = json!({ "style": "thin", "color": "FF0000" });
+    assert_eq!(
+        read["sheets"][0]["formats"],
+        json!({
+            "A1": { "border_left": line, "border_top": line, "border_bottom": line },
+            "B1": { "border_right": line, "border_top": line, "border_bottom": line, "italic": true },
+            "C3": { "bold": true, "fill_color": "FFFF00" },
+        })
+    );
+    // Whole rows and columns are listed by their own labels.
+    assert_eq!(
+        read["sheets"][0]["column_formats"],
+        json!({ "B": { "italic": true } })
+    );
+    assert_eq!(
+        read["sheets"][0]["row_formats"],
+        json!({ "3": { "fill_color": "FFFF00" } })
     );
 }

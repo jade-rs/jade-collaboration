@@ -276,6 +276,31 @@ impl<D: Document, M: Materializer<D>> Sequencer<D, M> {
         }
     }
 
+    /// Commits `op` on behalf of [`ReplicaId::ORIGIN`], outside any
+    /// replica's submission — what the server itself knows and the model
+    /// must hear in log order (who a replica is, say). Applied and
+    /// materialized like a commit; the caller journals and broadcasts it.
+    /// Nothing is admitted or derived: the server is the author.
+    pub fn commit_origin(&mut self, op: D::Op) -> Result<Committed<D::Op>, Rejection> {
+        let seq = self.seq() + 1;
+        let ctx = ApplyContext {
+            origin: ReplicaId::ORIGIN,
+            base_seq: seq - 1,
+            seq: Some(seq),
+        };
+        let effect = self.document.apply(&op, &ctx)?;
+        self.materialize(effect, &ctx);
+        let committed = Committed {
+            seq,
+            origin: ReplicaId::ORIGIN,
+            client_seq: 0,
+            base_seq: seq - 1,
+            op,
+        };
+        self.log.push(committed.clone());
+        Ok(committed)
+    }
+
     /// The operations derived since the last call, already in the log, for
     /// the caller to journal and broadcast after the commit that caused them.
     pub fn take_derived(&mut self) -> Vec<Committed<D::Op>> {

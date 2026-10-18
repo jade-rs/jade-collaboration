@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 2f0c33ed585d04a3d7018e2a4f172d3ece92becfe14531cd58c664705bded5c5 # shrinks to steps = [(0, 0, (1, 0, 0, 0), RangeBorders { outline: None, inside: None, top: None, bottom: None, left: None, right: None, inside_horizontal: Some(BorderLine { style: Thin, color: Some("#00b050") }), inside_vertical: None, diagonal: None, diagonal_up: None, diagonal_down: None })]

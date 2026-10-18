@@ -5,14 +5,16 @@ use std::path::PathBuf;
 
 use jade_collab_core::grid::GridOp;
 use jade_collab_core::id::Id;
+use jade_collab_core::id::ReplicaId;
 use jade_collab_sync::{ApplyContext, Document, Lane, Materializer};
-use jade_docx_collab::intent::{resolve, IntentOp};
+use jade_docx_collab::intent::{resolve, resolve_with, Context, IntentOp};
 use jade_docx_collab::{
-    Anchor, CommentContent, DocxEffect, DocxModel, DocxOp, FormatChange, JadeDocx, NoteKind,
-    ParagraphAlignment, StoryId,
+    Anchor, CommentContent, DocxEffect, DocxModel, DocxOp, FormatChange, JadeDocx, MarkKey,
+    NoteKind, ParagraphAlignment, RevisionKind, StoryId,
 };
+use jade_docx_document_core::document::RevisionKind as JadeRevisionKind;
 use jade_docx_document_core::headless_api::execute_headless_queries_on_document;
-use jade_docx_document_core::word_document::ParagraphAnchorKind;
+use jade_docx_document_core::word_document::{ParagraphAnchorKind, WordDocument};
 use jade_docx_headless_api::{
     HeadlessCommentSnapshot, HeadlessParagraphSnapshot, HeadlessQuery, HeadlessQueryRequest,
     HeadlessQueryResult, HeadlessRunStyle,
@@ -100,6 +102,130 @@ pub fn assert_stories_agree(model: &DocxModel, jade: &JadeDocx, context: &str) {
     }
 }
 
+/// (top, left, bottom, right) indices of a merged region.
+pub type Region = (usize, usize, usize, usize);
+
+/// What a table shows, cell by cell: the paragraph texts of each `w:tc`
+/// keyed by (row, first grid column), and its merged regions.
+#[derive(Debug, PartialEq)]
+pub struct TableLayout {
+    pub rows: usize,
+    pub columns: usize,
+    pub cells: BTreeMap<(usize, usize), Vec<String>>,
+    pub merges: Vec<Region>,
+}
+
+/// jade's top-level body tables as [`TableLayout`]s (`w:gridSpan` across,
+/// `w:vMerge` restart/continue down); `None` for a ragged one.
+pub fn jade_tables(jade: &JadeDocx) -> Vec<Option<TableLayout>> {
+    use jade_docx_document_core::document::BodyElement;
+    let Some(body) = jade.word().document.as_ref().and_then(|d| d.body.as_ref()) else {
+        return Vec::new();
+    };
+    body.elements
+        .iter()
+        .filter_map(|e| match e {
+            BodyElement::Table(t) => Some(t),
+            _ => None,
+        })
+        .map(|table| {
+            let mut cells = BTreeMap::new();
+            let mut merges: Vec<Region> = Vec::new();
+            let mut width = None;
+            for (r, row) in table.rows.iter().enumerate() {
+                let mut c = 0;
+                for cell in &row.cells {
+                    let span = cell.span.unwrap_or(1).max(1) as usize;
+                    let right = c + span - 1;
+                    let texts = cell
+                        .blocks
+                        .iter()
+                        .filter_map(|b| match b {
+                            BodyElement::Paragraph(p) => {
+                                Some(p.runs.iter().map(|r| r.text.as_str()).collect::<String>())
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    cells.insert((r, c), texts);
+                    match cell.vertical_merge.as_deref() {
+                        Some("continue") => {
+                            let above = merges
+                                .iter_mut()
+                                .find(|m| m.1 == c && m.3 == right && m.2 + 1 == r)?;
+                            above.2 = r;
+                        }
+                        Some(_) => merges.push((r, c, r, right)),
+                        None if right > c => merges.push((r, c, r, right)),
+                        None => {}
+                    }
+                    c = right + 1;
+                }
+                if *width.get_or_insert(c) != c {
+                    return None;
+                }
+            }
+            merges.retain(|(t, l, b, r)| (b - t + 1) * (r - l + 1) >= 2);
+            merges.sort();
+            Some(TableLayout {
+                rows: table.rows.len(),
+                columns: width.unwrap_or(0),
+                cells,
+                merges,
+            })
+        })
+        .collect()
+}
+
+/// The model's top-level body tables as [`TableLayout`]s: the paragraphs of
+/// the stories each alive cell position shows; `None` for a locked table.
+pub fn model_tables(model: &DocxModel) -> Vec<Option<TableLayout>> {
+    let paragraphs = model.paragraphs();
+    model
+        .tables()
+        .into_iter()
+        .map(|table| {
+            if table.locked {
+                return None;
+            }
+            let mut cells: BTreeMap<(usize, usize), Vec<String>> = BTreeMap::new();
+            for p in &paragraphs {
+                let Some((t, row, column)) = model.cell_of(p.story) else {
+                    continue;
+                };
+                if t != table.id {
+                    continue;
+                }
+                let r = table.rows.iter().position(|x| *x == row)?;
+                let c = table.columns.iter().position(|x| *x == column)?;
+                cells.entry((r, c)).or_default().push(p.text.clone());
+            }
+            let mut merges = table.merges.clone();
+            merges.sort();
+            Some(TableLayout {
+                rows: table.rows.len(),
+                columns: table.columns.len(),
+                cells,
+                merges,
+            })
+        })
+        .collect()
+}
+
+/// Every unlocked top-level table shows, cell by cell, what jade's does:
+/// the same cells at the same grid positions with the same paragraphs, and
+/// the same merged regions.
+pub fn assert_tables_agree(model: &DocxModel, jade: &JadeDocx, context: &str) {
+    let ours = model_tables(model);
+    let theirs = jade_tables(jade);
+    assert_eq!(ours.len(), theirs.len(), "table count {context}");
+    for (k, (ours, theirs)) in ours.iter().zip(&theirs).enumerate() {
+        if let Some(ours) = ours {
+            assert_eq!(Some(ours), theirs.as_ref(), "table {k} {context}");
+        }
+    }
+}
+
 /// jade's paragraph surface for a model paragraph.
 pub fn surface(jade: &JadeDocx, paragraph: &jade_docx_collab::Paragraph) -> usize {
     jade.word()
@@ -131,8 +257,18 @@ fn describe(model: &DocxModel, story: StoryId) -> String {
 /// Applies `op` as the server does — admit (sequenced), apply, materialize —
 /// and checks the model and jade still agree.
 pub fn commit(model: &mut DocxModel, jade: &mut JadeDocx, op: DocxOp) -> Vec<DocxEffect> {
+    commit_as(model, jade, op, ReplicaId(1))
+}
+
+/// [`commit`] on behalf of `origin`.
+pub fn commit_as(
+    model: &mut DocxModel,
+    jade: &mut JadeDocx,
+    op: DocxOp,
+    origin: ReplicaId,
+) -> Vec<DocxEffect> {
     let ctx = ApplyContext {
-        origin: jade_collab_core::id::ReplicaId(1),
+        origin,
         base_seq: 0,
         seq: Some(1),
     };
@@ -147,7 +283,10 @@ pub fn commit(model: &mut DocxModel, jade: &mut JadeDocx, op: DocxOp) -> Vec<Doc
         .unwrap_or_else(|e| panic!("{op:?}: {e}"));
     derive(model, jade, &op);
     assert_stories_agree(model, jade, &format!("after {op:?}"));
+    assert_tables_agree(model, jade, &format!("after {op:?}"));
     assert_comments_agree(model, jade, &format!("after {op:?}"));
+    assert_revisions_agree(model, jade, &format!("after {op:?}"));
+    assert_formatting_agrees(model, jade, &format!("after {op:?}"));
     effect
 }
 
@@ -168,10 +307,254 @@ pub fn derive(model: &mut DocxModel, jade: &mut JadeDocx, cause: &DocxOp) {
     }
 }
 
+/// A tracked change as Word shows it on one character: who made it and when.
+pub type Mark = Option<(Option<String>, Option<String>)>;
+
+/// (inserted, deleted) for every character of every paragraph, as the
+/// model shows them.
+pub fn model_marks(model: &DocxModel) -> Vec<Vec<(Mark, Mark)>> {
+    let mark = |id: Option<Id>| {
+        id.map(|id| {
+            let revision = model.revision(id).expect("a shown revision exists");
+            (revision.author.clone(), revision.date.clone())
+        })
+    };
+    model
+        .paragraphs()
+        .iter()
+        .map(|p| {
+            assert_eq!(p.tracked.len(), p.chars.len(), "one mark per character");
+            p.tracked
+                .iter()
+                .map(|t| (mark(t.inserted), mark(t.deleted)))
+                .collect()
+        })
+        .collect()
+}
+
+/// The same, read from jade's runs (a deletion inside an insertion carries
+/// both).
+pub fn jade_marks(model: &DocxModel, jade: &JadeDocx) -> Vec<Vec<(Mark, Mark)>> {
+    word_marks(model, jade.word())
+}
+
+/// [`jade_marks`] read from any jade document holding the model's
+/// paragraphs — the formatted copy an export writes, say.
+pub fn word_marks(model: &DocxModel, word: &WordDocument) -> Vec<Vec<(Mark, Mark)>> {
+    model
+        .paragraphs()
+        .iter()
+        .map(|p| {
+            let surface = word
+                .paragraph_story_surface(&p.at)
+                .unwrap_or_else(|| panic!("jade has no paragraph {:?}", p.at));
+            let runs = &word.paragraph(surface).expect("surface exists").runs;
+            let mut out = Vec::new();
+            for run in runs {
+                let of = |m: &jade_docx_document_core::document::RevisionMark| {
+                    Some((m.author.clone(), m.date.clone()))
+                };
+                let (inserted, deleted) = match &run.revision {
+                    None => (None, None),
+                    Some(m) => match m.kind {
+                        JadeRevisionKind::Inserted | JadeRevisionKind::MovedTo => (of(m), None),
+                        JadeRevisionKind::Deleted | JadeRevisionKind::MovedFrom => {
+                            (m.insertion.as_deref().and_then(of), of(m))
+                        }
+                    },
+                };
+                out.extend(
+                    run.text
+                        .chars()
+                        .map(|_| (inserted.clone(), deleted.clone())),
+                );
+            }
+            out
+        })
+        .collect()
+}
+
+/// Every character shows the same tracked insertion and deletion (author
+/// and date) in the model and in jade.
+///
+/// Also in the copy an export writes, where convergent marks are applied
+/// over the revisions: formatting tracked text must not move or drop them.
+pub fn assert_revisions_agree(model: &DocxModel, jade: &JadeDocx, context: &str) {
+    let ours = model_marks(model);
+    let formatted = jade
+        .formatted(model)
+        .unwrap_or_else(|e| panic!("jade cannot realise the marks: {e}"));
+    for (which, theirs) in [
+        ("jade", jade_marks(model, jade)),
+        ("the formatted copy", word_marks(model, &formatted)),
+    ] {
+        for (p, (a, b)) in ours.iter().zip(&theirs).enumerate() {
+            assert_eq!(
+                a,
+                b,
+                "tracked changes of paragraph {p} ({:?}) in {which} {context}",
+                model.paragraphs()[p].text
+            );
+        }
+    }
+}
+
+/// Who is editing and when, for a generated edit.
+pub fn context(replica: ReplicaId, choice: u64) -> Context {
+    let dates = [
+        Some("2026-10-18T09:00:00Z"),
+        Some("2026-10-18T10:30:00Z"),
+        None,
+    ];
+    Context {
+        replica: Some(replica),
+        date: dates[((choice >> 50) % 3) as usize].map(str::to_string),
+    }
+}
+
+/// [`generate`], with tracked changes: the mode switched, tracked typing and
+/// deleting (as the intent API makes them with tracking on, for `ctx`),
+/// tracked deletions of arbitrary characters (already deleted ones and one's
+/// own insertions included), and accepting and rejecting revisions.
+pub fn generate_as(
+    view: &DocxModel,
+    choice: u64,
+    ctx: &Context,
+    ids: &mut dyn FnMut(u64) -> Id,
+) -> Option<DocxOp> {
+    // generate_plain's 36 kinds, then 10 of tracked changes (30..=39).
+    let kind = choice % 46;
+    if kind < 36 {
+        return generate_plain(view, choice, ids);
+    }
+    let kind = kind - 6;
+    let pick = |n: usize, salt: u32| ((choice >> salt) as usize) % n.max(1);
+    let tracking = || {
+        let mut v = view.clone();
+        let local = ApplyContext {
+            origin: ctx.replica.unwrap_or(ReplicaId(1)),
+            base_seq: 0,
+            seq: None,
+        };
+        v.apply(&DocxOp::SetTracking { on: true }, &local)
+            .expect("tracking can always be switched");
+        v
+    };
+    let paragraphs = view.paragraphs();
+    let boundaries =
+        |t: &str| -> Vec<usize> { t.char_indices().map(|(i, _)| i).chain([t.len()]).collect() };
+    match kind {
+        30 => Some(DocxOp::SetTracking {
+            on: pick(3, 8) != 0,
+        }),
+        31..=33 => {
+            let p = pick(paragraphs.len(), 8);
+            let b = boundaries(&paragraphs[p].text);
+            let op = IntentOp::InsertText {
+                paragraph: p,
+                offset: b[pick(b.len(), 16)],
+                text: ["x", "日本", "Lorem ", "é"][pick(4, 24)].to_string(),
+            };
+            resolve_with(&tracking(), &op, ctx, ids)
+                .ok()?
+                .into_iter()
+                .next()
+        }
+        34 | 35 => {
+            let p = pick(paragraphs.len(), 8);
+            let b = boundaries(&paragraphs[p].text);
+            let op = if kind == 34 {
+                IntentOp::DeleteText {
+                    paragraph: p,
+                    offset: b[pick(b.len(), 16)],
+                    direction: if pick(2, 28) == 0 {
+                        jade_docx_headless_api::HeadlessDeleteDirection::Forward
+                    } else {
+                        jade_docx_headless_api::HeadlessDeleteDirection::Backward
+                    },
+                    count: 1 + pick(5, 24),
+                }
+            } else {
+                let (so, eo) = (b[pick(b.len(), 16)], b[pick(b.len(), 24)]);
+                IntentOp::ReplaceRange {
+                    start_paragraph: p,
+                    start_offset: so.min(eo),
+                    end_paragraph: p,
+                    end_offset: so.max(eo),
+                    text: ["", "y", "置換"][pick(3, 32)].to_string(),
+                }
+            };
+            let ops = resolve_with(&tracking(), &op, ctx, ids).ok()?;
+            ops.get(pick(ops.len(), 40)).cloned()
+        }
+        36 => {
+            let p = pick(paragraphs.len(), 8);
+            let chars = &paragraphs[p].chars;
+            if chars.is_empty() {
+                return None;
+            }
+            let start = pick(chars.len(), 16);
+            let ids_to_delete: Vec<Id> = chars[start..]
+                .iter()
+                .take(1 + pick(4, 24))
+                .copied()
+                .collect();
+            Some(DocxOp::TrackDeleteText {
+                story: paragraphs[p].story,
+                ids: ids_to_delete,
+                revision: ids(1),
+                date: ctx.date.clone(),
+            })
+        }
+        37..=39 => {
+            let revisions = view.revisions();
+            if revisions.is_empty() {
+                return None;
+            }
+            let chosen: Vec<Id> = if kind == 39 {
+                revisions.iter().map(|r| r.id).collect()
+            } else {
+                revisions
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| (choice >> (8 + (i % 40))) & 1 == 1)
+                    .map(|(_, r)| r.id)
+                    .collect()
+            };
+            let chosen = if chosen.is_empty() {
+                vec![revisions[pick(revisions.len(), 12)].id]
+            } else {
+                chosen
+            };
+            Some(if (kind == 37) ^ (kind == 39 && pick(2, 30) == 0) {
+                DocxOp::AcceptRevisions { revisions: chosen }
+            } else {
+                DocxOp::RejectRevisions { revisions: chosen }
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The kinds of the model's live revisions, for assertions.
+pub fn revision_kinds(model: &DocxModel) -> Vec<RevisionKind> {
+    model.revisions().iter().map(|r| r.revision.kind).collect()
+}
+
 /// Turns a random `choice` into an operation on `view`. `ids(n)` reserves `n`
 /// consecutive identifiers. Returns `None` when the choice does not fit the
-/// document (e.g. no tables to edit).
+/// document (e.g. no tables to edit). Includes tracked changes, made by an
+/// unnamed replica.
 pub fn generate(view: &DocxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -> Option<DocxOp> {
+    generate_as(view, choice, &Context::default(), ids)
+}
+
+/// [`generate`] without tracked changes.
+pub fn generate_plain(
+    view: &DocxModel,
+    choice: u64,
+    ids: &mut dyn FnMut(u64) -> Id,
+) -> Option<DocxOp> {
     let paragraphs = view.paragraphs();
     let pick = |n: usize, salt: u32| ((choice >> salt) as usize) % n.max(1);
     let words = ["x", "日本", "é", "Lorem ", "  ", "ab"];
@@ -527,6 +910,106 @@ pub fn generate(view: &DocxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
     }
 }
 
+/// An operation on an editable top-level table that goes through its merged
+/// cells most of the time: a row or column inserted just above, inside or
+/// just below a merge, or deleted from one; a new merge of up to 3 × 3
+/// cells; an unmerge; or typing into a cell. `None` when there is no
+/// editable table.
+pub fn generate_through_merges(
+    view: &DocxModel,
+    choice: u64,
+    ids: &mut dyn FnMut(u64) -> Id,
+) -> Option<DocxOp> {
+    let pick = |n: usize, salt: u32| ((choice >> salt) as usize) % n.max(1);
+    let tables = view.tables();
+    let editable: Vec<(usize, &jade_docx_collab::TableView)> = tables
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| !t.locked)
+        .collect();
+    let &(index, table) = editable.get(pick(editable.len(), 8))?;
+    // A merge's span on one axis, widened by one line before it, or the
+    // whole axis when there is no merge (or now and then anyway).
+    let merge = (pick(4, 12) != 0)
+        .then(|| table.merges.get(pick(table.merges.len(), 14)))
+        .flatten();
+    let line = |rows: bool, salt: u32| -> Option<usize> {
+        let n = if rows {
+            table.rows.len()
+        } else {
+            table.columns.len()
+        };
+        match merge {
+            Some(&(top, left, bottom, right)) => {
+                let (first, last) = if rows { (top, bottom) } else { (left, right) };
+                let from = first.saturating_sub(1);
+                let k = from + pick(last - from + 1, salt);
+                // `None` stands for "insert at the start" (before line 0).
+                (!(first == 0 && k == from && pick(2, salt + 5) == 0)).then_some(k)
+            }
+            None => Some(pick(n, salt)),
+        }
+    };
+    let op = match choice % 10 {
+        0 | 1 => GridOp::InsertRow {
+            id: ids(1),
+            after: line(true, 20).map(|k| table.rows[k]),
+        },
+        2 | 3 => GridOp::InsertColumn {
+            id: ids(1),
+            after: line(false, 20).map(|k| table.columns[k]),
+        },
+        4 => GridOp::DeleteRow {
+            id: table.rows[line(true, 20).unwrap_or(0)],
+        },
+        5 => GridOp::DeleteColumn {
+            id: table.columns[line(false, 20).unwrap_or(0)],
+        },
+        6 | 7 => {
+            let top = pick(table.rows.len(), 20);
+            let left = pick(table.columns.len(), 24);
+            let op = IntentOp::MergeTableCells {
+                table: index,
+                top_row: top,
+                left_column: left,
+                bottom_row: (top + pick(3, 28)).min(table.rows.len() - 1),
+                right_column: (left + pick(3, 32)).min(table.columns.len() - 1),
+            };
+            return resolve(view, &op, ids).ok()?.into_iter().next();
+        }
+        8 => {
+            let &(row, column, _, _) = merge?;
+            let op = IntentOp::UnmergeTableCells {
+                table: index,
+                row,
+                column,
+            };
+            return resolve(view, &op, ids).ok()?.into_iter().next();
+        }
+        _ => {
+            // Typing at the start of a cell of this table.
+            let paragraphs = view.paragraphs();
+            let cells: Vec<usize> = paragraphs
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| view.cell_of(p.story).is_some_and(|(t, _, _)| t == table.id))
+                .map(|(k, _)| k)
+                .collect();
+            let p = *cells.get(pick(cells.len(), 20))?;
+            let op = IntentOp::InsertText {
+                paragraph: p,
+                offset: 0,
+                text: ["m", "表"][pick(2, 30)].to_string(),
+            };
+            return resolve(view, &op, ids).ok()?.into_iter().next();
+        }
+    };
+    Some(DocxOp::Table {
+        table: table.id,
+        op,
+    })
+}
+
 /// An edit at a random anchor (a text box or a note reference): typing or
 /// splitting at its offset, deleting the characters on both sides of it,
 /// emptying its paragraph up to it, or joining its paragraph with the next
@@ -702,9 +1185,9 @@ pub struct CharStyle {
     pub resolved: bool,
 }
 
-fn query(jade: &JadeDocx, query: HeadlessQuery) -> HeadlessQueryResult {
+fn query(word: &WordDocument, query: HeadlessQuery) -> HeadlessQueryResult {
     execute_headless_queries_on_document(
-        jade.word(),
+        word,
         &HeadlessQueryRequest {
             queries: vec![query],
         },
@@ -715,7 +1198,11 @@ fn query(jade: &JadeDocx, query: HeadlessQuery) -> HeadlessQueryResult {
 }
 
 pub fn paragraph_snapshot(jade: &JadeDocx, surface: usize) -> HeadlessParagraphSnapshot {
-    match query(jade, HeadlessQuery::Paragraph { paragraph: surface }) {
+    snapshot_in(jade.word(), surface)
+}
+
+fn snapshot_in(word: &WordDocument, surface: usize) -> HeadlessParagraphSnapshot {
+    match query(word, HeadlessQuery::Paragraph { paragraph: surface }) {
         HeadlessQueryResult::Paragraph {
             value: Some(value), ..
         } => value,
@@ -723,13 +1210,30 @@ pub fn paragraph_snapshot(jade: &JadeDocx, surface: usize) -> HeadlessParagraphS
     }
 }
 
-/// Every visible character of `model`, with what jade says about it.
+/// Every visible character of `model`, with what jade's own document (the
+/// base the model's marks are realised on) says about it.
 pub fn char_styles(model: &DocxModel, jade: &JadeDocx) -> BTreeMap<Id, CharStyle> {
+    char_styles_in(model, jade.word())
+}
+
+/// Every visible character of `model`, with what the file jade writes —
+/// its document with the model's marks realised — says about it.
+pub fn formatted_char_styles(model: &DocxModel, jade: &JadeDocx) -> BTreeMap<Id, CharStyle> {
+    let formatted = jade
+        .formatted(model)
+        .unwrap_or_else(|e| panic!("jade cannot realise the marks: {e}"));
+    char_styles_in(model, &formatted)
+}
+
+/// Every visible character of `model`, with what `word` says about it.
+pub fn char_styles_in(model: &DocxModel, word: &WordDocument) -> BTreeMap<Id, CharStyle> {
     let mut out = BTreeMap::new();
     for paragraph in model.paragraphs().iter() {
-        let surface = surface(jade, paragraph);
-        let snapshot = paragraph_snapshot(jade, surface);
-        let runs = &jade.word().paragraph(surface).expect("surface exists").runs;
+        let surface = word
+            .paragraph_story_surface(&paragraph.at)
+            .unwrap_or_else(|| panic!("jade has no paragraph {:?}", paragraph.at));
+        let snapshot = snapshot_in(word, surface);
+        let runs = &word.paragraph(surface).expect("surface exists").runs;
         let mut offset = 0;
         for (c, id) in paragraph.text.chars().zip(&paragraph.chars) {
             // jade's commands take rendered offsets (an inline text box counts
@@ -789,7 +1293,7 @@ pub fn paragraph_formats(
 
 pub fn jade_comments(jade: &JadeDocx) -> Vec<HeadlessCommentSnapshot> {
     match query(
-        jade,
+        jade.word(),
         HeadlessQuery::Comments {
             start_comment: 0,
             max_comments: usize::MAX,
@@ -838,5 +1342,69 @@ pub fn assert_comments_agree(model: &DocxModel, jade: &JadeDocx, context: &str) 
             comment.parent.map(jade_id),
             "thread of {key} {context}"
         );
+    }
+}
+
+/// Whether `style` shows `change` (for the properties jade's queries report).
+pub fn shows(change: &FormatChange, style: &CharStyle) -> bool {
+    let s = &style.style;
+    match change {
+        FormatChange::Bold { value } => s.bold.unwrap_or(false) == *value,
+        FormatChange::Italic { value } => s.italic.unwrap_or(false) == *value,
+        FormatChange::Underline { value, .. } => s.underline.unwrap_or(false) == *value,
+        // The query reports `w:strike` only, not `w:dstrike`.
+        FormatChange::Strike { value, double } => *double || s.strike.unwrap_or(false) == *value,
+        FormatChange::FontSize { half_points } => s.font_size == Some(*half_points as f32 / 2.0),
+        FormatChange::FontFamily { family } => s.font_family.as_deref() == Some(family.as_str()),
+        FormatChange::FontColor { color } => s.color.as_deref() == Some(color.as_str()),
+        FormatChange::Highlight { color } => style.highlight.as_deref() == Some(color.as_str()),
+        // Clearing restores whatever the style says; only "elsewhere nothing
+        // changed" is checked for it.
+        FormatChange::ClearFormatting => true,
+        FormatChange::Alignment { .. } | FormatChange::ParagraphStyle { .. } => true,
+    }
+}
+
+pub const MARK_KEYS: [MarkKey; 8] = MarkKey::ALL;
+
+/// What `style` reports for one attribute.
+pub fn attribute(style: &CharStyle, key: MarkKey) -> String {
+    let s = &style.style;
+    match key {
+        MarkKey::Bold => format!("{:?}", s.bold),
+        MarkKey::Italic => format!("{:?}", s.italic),
+        MarkKey::Underline => format!("{:?}", s.underline),
+        MarkKey::Strike => format!("{:?}", s.strike),
+        MarkKey::FontSize => format!("{:?}", s.font_size),
+        MarkKey::FontFamily => format!("{:?}", s.font_family),
+        MarkKey::FontColor => format!("{:?}", s.color),
+        MarkKey::Highlight => format!("{:?}", style.highlight),
+    }
+}
+
+/// The file the server writes shows the model's formatting: every
+/// character a mark sets shows that value, and every attribute no mark sets
+/// is what jade's own document has (the file's formatting, jade's rules for
+/// typed text, and sequenced formatting) — whatever jade's typing rules
+/// would have made of the marks around it.
+pub fn assert_formatting_agrees(model: &DocxModel, jade: &JadeDocx, context: &str) {
+    let base = char_styles(model, jade);
+    let formatted = formatted_char_styles(model, jade);
+    let overrides = model.character_formats();
+    for (c, style) in &formatted {
+        let set = overrides.get(c).map(Vec::as_slice).unwrap_or_default();
+        for key in MARK_KEYS {
+            match set.iter().find(|change| change.mark_key() == Some(key)) {
+                Some(change) => assert!(
+                    shows(change, style),
+                    "{c} does not show {change:?}: {style:?} {context}"
+                ),
+                None => assert_eq!(
+                    attribute(style, key),
+                    attribute(&base[c], key),
+                    "{key:?} of {c}, which no mark sets, is not jade's own {context}"
+                ),
+            }
+        }
     }
 }

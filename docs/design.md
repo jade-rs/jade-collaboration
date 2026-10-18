@@ -37,7 +37,8 @@ index, and is classified into one of two lanes:
 * **Convergent lane** — invariant-confluent operations. They commute with every
   other operation, so a replica applies them immediately and never rolls them
   back. Text insert/delete inside a paragraph (an RGA sequence CRDT), paragraph
-  split, and cell values (last-writer-wins registers).
+  split, character formatting (Peritext-style marks over the RGA) and cell
+  values (last-writer-wins registers).
 * **Sequenced lane** — operations that need coordination. A replica applies them
   tentatively; the central **sequencer** validates them against the
   authoritative state in arrival order and either commits or rejects them.
@@ -169,6 +170,17 @@ offset, so the materializer reaches any other place by typing a placeholder
 after the anchors that come first, inserting right after it and deleting it
 again.
 
+With tracked changes: creating or deleting a note or text box is not a
+revision (Word tracks neither as one, and jade's commands write none), but
+text typed into one while tracking is on is; tracked text that lands among
+the anchors at an offset is typed right after the placeholder with jade's
+revision session on (jade's `insert_text_among_anchors` writes plain text).
+Deleting a note or text box takes the tracked changes inside it with its
+story. Both tracks commit origin operations — the authors the server names
+(`SetAuthor`, committed directly) and jade's numbers (`Numbered`, derived) —
+and both sit in the journal and the checkpoint's model, so a restored
+server keeps both (`tests/notes_tracked.rs`).
+
 The model's walk lists paragraphs in jade's paragraph-surface order, which
 is also the order the intent API indexes: the body (table cells row by
 row); after each body paragraph the text boxes it anchors (in run order)
@@ -207,7 +219,8 @@ into the notes part, which jade rewrites from the runs by position — so the
 model refuses comments in notes on every replica; supporting them needs that
 binding in jade-core first. jade's `add_comment`
 (and a reply, which it anchors the same way) splits the runs of the
-paragraph it anchors to without relisting that paragraph's text boxes, whose paragraphs then point at a stale run until the
+paragraph it anchors to without relisting that paragraph's text boxes,
+whose paragraphs then point at a stale run until the
 file is read again; the materializer has jade relist them by restoring
 jade's own snapshot. A jade-core bug surfaced here — text typed after a note
 reference or text box alone in its paragraph went into that run, and the
@@ -258,6 +271,32 @@ grid's validity predicate (all regions alive, well-formed and pairwise
 non-overlapping) is checked by the sequencer for every structural operation;
 Lean proves that the grid's `apply` keeps it (`Grid.apply_preserves_valid`).
 
+**Rows and columns through merged regions** behave as in Word and Excel, and
+as jade does in both formats (pinned by probe tests that drive jade's own
+commands, `jade_table_merges.rs` and the xlsx merge tests):
+
+* a row (column) inserted *strictly inside* a merge — after its top row or
+  a row below it, before or at its bottom row — joins it: the merge grows;
+  one inserted above its top or below its bottom does not;
+* deleting a line takes it out of every merge: deleting a merge's top or
+  bottom (left or right) line moves that edge inward to the next alive line,
+  deleting an inner line shrinks it;
+* a merge left with fewer than two cells is dropped — deleting the last line
+  it had on an axis, or collapsing it to a single cell, which is then an
+  ordinary cell.
+
+The grid needs no special case for this: a merge is named by its corner
+lines, so a line inserted between the corners belongs to it, and deletion
+normalizes each merge to the first and last alive lines between its corners
+(the corners are what `Grid::merge_at`, the merge covering a cell, reads).
+Lean pins the behaviour down on the cells a merge covers
+(`Grid.insertRow_covers`, `insertCol_covers`: corners kept, every other line
+in or out as before, the new line inside exactly when inserted after a
+merge line other than its last; `deleteRow_covers`, `deleteCol_covers`: a
+surviving merge covers exactly its old alive cells minus the deleted line,
+and a merge is dropped exactly when fewer than two cells are left;
+`mergeAt_spec`: in a valid grid one merge at most covers a cell).
+
 **Merged cells in docx.** A table keeps every story it ever held, by
 identity, and separately *which stories each cell position shows* (jade's
 `w:tc` there). Merging (sequenced, `MergeCells`) changes only the latter, as
@@ -268,8 +307,16 @@ go. Unmerging (`UnmergeCells`) keeps what the merged cell shows and gives the
 cells it frees new empty stories. Because stories never move, text typed
 into any cell's story commutes with merging and unmerging — the property the
 client fast path needs (Lean: `CellCommute.cell_edit_comm_grid`; property
-test `merges_commute_with_cell_text`). Rows and columns may not be inserted
-or deleted through a merged region. Tables whose merges come from the file
+test `merges_commute_with_cell_text`). Rows and columns go through merged
+cells as the grid says (above), and the layout follows jade's `w:tc`: a new
+line's cells a merge covers get a story that no position shows (the new
+row's cell in the merge's left column is an empty follower, as Word's
+`w:vMerge` continuation is); deleting a merge's top row deletes what the
+merged cell shows, which lives in that row's `w:tc`, and the follower below
+becomes the merged cell; deleting its left column keeps the `w:tc`, one
+column narrower, so what the merged cell and its followers show moves to
+the next column. Stories still never move, so these commute with cell
+text too (`structure_through_merges_commutes_with_cell_text`). Tables whose merges come from the file
 (`w:gridSpan`, `w:vMerge`) load unlocked; ragged or nested tables stay
 structurally read-only. A jade-core bug surfaced here — a merge wrote an
 empty paragraph into each follower's XML but not into the model, so a save
@@ -277,25 +324,90 @@ added a paragraph — and is fixed in jade-rs/jade-core#12.
 
 ### Formatting and comments (`jade-docx-collab`)
 
-Formatting travels the sequenced lane as `Format { story, start, end,
-change }`: `start` and `end` are atom ids (characters, or a paragraph mark to
-reach an empty paragraph) of one story, inclusive, and `change` is one
-`FormatChange` — bold, italic, underline, strike, font size (half points),
-font family, font color, highlight, clear formatting, paragraph alignment and
-paragraph style. The range is resolved **when the operation is applied, in
-log order**: the visible atoms between the two ids in the story's RGA order.
-Characters deleted before it commits shrink it, characters inserted inside
-it before it commits are covered, and a range with nothing visible left does
-nothing. A character change becomes one jade command per paragraph slice; a
-paragraph change one per paragraph holding a visible atom of the range.
+**Character formatting is convergent: marks (`jade-collab-core::marks`).**
+Bold, italic, underline, strike, font size, font family, font colour and
+highlight — simple run properties whose new value replaces the old one —
+travel as `Mark { story, id, start, end, change }`, a Peritext mark (Litt,
+Lim, Kleppmann, van Hardenberg 2022). `start` and `end` are *boundaries*: a
+side of an atom of the story's RGA (`before` / `after` a character, a
+paragraph mark or an anchor) or an end of the story. RGA atoms are never
+removed — deleted text is a tombstone — and inserts never reorder the atoms
+that are there, so a mark's anchors never vanish and never move. An atom is
+covered when it lies strictly between the boundaries in the story's order,
+tombstones included, and for each attribute it shows the covering mark with
+the greatest id (last-writer-wins per attribute and character). The state
+is the *set* of marks, so marks commute with each other and with every text
+edit: a replica applies a remote mark straight onto its view, and replicas
+converge on every character's formatting whatever order the operations
+travel in (Lean: `Marks.format_converges`).
 
-The model **does not store formatting**: it only validates the value (values
-jade would write verbatim but Word cannot read, such as a hex highlight, are
-refused) and reports where jade must format. jade does the formatting, so
-Word's own rules — text typed next to bold text is bold, clearing keeps the
-highlight, a paragraph style re-cascades run properties — are jade's, never
-re-implemented. The convergent lane stays formatting-free; a Peritext-style
-mark CRDT would be needed to format optimistically without the sequencer.
+*Expand rules* are in the anchors, chosen by the intent API when the mark is
+made: a mark over the characters `first … last` starts `before first`
+(typing in front of formatted text is not covered) and, for every one of
+these attributes, ends `before` the atom that followed `last` in the
+story's order — or at the story's end — so text typed at the end of
+formatted text takes its formatting, as in Word. A link-like attribute would
+end `after last` instead (`Expand::None` in the core; no docx attribute
+uses it yet). Lean proves the consequences for any concurrent insert: inside
+the range covered, right after the last character covered exactly when the
+attribute expands, right before the first never (`typed_inside`,
+`typed_after_end`, `typed_before_start`), and inserting never changes the
+formatting of existing text (`effective_preserved`). The model refuses a
+mark whose anchors it does not have, that covers nothing, that reuses an id
+or carries an invalid value — all decided the same way on every replica.
+
+**Loaded formatting: jade is the base, marks are overrides.** The model
+stores only the marks made in the session. A character no mark of an
+attribute covers keeps what jade has for it: the file's formatting, jade's
+typing rules for text typed in the session, and the sequenced formatting
+below. The server's jade document holds exactly that *base* — every text
+and structural edit and every sequenced format, in log order, but no marks.
+The marks are realised when the file is written (`JadeDocx::formatted`,
+`JadeDocx::export(model)`): a copy of the base gets each maximal run of
+characters a mark sets (`DocxModel::formatting`) as an explicit value. jade's
+typing rule therefore only ever sees base formatting, never a mark's run:
+text typed right before bold text at a paragraph's start — where jade alone
+would copy the bold run — stays as its surroundings are, and text typed at
+the end of a bold mark is bold because the mark covers it, not because jade
+guessed. A test checks after every random edit, in concurrent sessions and
+after export that the written file shows every character's mark values and,
+for every attribute no mark sets, jade's own value. A checkpoint stores the
+base file next to the model (which holds the marks); downloads get the
+formatted file. Where no mark sets an attribute the model promises only
+"jade's base": for text typed in the session that is jade's typing rule
+applied in log order on the server (the neighbour's base formatting), which
+replicas without jade do not predict — as before marks existed. Making it
+fully determined would take loading the file's run formatting as origin
+marks, and jade-core commands that remove one direct property (a mark
+falling back to the style's value); not done.
+
+**Sequenced formatting stays for what is not a simple attribute.**
+`Format { story, start, end, change }` — paragraph alignment, paragraph
+style and clearing (and, for older clients, any character change, which
+then edits the base) — is resolved **when it is applied, in log order**:
+`start` and `end` are atom ids (characters, or a paragraph mark to reach an
+empty paragraph) of one story, inclusive, and the range is the visible
+atoms between them. Characters deleted before it commits shrink it,
+characters inserted inside it before it commits are covered, and a range
+with nothing visible left does nothing. A character change becomes one jade
+command per paragraph slice; a paragraph change one per paragraph holding a
+visible atom of the range. The model does not store this formatting: it
+validates the value (values jade would write verbatim but Word cannot read,
+such as a hex highlight, are refused on every lane) and reports where jade
+must format, and jade applies Word's own rules — a paragraph style
+re-cascades run properties, which explicit mark values then override, like
+direct formatting in Word.
+
+**Clearing** is both. The intent API turns a clear into a convergent
+`Mark { change: ClearFormatting }`, which *unsets* every attribute but the
+highlight on its range (Word's Ctrl+Space keeps the highlight) — a mark
+whose value is "back to the base", expanding like the attributes it unsets
+— plus a sequenced `Format { ClearFormatting }`, which clears the file's
+direct formatting in jade at its log position. The unset mark takes part in
+last-writer-wins like any other: marks older than the clear lose to it on
+its range, a newer mark wins over it, and a concurrent one is ordered by
+id, the same everywhere. The sequenced half needs no id and cannot conflict
+with marks: it only changes the base.
 
 Comments are sequenced too. `AddComment` anchors to the visible characters of
 an id range (refused when none are left); `ReplyToComment`, `ResolveComment`,
@@ -321,11 +433,125 @@ still addresses every comment and note (a property test restarts the
 server at random points of concurrent sessions). Replaying a journal checks
 that jade numbered alike.
 
-`admit` preflights formatting, comment, note and text box operations on a
-clone of the jade document and refuses what jade cannot do — for instance a
-reply whose root's text was deleted (jade re-anchors replies on the root's
-text). The agreement property test fails if jade refuses a note, text box
-or comment edit the model accepts.
+`admit` preflights sequenced formatting, comment, note and text box
+operations on a clone of the jade document and refuses what jade cannot do
+— for instance a reply whose root's text was deleted (jade re-anchors
+replies on the root's text). The agreement property test fails if jade
+refuses a note, text box or comment edit the model accepts. Marks are never
+preflighted: they must commit wherever they land, and the model refuses
+everything jade could not write (invalid values) itself.
+
+### Tracked changes (`jade-docx-collab`)
+
+Word's Track Changes in a shared document, edited by people and agents at
+once. What jade does, found by probing it (`tests/tracked_changes.rs`):
+with a revision session (`start_change_tracking`, one author and date for
+the whole document) typed text becomes a `w:ins` run of its own (a new
+`w:id` per edit, so two authors typing into each other's insertions stay
+apart), and a deletion becomes a `w:del` run whose text stays in the
+paragraph — every jade offset counts deleted text. Deleting text that is
+already deleted keeps its first author, and deleting with tracking off
+leaves deleted text alone (it goes only when its deletion is accepted).
+Four things jade got wrong, all fixed on jade-core's
+`feat/collab-tracked-changes` (below): deleting inserted text *replaced*
+the insertion by the deletion, so rejecting all changes kept text nobody
+had accepted (Word nests `<w:ins><w:del>`); text typed with tracking off
+at the end of an insertion joined it; a revision could be accepted or
+rejected only as whole runs; and a move decided after its paragraph was
+joined kept its `w:moveTo` in the file. jade also does
+not remove one's own insertion on deletion, as Word does — the intent API
+does that instead (below).
+
+Before this, a file's revisions loaded as plain text: deleted text was
+ordinary visible characters and nothing was locked, so editing such a file
+silently disagreed with what Word shows.
+
+**Revisions are attributes of atoms, never tombstones.** A tracked deletion
+must stay visible (and rejectable), and a tracked insertion must be
+removable as a unit, so the model keeps beside each story's RGA:
+
+* `inserted: atom → revision` — set when the atom is created by a tracked
+  insertion (or loaded from a `w:ins` run); cleared when the insertion is
+  accepted.
+* `deleted: atom → set of revisions` — every tracked deletion that named
+  the atom. A **grow-only set** under the convergent lane; only a sequenced
+  rejection removes a member.
+* `revisions: id → {kind, author, date, replica, file w:id, moved}` — one
+  entry per tracked operation (its first atom id, or a fresh id for a
+  deletion), or per (kind, `w:id`, author, date) loaded from the file.
+
+A character is *in jade's text* while it is not tombstoned; it *shows as
+deleted* while its set is non-empty, attributed to the set's **least**
+revision id. Two concurrent tracked deletions of the same character are
+both kept, so rejecting one leaves the other in force; which one Word shows
+is a pure function of the set (jade applies them in log order and keeps the
+first, so the materializer re-attributes when the log order and the id
+order disagree — below).
+
+| Operation | Lane | Effect on the atoms |
+| --- | --- | --- |
+| `TrackInsertText {story, parent, first, text, date}` | convergent | new atoms, `inserted = first` |
+| `TrackDeleteText {story, ids, revision, date}` | convergent | `deleted[a] ∪= {revision}` for each named character (also for tombstoned ones, so it commutes with removals) |
+| `InsertText` / `DeleteText` | convergent | as before: plain atoms; a tombstone (removing tracked text outright) |
+| `AcceptRevisions {revisions}` | sequenced | insertion: `inserted` cleared; deletion: its atoms tombstoned |
+| `RejectRevisions {revisions}` | sequenced | insertion: its atoms tombstoned; deletion: removed from every set |
+| `SetTracking {on}` | sequenced | the document's mode (Word's *Track Changes* button) |
+| `SetAuthor {replica, name}` | sequenced, server only | who `replica` is |
+
+**Convergence.** The state is (tombstones, `inserted`, `deleted`): set
+union, map insertion of fresh keys, and removals keyed by a revision id.
+Every convergent operation commutes with every other operation — the
+client fast path's condition (§2) — provided a decision names a revision
+other than the one a concurrent tracked deletion creates, which always
+holds (a revision is decided only after its author's operation committed).
+`lean/JadeCollab/Revision.lean` proves it: `trackDelete_comm_*` for every
+pair, `converges` for any order of convergent operations, and that the
+attributed revision (the set's minimum) is the same everywhere. Decisions
+name **whole revisions by id**, never ranges: a range resolved in log order
+would take in a revision inserted concurrently inside it on one replica and
+not on another, and the per-step `view == rebuilt view` check would catch
+it. The intent API turns "accept the changes in paragraphs 3–5" or "reject
+all" into the ids the author's view shows; a revision made concurrently is
+left for the next decision, as in Word when someone else's change arrives
+after you clicked.
+
+A concurrent tracked deletion and an insertion inside the deleted range:
+the new atoms sit between deleted ones (RGA), keep their own `inserted`
+revision (or none), and are not deleted — the deletion named only the
+characters its author saw. jade gets the same: an insertion inside a
+`w:del` run splits it.
+
+**Authors.** A tracked operation carries a date but no author: a client
+could claim any name, and a convergent operation cannot be rejected after
+the fact. The author is the operation's origin replica, resolved through
+`authors` when the operation is applied and stored in the revision. Only
+the server writes `authors`: when a replica joins or resumes over a socket
+whose token has a name — a person, or an agent's MCP token — the server
+commits `SetAuthor` as an origin operation right after the join. Every
+replica applies a replica's operations after the `SetAuthor`s committed
+before them (the server commits them before reading anything that replica
+sends, and a replica rebuilds its view when one arrives), so the snapshot is
+the same everywhere. A replica with no name (no tokens) authors anonymously
+(jade writes no `w:author`). "Own" — for Word's rule that deleting your own
+insertion removes it — means the same author name, or the same replica when
+there is no name.
+
+**What each edit becomes with tracking on** (the intent API reads the
+mode from the view; the operations never depend on it, so a concurrent
+`SetTracking` cannot change what an edit already sent means):
+
+* typing → `TrackInsertText`;
+* deleting → characters already shown as deleted are skipped (Word keeps
+  their first author); characters of one's own *still tracked* insertion
+  go in a plain `DeleteText`; the rest in one `TrackDeleteText`;
+* paragraph splits and joins, tables, formatting and comments stay
+  untracked (jade's paragraph-mark revisions cannot all be decided yet, and
+  Word's formatting revisions are not modelled).
+
+A file's existing revisions load as these attributes (`w:moveFrom` /
+`w:moveTo` as moved deletions / insertions), are listed, and can be
+accepted and rejected like session-made ones. Paragraph-mark revisions in a
+file are left in jade untouched and not shown.
 
 ### Spreadsheets (`jade-xlsx-collab`)
 
@@ -349,8 +575,8 @@ with jade by reusing jade's own reference shifter
 Notes and cell formats are convergent too. A note is a last-writer-wins
 register per cell, like a value. A format is one register per cell *and
 attribute* (bold, italic, underline, strike, font colour/size/name, fill,
-number format, horizontal/vertical alignment, wrap — exactly jade's
-`FormatChange`): jade's `set_format` is a partial change that keeps every
+number format, horizontal/vertical alignment, wrap, the border edges —
+exactly jade's `FormatChange`): jade's `set_format` is a partial change that keeps every
 attribute it does not name, so attributes are independent, concurrent
 changes to different attributes of one cell both survive, and each
 attribute converges to its newest write. jade is only told the attributes a
@@ -369,10 +595,53 @@ the two land in the log, which a convergent operation must not depend on.
 The server realises it with one `set_format` per rectangle of cells that
 won the same attributes.
 
+**Borders** (jade-rs/jade-core#21 added them to jade's `set_format` and
+`format_at`) are five more attributes, one per edge — left, right, top,
+bottom and the diagonal — each a register holding the line's style *and*
+colour, plus one per diagonal direction. Style and colour share a
+register because they are one look: a newer automatic-colour line must
+not keep an older line's red. Different edges are different registers,
+so one person drawing a cell's top edge while another draws its left edge
+both survive. `SetBorders` is Excel's border dialog over a range — the
+outline, the lines inside, single edges, the diagonals — expanded into
+per-cell edges by each cell's place in the row and column lists the
+operation names (never by the grid it lands in), so it stays convergent;
+the server realises it with one `set_format` per rectangle of cells that
+won the same edges. Excel stores a border on each cell, so a line between
+two cells may be the bottom edge of one and the top edge of the other;
+like Excel, `SetBorders` draws an inside line on both sides and the
+outline only on the range's own cells. On structure edits the model
+follows jade, which here differs from Excel's default: Excel gives an
+inserted row the format of the row above ("Format Same As Above"), jade
+leaves it unformatted, so a row inserted inside a box is open on the
+sides — the model knows no format for its cells, as for any line made
+after a range was drawn. A deleted edge row takes its edge with it.
+Merging copies the anchor's edges into the covered cells, as jade (and
+Excel) copy the anchor's style; jade reports a merged cell's borders at
+the anchor, and so does the model.
+
+**Whole rows and columns** (Excel's `<row s=…>` / `<col style=…>`, which
+jade writes for `set_format` on `3:5` or `B:D`, together with every stored
+cell and row/column intersection on them) are registers per line and
+attribute, written by the convergent `SetLineFormat`. A cell shows, per
+attribute, the newest write among its own, its row's and its column's.
+jade only sees the writes that won their register, in log order, and a
+line write patches every cell of the line, so when it arrives the server
+puts back, cell by cell, the attributes where a newer cell or crossing
+line write shows; a cell write older than its row's or column's reaches
+jade not at all. Lines inserted later behave as in jade: a new row has no
+row format and shows its columns' formats, a new column shows its rows'
+(jade widens a multi-column `<col>` span around a column inserted inside
+it; the model does not claim that format, so the two never disagree on
+what it knows). A merge copies what shows at the anchor, its row's and
+column's formats included.
+
 jade reports a merged cell's format at the merge's anchor, so the model
 loads the file's merges into the sheet grid, which moves them exactly as
-jade does (a line inserted inside joins the merge, a deleted corner moves
-to the next line). Formatting a covered cell is kept and shows once a
+jade does (the rules above: a line inserted inside joins the merge, a
+deleted corner moves to the next line, a single cell is no merge — jade's
+reference shifter drops a range that shrinks to one cell). The agreement
+tests compare every sheet's merged ranges with jade's. Formatting a covered cell is kept and shows once a
 deletion makes it the anchor, as in jade. Notes and formats in an Excel
 table's header or totals row are safe — jade leaves the header text and
 column name alone when only the format or the note changes — so unlike
@@ -477,6 +746,11 @@ read again. For pptx, effects name slides by position and
 text by paragraph and byte offset; the materializer turns those into jade's
 UTF-16 ranges on jade's own text.
 
+A docx mark has no effect on jade's document: the server's jade holds the
+base formatting and the marks are realised on a copy whenever the file is
+written (§4, "Loaded formatting"), so jade's own typing rules never act on
+a mark's formatting.
+
 Clients do not need jade: an AI agent, a CLI or a test works on the model. A
 jade editor client additionally applies the same effects to its local
 `WordDocument`.
@@ -505,6 +779,26 @@ convergent operations — they must commit wherever they land; the pptx model
 therefore refuses text and geometry jade would refuse (characters, the
 32-bit EMU range, locks) with jade's own validators, on every replica.
 
+**Tracked changes in jade.** jade's revision session is document-wide, so
+the materializer keeps it off and switches it on, with the operation's
+author and date, around exactly one jade command: the `InsertText` of a
+tracked insertion (the split and join that place text beside an anchor
+stay untracked) or the `ReplaceRange` of a tracked deletion. Removing
+text (rejecting an insertion, deleting outright) is an untracked
+`ReplaceRange`, except for text a deletion holds, which jade's deletion
+leaves: it goes by accepting that deletion. Accepting an insertion or a
+deletion and restoring a deletion are jade's `accept_revisions` /
+`reject_revisions`
+with *revision targets* — the parts of jade's runs under the model's
+characters, read from jade with their `w:id`s, which needs jade-core's
+targets on part of a run. When the least revision of a character's set
+changes (a tracked deletion with a smaller id arrives later in the log, or
+the least one is rejected while others remain), the model emits a restore
+and a tracked deletion by the new least revision's author, so jade shows
+the author the model does. A test compares, for every character of every
+paragraph, the model's (inserted author/date, deleted author/date) with
+jade's runs after every operation.
+
 Tables are matched to jade's `table_order_index` by identity: the model knows
 the body's table structure (nested tables included), jade's order also counts
 tables inside text boxes, and the materializer pairs the two by walking
@@ -519,12 +813,18 @@ jade's parsed body.
   structure log records the log position), so the tentative result is
   replaced by the authoritative one. A convergent operation must therefore
   never depend on its log position.
+* A mark's boundaries are chosen by its author and travel with it. Deriving
+  them where an operation is applied — "before the atom after the range"
+  computed from a sequenced clear's ids — would put a concurrent insert on
+  one side of the boundary on a replica that applied the insert straight
+  onto its view and on the other side in the rebuilt view; so a clear's
+  unset half is a convergent mark of its own.
 
 ## 6. Components
 
 | Crate | Role |
 | --- | --- |
-| `jade-collab-core` | identifiers, Lamport clock, RGA (+ executable spec), LWW register, table grid |
+| `jade-collab-core` | identifiers, Lamport clock, RGA (+ executable spec), marks (Peritext formatting over the RGA, + executable spec), LWW register, table grid |
 | `jade-collab-sync` | `Document` trait, lanes, wire protocol, `Sequencer` (server core, with checkpoints, journal records and replay), `Replica` (client core), deterministic network simulator |
 | `jade-docx-collab` | docx model + operations, loading from a jade `WordDocument`, materialization to `HeadlessCommand`s, index-addressed intent API (migrated from jade-core) |
 | `jade-xlsx-collab` | xlsx model + operations, loading from / materializing into a jade `HeadlessWorkbook` |
@@ -546,7 +846,10 @@ Tests are written first. Three layers:
    `jade_collab_core::grid::Grid` that behaves exactly like the Rust code
    (same accept/reject decisions, same resulting state) with
    `apply_preserves_valid` — every accepted row/column/merge operation keeps
-   the table valid — and `check_iff_valid` for the executable checker; cell
+   the table valid — and `check_iff_valid` for the executable checker; rows
+   and columns go through merged regions as in Word and Excel, stated on the
+   cells each merge covers (`insertRow_covers`, `insertCol_covers`,
+   `deleteRow_covers`, `deleteCol_covers`, `mergeAt_spec`); cell
    edits commute with every grid operation; a live table's anchor mark always
    exists and is visible, and convergent text operations never change
    whether a join or table operation is accepted. The proofs also sharpened
@@ -557,12 +860,46 @@ Tests are written first. Three layers:
    its view whenever a remote convergent operation does not apply directly.
    The Lean model is also an executable oracle (`lake build grid-oracle`); a
    property test feeds it and the Rust grid the same random operations and
-   compares every decision and the final state (CI job `lean-oracle`).
+   compares every decision, the final state and which merge covers every
+   alive cell (`mergeAt` against `Grid::merge_at`; CI job `lean-oracle`).
+   For formatting (`Marks.lean`): a character's formatting is a function of
+   the sets of inserts and marks (any order, any duplication; deletions play
+   no part), so rich text converges (`format_converges`,
+   `richRender_converges`); inserted atoms never reformat existing ones
+   (`effective_preserved`); a new atom gets exactly the formatting of the
+   gap it lands in (`effective_in_gap`), and for the marks the intent API
+   makes that means: inside the range covered, right after the end covered
+   iff the attribute expands, right before the start never (`typed_inside`,
+   `typed_after_end`, `typed_before_start`, `typed_at_story_start`). The
+   RGA's own part — that inserts keep the relative order of existing atoms —
+   is a hypothesis there, checked by property tests. `marks-oracle` runs the
+   Lean RGA walk and `effective`; a property test compares it with the Rust
+   `Rga` + `MarkSet` on random concurrent histories (same CI job).
+   For tracked changes (`Revision.lean`): a model of the per-character
+   state (tombstone, insertion revision, deletion set) and of every
+   operation on it, with `convergent_comm` — each convergent operation
+   (tracked deletion, removal, insertion of fresh characters) commutes with
+   every operation that does not decide the revision it creates, sequenced
+   accept/reject included — `convergent_grows` (deletion sets only grow on
+   the convergent lane), `converges` / `shown_converges` (any order of the
+   same tracked deletions and removals gives the same state, hence the same
+   attributed revision) and `rejectDel_keeps_others`.
 2. **Property-based tests** (`proptest`) — the implementation against the
-   specification (RGA differential test), convergence of random concurrent
-   histories across N replicas under random message scheduling, grid
-   invariants under random structural operations, docx/xlsx/pptx model ↔
-   jade agreement after random edit sequences, a restarted server
+   specification (RGA and mark-sweep differential tests), convergence of
+   random concurrent histories across N replicas under random message
+   scheduling (text and marks peer to peer, and docx formatting through the
+   server, whose written file must show every character's formatting), the
+   expand rules for concurrent typing at a mark's edges, grid
+   invariants under random structural operations and the covered cells of
+   every merge following Word's rules under them, docx/xlsx/pptx model ↔
+   jade agreement after random edit sequences (docx tables compared cell by
+   cell and xlsx merged ranges compared, with generators biased to rows and
+   columns through merged cells; every docx character's tracked insertion
+   and deletion, with author and date, compared too), convergent docx
+   operations commuting with every text and revision operation,
+   concurrent xlsx border, cell, row and
+   column formats ending — on every replica and in jade — at the newest
+   write per cell, edge and attribute, a restarted server
    indistinguishable from one that kept running and resuming within its
    kept tail exactly as one that never checkpointed, the journal reading
    back whatever was appended, checkpointed and torn and being synced as its
@@ -685,21 +1022,62 @@ connection itself, before the document's thread sees it, and only its sender
 gets `presence_rejected {reason}`; submissions go through the same loop
 untouched.
 
+### Slow connections
+
+The document's thread never waits on a connection. Each connection has a
+bounded queue of outgoing messages (1024 by default, `--outgoing-limit`);
+the thread offers each message without blocking, and a message that does not
+fit means the client reads too slowly. The thread then stops sending to that
+connection (it leaves the subscribers, so the others are not held up), and
+the connection says `overloaded {message}` and closes with 1013 (try again
+later). Its replica is not lost: it resumes on a new connection like after
+any disconnect and catches up from the log (or rejoins if what it missed was
+compacted). A test floods a client that reads nothing with presence and
+checks that the flooding client's operation still commits, that the slow one
+is told and closed without being sent everything, and that it resumes; a
+mutation that stops reporting the overflow fails it.
+
+### Audit log
+
+`--audit-log FILE` appends one JSON object per line for every access, each
+with `at` (milliseconds since the Unix epoch) and `event`: `connected`
+(document, token name, role), `joined` / `resumed` (the replica), `closed`
+(the replica and why: `client`, `revoked`, `overloaded`, `stopped`),
+`refused` (status 401 with the request path, or 403 with the document and
+token name), `uploaded` and `downloaded`. A token is recorded by its grant's
+name and never by itself, and request URLs are reduced to their path, since
+a socket may carry its token in the query; a test checks that no secret
+reaches the file.
+
 ## 9. Status and next steps
 
 Working: the two-lane protocol over WebSockets; docx text, paragraph
-split/join, table insertion/deletion and row/column structure on simple
-tables, text in any table cell; text and paragraphs of footnotes, endnotes
-and text boxes (§4), their anchors following splits, joins and deletions as
-jade moves them, in every concurrent order; creating and deleting
-footnotes, endnotes and text boxes; docx formatting (character and
-paragraph) and comments (add, reply, resolve, edit, delete; also comments
-loaded from the file; in the body, table cells and text boxes) as
-sequenced operations on id ranges resolved in log order (§4), with jade's
-numbers for new comments and notes committed as derived operations so a
-restored server keeps addressing them; xlsx
+split/join, table insertion/deletion and row/column structure (through
+merged cells too, as Word does), merging and unmerging cells, text in any
+table cell; text and paragraphs of footnotes, endnotes and text boxes
+(§4), their anchors following splits, joins and deletions as jade moves
+them, in every concurrent order; creating and deleting footnotes, endnotes
+and text boxes; docx character formatting as convergent
+Peritext marks (bold, italic, underline, strike, size, family, colour,
+highlight; expanding at their end; newest wins per attribute; realised on
+the written file over jade's base formatting) and clearing as an unset mark
+plus a sequenced clear of the file's formatting; paragraph formatting and
+comments (add, reply, resolve, edit, delete; also comments loaded from the
+file; in the body, table cells and text boxes) as sequenced operations on id
+ranges resolved in log order (§4), with jade's numbers for new comments and
+notes committed as derived operations so a restored server keeps
+addressing them;
+docx tracked changes (§4): a document-wide tracking mode, tracked typing
+and deleting by people and agents with the server naming each revision's
+author from the token, Word's own-insertion rule, concurrent tracked
+deletions converging on the least revision, accepting and rejecting whole
+revisions by id, paragraph range or all, a file's revisions (moves
+included) loaded, listed and decided, and every character's revision
+agreeing with jade and the written file; xlsx
 values, formulas (with rebasing), row/column structure, notes, cell
-formatting (per-attribute LWW, A1 ranges), merged cells and sheet
+formatting (per-attribute LWW, A1 ranges), cell borders (a register per
+edge; Excel's outline/inside lines over a range), whole-row and
+whole-column formats, merged cells and sheet
 management (add, rename, delete, move); pptx slide
 insert/delete/move/duplicate, text in shapes, group children and speaker
 notes, shape geometry, text boxes and shape deletion (hosted by the server,
@@ -713,27 +1091,50 @@ log compaction that keeps a tail for replicas slightly behind, and an
 optional fsync per journal record; bearer-token authentication with editor
 and viewer roles, per-document access and roles, and tokens rotated without a
 restart (revoked sockets are closed); presence, limited in size and rate per
-connection.
+connection; a bounded outgoing queue per connection (a client that reads too
+slowly is closed and resumes); an audit log of every access.
 
 Not yet:
 
-* Optimistic formatting on the convergent lane (a Peritext-style mark CRDT);
-  formatting a story's last paragraph while it is empty (it has no atom to
+* Marks for attributes with structure: links and hyperlink styles
+  (non-expanding marks; the core supports them), character styles, comments
+  as marks (they are sequenced); a mark cannot set the formatting of an
+  empty paragraph's mark (Word's paragraph-mark run properties). A jade
+  editor client would realise marks the way the server's writer does
+  (`JadeDocx::formatted`), not by applying them to its own document.
+  `read_document` (MCP) does not report formatting yet. In Lean the RGA's
+  part of the expand rules — an insert keeps the order of existing atoms
+  and lands right after its parent when its id is the newest — is a
+  hypothesis (`Extends`, `InGap`), checked by a property test rather than
+  proved from `Rga.walk`.
+  Formatting a story's last paragraph while it is empty (it has no atom to
   name it by); comments in notes (jade-core's comment commands edit
   `document.xml` only, and note runs carry no XML binding) and headers.
   Headers and footers are not modelled.
-* xlsx borders, whole-row/column formats, conditional formats and threaded
-  comments; note authors are not modelled (jade records `jade`).
-* docx structure of ragged and nested tables (their text is editable),
-  rows/columns through merged regions, tracked changes; text boxes inside
-  text boxes or notes, and their geometry.
-* Access and durability: a connection's outgoing queue is unbounded (a
-  client that stops reading makes it grow), there is no audit log of who
-  connected with which token, and reloading tokens on SIGHUP is Unix-only
-  (the file is still polled everywhere).
+* xlsx conditional formats and threaded comments; borders on whole rows
+  and columns through `set_borders` (`set_format` takes edges for them);
+  the formats a file already had are not loaded into the model, so reads
+  list only what was written in the collaboration; note authors are not
+  modelled (jade records `jade`).
+* Tracked changes: paragraph splits and joins, tables and formatting are
+  not tracked (jade cannot yet decide every paragraph-mark revision, and
+  formatting revisions — `w:rPrChange` — are not modelled; convergent
+  marks format deleted and inserted text alike, untracked); a file's
+  paragraph-mark and formatting revisions are kept in jade but neither
+  shown nor decided; the tracking mode is the model's and is not written to
+  `settings.xml` (`w:trackRevisions`) nor read from it; decisions take whole
+  revisions, not part of one; jade's own editor still marks one's own
+  insertion deleted instead of removing it (the intent API removes it).
+* docx structure of ragged and nested tables (their text is editable);
+  text boxes inside text boxes or notes, and their geometry.
+* Access: reloading tokens on SIGHUP is Unix-only (the file is still polled
+  everywhere); the audit log is a plain file that is never rotated.
 * Performance: RGA lookups are linear and paragraph positions are recomputed
-  by walking the model on each operation; formatting, comment, note and
-  text box operations are preflighted on a copy of the jade document;
+  by walking the model on each operation; sequenced formatting, comment,
+  note and text box operations are preflighted on a copy of the jade document; marks are
+  realised on a fresh copy of the base document every time the file is
+  written (one jade command per run of one value), and their coverage is
+  recomputed by a sweep over the story (`O((n + m) log m)`) when asked;
   jade's xlsx editor rereads the workbook on every write. Fine for the first
   milestone, not for large documents.
 * pptx in the server (the crate is ready: a `PptxModel` and a `JadePptx`

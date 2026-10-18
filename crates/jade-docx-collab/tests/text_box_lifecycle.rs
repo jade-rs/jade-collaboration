@@ -60,7 +60,7 @@ fn layouts(model: &DocxModel) -> Vec<String> {
 }
 
 fn reloaded(jade: &JadeDocx) -> (DocxModel, JadeDocx) {
-    let jade = JadeDocx::load(&jade.export().unwrap()).unwrap();
+    let jade = JadeDocx::load(&jade.export_base().unwrap()).unwrap();
     let model = DocxModel::from_word_document(jade.word()).unwrap();
     assert_same_order(&model, &jade, "after reloading");
     (model, jade)

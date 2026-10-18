@@ -12,7 +12,10 @@ columns and merges in the same order; `Valid` is exactly what
 Main result: `apply_preserves_valid`, and through
 `Sequencer.sequenced_preserves`, `grid_sequenced_valid`. The executable
 `check` is proven equivalent to `Valid` (`check_iff_valid`) and, together with
-`apply`, drives the `grid-oracle` executable (`GridOracle.lean`).
+`apply` and `mergeAt`, drives the `grid-oracle` executable (`GridOracle.lean`).
+Rows and columns go through merged regions as in Word and Excel
+(`insertRow_covers`, `insertCol_covers`, `deleteRow_covers`,
+`deleteCol_covers`).
 -/
 
 namespace JadeCollab.Grid
@@ -865,6 +868,554 @@ theorem check_iff_valid (g : Grid) : check g = true ↔ Valid g := by
 
 instance (g : Grid) : Decidable (Valid g) := decidable_of_iff _ (check_iff_valid g)
 
+/-! ## Rows and columns through merged regions
+
+What Word and Excel do when a row or column goes through a merged cell, stated
+on the cells a merge covers: a line inserted strictly inside a merge joins it
+and one inserted at its edge does not (`insertRow_covers`, `insertCol_covers`);
+deleting a line takes it out of every merge, so a deleted edge moves inward to
+the next alive line, and a merge left with fewer than two cells is dropped
+(`deleteRow_covers`, `deleteCol_covers`). `mergeAt` (`Grid::merge_at`) names
+the merge covering an alive cell (`mergeAt_spec`). The grid already behaved
+this way — merges are named by their corners, so lines between the corners
+belong to them — and these theorems pin the behaviour down; `grid-oracle`
+prints `mergeAt` of every alive cell so the Rust query is compared too. -/
+
+/-- Line `z` lies between lines `x` and `y`, inclusive, by position — alive or
+not. -/
+def between (ls : List Line) (x y z : Nat) : Bool :=
+  match pos ls x, pos ls y, pos ls z with
+  | some a, some b, some i => decide (a ≤ i) && decide (i ≤ b)
+  | _, _, _ => false
+
+/-- Merge `m` spans cell (`r`, `c`): its row lies between `m`'s top and bottom
+and its column between `m`'s left and right. -/
+def covers (g : Grid) (m : Merge) (r c : Nat) : Bool :=
+  between g.rows m.top m.bottom r && between g.cols m.left m.right c
+
+/-- Row `r` and column `c` both exist and are alive. -/
+def aliveCell (g : Grid) (r c : Nat) : Bool :=
+  (alivePos g.rows r).isSome && (alivePos g.cols c).isSome
+
+/-- `Grid::merge_at`: the merge covering an alive cell. -/
+def mergeAt (g : Grid) (r c : Nat) : Option Merge :=
+  if aliveCell g r c then g.merges.find? (covers g · r c) else none
+
+/-- The alive cells of `m`: what the merge shows as one cell. -/
+def Holds (g : Grid) (m : Merge) (r c : Nat) : Prop :=
+  covers g m r c = true ∧ aliveCell g r c = true
+
+theorem between_spec {ls : List Line} {x y z : Nat} :
+    between ls x y z = true ↔ ∃ a b i, pos ls x = some a ∧ pos ls y = some b ∧
+      pos ls z = some i ∧ a ≤ i ∧ i ≤ b := by
+  unfold between
+  cases pos ls x <;> cases pos ls y <;> cases pos ls z <;> simp
+
+/-- Two merges covering one cell overlap. -/
+theorem overlaps_of_covers {g : Grid} {m n : Merge} {r c : Nat}
+    (hm : covers g m r c = true) (hn : covers g n r c = true) : overlaps g m n = true := by
+  simp only [covers, Bool.and_eq_true] at hm hn
+  obtain ⟨⟨a1, b1, i1, ha1, hb1, hi1, h11, h12⟩, ⟨a2, b2, i2, ha2, hb2, hi2, h21, h22⟩⟩ :=
+    And.intro (between_spec.mp hm.1) (between_spec.mp hm.2)
+  obtain ⟨⟨a3, b3, i3, ha3, hb3, hi3, h31, h32⟩, ⟨a4, b4, i4, ha4, hb4, hi4, h41, h42⟩⟩ :=
+    And.intro (between_spec.mp hn.1) (between_spec.mp hn.2)
+  rw [hi1] at hi3; rw [hi2] at hi4; cases hi3; cases hi4
+  simp only [overlaps, span_of_pos ha1 hb1, span_of_pos ha2 hb2, span_of_pos ha3 hb3,
+    span_of_pos ha4 hb4, inter, Bool.and_eq_true, decide_eq_true_eq]
+  omega
+
+theorem find?_covers {g : Grid} {r c : Nat} :
+    ∀ {ms : List Merge}, ms.Pairwise (fun a b => overlaps g b a = false) →
+      ∀ {m}, m ∈ ms → covers g m r c = true → ms.find? (covers g · r c) = some m
+  | [], _, _, hm, _ => by simp at hm
+  | x :: xs, hp, m, hm, hc => by
+    rw [List.pairwise_cons] at hp
+    by_cases hx : covers g x r c = true
+    · rw [List.find?_cons_of_pos (p := (covers g · r c)) hx]
+      rcases List.mem_cons.mp hm with rfl | hm
+      · rfl
+      · have := hp.1 m hm
+        rw [overlaps_of_covers hc hx] at this
+        simp at this
+    · rw [List.find?_cons_of_neg (p := (covers g · r c)) hx]
+      rcases List.mem_cons.mp hm with rfl | hm
+      · exact absurd hc hx
+      · exact find?_covers hp.2 hm hc
+
+/-- **`merge_at` names the one merge covering an alive cell.** In a valid
+grid at most one does, since merges do not overlap. -/
+theorem mergeAt_spec {g : Grid} (hv : Valid g) (r c : Nat) (m : Merge) :
+    mergeAt g r c = some m ↔ m ∈ g.merges ∧ Holds g m r c := by
+  unfold mergeAt Holds
+  split
+  · rename_i ha
+    constructor
+    · intro h
+      exact ⟨List.mem_of_find?_eq_some h, List.find?_some (p := (covers g · r c)) h, ha⟩
+    · rintro ⟨hm, hc, -⟩
+      exact find?_covers hv.disjoint hm hc
+  · rename_i ha
+    simp only [reduceCtorEq, false_iff, not_and]
+    intro _ _ h; exact absurd h ha
+
+/-! ### Insertion -/
+
+theorem insertLine_at {ls rs : List Line} {x : Nat} {after : Option Nat}
+    (h : insertLine ls x after = some rs) :
+    x ∉ ids ls ∧ ((after = none ∧ rs = insertAt ls 0 ⟨x, true⟩) ∨
+      ∃ a q, after = some a ∧ pos ls a = some q ∧ rs = insertAt ls (q + 1) ⟨x, true⟩) := by
+  refine ⟨(insertLine_spec h).1, ?_⟩
+  unfold insertLine at h
+  split at h
+  · simp at h
+  · split at h
+    · cases h; exact Or.inl ⟨rfl, rfl⟩
+    · rename_i a
+      split at h
+      · simp at h
+      · rename_i q hq
+        cases h; exact Or.inr ⟨a, q, rfl, hq, rfl⟩
+
+theorem pos_insertAt_self {ls : List Line} {k : Nat} {e : Line} (hk : k ≤ ls.length)
+    (he : e.id ∉ ids ls) : pos (insertAt ls k e) e.id = some k := by
+  induction ls generalizing k with
+  | nil => simp at hk; subst hk; simp [insertAt_zero, pos]
+  | cons l ls ih =>
+    cases k with
+    | zero => simp [insertAt_zero, pos]
+    | succ k =>
+      rw [insertAt_succ]
+      simp only [ids, List.map_cons, List.mem_cons, not_or] at he
+      simp at hk
+      simp only [pos, Ne.symm he.1, ite_false, ih (by omega) he.2]
+      rfl
+
+theorem between_insertAt_old {ls : List Line} {k : Nat} {e : Line} {x y z : Nat}
+    (hk : k ≤ ls.length) (hx : e.id ≠ x) (hy : e.id ≠ y) (hz : e.id ≠ z) :
+    between (insertAt ls k e) x y z = between ls x y z := by
+  unfold between
+  rw [pos_insertAt hk hx, pos_insertAt hk hy, pos_insertAt hk hz]
+  cases pos ls x <;> cases pos ls y <;> cases pos ls z <;> simp [sh_le_sh]
+
+theorem between_insertAt_new {ls : List Line} {k : Nat} {e : Line} {x y : Nat}
+    (hk : k ≤ ls.length) (he : e.id ∉ ids ls) (hx : e.id ≠ x) (hy : e.id ≠ y) :
+    between (insertAt ls k e) x y e.id = true ↔
+      ∃ i j, pos ls x = some i ∧ pos ls y = some j ∧ i < k ∧ k ≤ j := by
+  unfold between
+  rw [pos_insertAt_self hk he, pos_insertAt hk hx, pos_insertAt hk hy]
+  cases pos ls x <;> cases pos ls y <;> simp [sh] <;> split <;> split <;> omega
+
+/-- The corners of a merge in a valid grid exist (and are alive). -/
+theorem corners {g : Grid} (hv : Valid g) {m : Merge} (hm : m ∈ g.merges) :
+    (∃ a b, pos g.rows m.top = some a ∧ pos g.rows m.bottom = some b ∧ a ≤ b) ∧
+    (∃ a b, pos g.cols m.left = some a ∧ pos g.cols m.right = some b ∧ a ≤ b) := by
+  have := hv.mergesOk m hm
+  simp only [checkMerge, Bool.and_eq_true] at this
+  obtain ⟨a, b, ha, hb, -, -, hab⟩ := axisOk_spec.mp this.1.1
+  obtain ⟨c, d, hc, hd, -, -, hcd⟩ := axisOk_spec.mp this.1.2
+  exact ⟨⟨a, b, ha, hb, hab⟩, ⟨c, d, hc, hd, hcd⟩⟩
+
+/-- **A row inserted strictly inside a merge joins it; one inserted at its
+edge does not** — Word's and Excel's rule. Every merge keeps its corners and
+the columns are untouched; every other row is inside or outside each merge as
+before; and the new row is inside merge `m` exactly when it was inserted
+after one of `m`'s rows other than its bottom one (a deleted one too). -/
+theorem insertRow_covers {g g' : Grid} {x : Nat} {after : Option Nat} (hv : Valid g)
+    (h : apply g (.insertRow x after) = some g') :
+    g'.merges = g.merges ∧ g'.cols = g.cols ∧
+    (∀ m ∈ g.merges, ∀ y, y ≠ x →
+      between g'.rows m.top m.bottom y = between g.rows m.top m.bottom y) ∧
+    (∀ m ∈ g.merges, between g'.rows m.top m.bottom x = true ↔
+      ∃ a i j q, after = some a ∧ pos g.rows m.top = some i ∧ pos g.rows m.bottom = some j ∧
+        pos g.rows a = some q ∧ i ≤ q ∧ q < j) := by
+  simp only [apply, Option.map_eq_some_iff] at h
+  obtain ⟨rs, hrs, rfl⟩ := h
+  obtain ⟨hid, hk⟩ := insertLine_at hrs
+  have ne : ∀ m ∈ g.merges, x ≠ m.top ∧ x ≠ m.bottom := by
+    intro m hm
+    obtain ⟨⟨a, b, ha, hb, -⟩, -⟩ := corners hv hm
+    exact ⟨fun e => hid (e ▸ mem_ids_of_pos ha), fun e => hid (e ▸ mem_ids_of_pos hb)⟩
+  refine ⟨rfl, rfl, ?_, ?_⟩
+  · intro m hm y hy
+    obtain ⟨n1, n2⟩ := ne m hm
+    rcases hk with ⟨-, rfl⟩ | ⟨a, q, -, hq, rfl⟩
+    · exact between_insertAt_old (Nat.zero_le _) n1 n2 (Ne.symm hy)
+    · exact between_insertAt_old (pos_lt hq) n1 n2 (Ne.symm hy)
+  · intro m hm
+    obtain ⟨n1, n2⟩ := ne m hm
+    rcases hk with ⟨rfl, rfl⟩ | ⟨a, q, rfl, hq, rfl⟩
+    · show between (insertAt g.rows 0 ⟨x, true⟩) m.top m.bottom (Line.id ⟨x, true⟩) = true ↔ _
+      rw [between_insertAt_new (Nat.zero_le _) hid n1 n2]
+      simp
+    · show between (insertAt g.rows (q + 1) ⟨x, true⟩) m.top m.bottom (Line.id ⟨x, true⟩) = true ↔ _
+      rw [between_insertAt_new (pos_lt hq) hid n1 n2]
+      constructor
+      · rintro ⟨i, j, hi, hj, h1, h2⟩
+        exact ⟨a, i, j, q, rfl, hi, hj, hq, by omega, by omega⟩
+      · rintro ⟨a', i, j, q', ha', hi, hj, hq', h1, h2⟩
+        cases ha'; rw [hq] at hq'; cases hq'
+        exact ⟨i, j, hi, hj, by omega, by omega⟩
+
+/-! ### Deletion -/
+
+theorem head_filter_first {l : List Line} {f e : Line} {i : Nat}
+    (hf : (l.filter (·.alive)).head? = some f) (hi : l[i]? = some e) (he : e.alive = true) :
+    ∃ k, k ≤ i ∧ l[k]? = some f := by
+  induction l generalizing i with
+  | nil => simp at hi
+  | cons x xs ih =>
+    by_cases hx : x.alive = true
+    · rw [List.filter_cons_of_pos hx] at hf; simp at hf; subst hf; exact ⟨0, Nat.zero_le _, rfl⟩
+    · rw [List.filter_cons_of_neg hx] at hf
+      cases i with
+      | zero => simp at hi; subst hi; exact absurd he hx
+      | succ i =>
+        simp at hi
+        obtain ⟨k, hk, hk'⟩ := ih hf hi
+        exact ⟨k + 1, by omega, by simpa using hk'⟩
+
+theorem getLast_filter_last {l : List Line} {v e : Line} {i : Nat}
+    (hv : (l.filter (·.alive)).getLast? = some v) (hi : l[i]? = some e) (he : e.alive = true) :
+    ∃ k, i ≤ k ∧ l[k]? = some v := by
+  rw [List.getLast?_eq_head?_reverse, ← List.filter_reverse] at hv
+  have hil : i < l.length := by
+    rcases Nat.lt_or_ge i l.length with h | h
+    · exact h
+    · rw [List.getElem?_eq_none h] at hi; simp at hi
+  have hr : l.reverse[l.length - 1 - i]? = some e := by
+    rw [List.getElem?_reverse (by omega)]
+    have : l.length - 1 - (l.length - 1 - i) = i := by omega
+    rw [this, hi]
+  obtain ⟨k, hk, hk'⟩ := head_filter_first hv hr he
+  have hkl : k < l.length := by
+    rcases Nat.lt_or_ge k l.length with h | h
+    · exact h
+    · rw [List.getElem?_eq_none (by simpa using h)] at hk'; simp at hk'
+  rw [List.getElem?_reverse hkl] at hk'
+  exact ⟨l.length - 1 - k, by omega, hk'⟩
+
+theorem getElem?_slice {ls : List Line} {a b k : Nat} (hk : a + k ≤ b) :
+    (slice ls a b)[k]? = ls[a + k]? := by
+  simp only [slice, List.getElem?_drop, List.getElem?_take]
+  split <;> first | rfl | omega
+
+theorem getElem?_slice_some {ls : List Line} {a b k : Nat} {l : Line}
+    (h : (slice ls a b)[k]? = some l) : a + k ≤ b ∧ ls[a + k]? = some l := by
+  simp only [slice, List.getElem?_drop, List.getElem?_take] at h
+  split at h
+  · exact ⟨by omega, h⟩
+  · simp at h
+
+/-- The corners `aliveSpan` finds enclose every alive line between the old
+ones: the first and the last alive line. -/
+theorem aliveSpan_bounds {ls : List Line} (hn : (ids ls).Nodup) {x y u v a b p : Nat}
+    (h : aliveSpan ls x y = some (u, v)) (ha : pos ls x = some a) (hb : pos ls y = some b)
+    (hp1 : a ≤ p) (hp2 : p ≤ b) (hal : isAlive ls p = true) :
+    ∃ i j, pos ls u = some i ∧ pos ls v = some j ∧ i ≤ p ∧ p ≤ j := by
+  unfold aliveSpan at h
+  rw [ha, hb] at h
+  simp only at h
+  split at h
+  · simp at h
+  · split at h
+    · rename_i f l hf hl
+      simp only [Option.some.injEq, Prod.mk.injEq] at h
+      obtain ⟨rfl, rfl⟩ := h
+      unfold isAlive at hal
+      split at hal
+      · rename_i e he
+        have hs : (slice ls a b)[p - a]? = some e := by
+          rw [getElem?_slice (by omega)]; rw [show a + (p - a) = p by omega]; exact he
+        obtain ⟨k, hk, hk'⟩ := head_filter_first hf hs hal
+        obtain ⟨k', hk2, hk2'⟩ := getLast_filter_last hl hs hal
+        obtain ⟨-, g1⟩ := getElem?_slice_some hk'
+        obtain ⟨-, g2⟩ := getElem?_slice_some hk2'
+        exact ⟨a + k, a + k', pos_of_get hn g1, pos_of_get hn g2, by omega, by omega⟩
+      · simp at hal
+    · simp at h
+
+/-- On alive lines, the corners `aliveSpan` finds span what the old ones did. -/
+theorem aliveSpan_between {ls : List Line} (hn : (ids ls).Nodup) {x y u v z : Nat}
+    (h : aliveSpan ls x y = some (u, v)) (hz : (alivePos ls z).isSome = true) :
+    between ls u v z = between ls x y z := by
+  obtain ⟨a, b, i, j, ha, hb, hi, hj, h1, h2, h3, h4, -, -⟩ := aliveSpan_spec hn h
+  unfold alivePos at hz
+  split at hz
+  · rename_i p hp
+    split at hz
+    · rename_i hal
+      unfold between
+      rw [ha, hb, hi, hj, hp]
+      by_cases hin : a ≤ p ∧ p ≤ b
+      · obtain ⟨i', j', hi', hj', h5, h6⟩ := aliveSpan_bounds hn h ha hb hin.1 hin.2 hal
+        rw [hi] at hi'; rw [hj] at hj'; cases hi'; cases hj'
+        simp [h5, h6, hin.1, hin.2]
+      · by_cases h7 : i ≤ p <;> by_cases h8 : p ≤ j <;> simp [h7, h8] <;> omega
+    · simp at hz
+  · simp at hz
+
+theorem countAlive_shrink {ls : List Line} {a b i j : Nat} (hai : a ≤ i) (hij : i ≤ j)
+    (hjb : j ≤ b)
+    (hout : ∀ p, a ≤ p → p ≤ b → isAlive ls p = true → i ≤ p ∧ p ≤ j) :
+    countAlive (slice ls i j) = countAlive (slice ls a b) := by
+  let L := ls.take (b + 1)
+  have hL : ∀ t, t ≤ b → L[t]? = ls[t]? := by
+    intro t ht; simp only [L, List.getElem?_take]; split <;> first | rfl | omega
+  have e1 : slice ls a b = (L.drop a).take (i - a) ++ L.drop i := by
+    show L.drop a = _
+    conv => lhs; rw [← List.take_append_drop (i - a) (L.drop a)]
+    rw [List.drop_drop, show a + (i - a) = i by omega]
+  have e2 : L.drop i = slice ls i j ++ L.drop (j + 1) := by
+    have hs : slice ls i j = (L.drop i).take (j + 1 - i) := by
+      apply List.ext_getElem?
+      intro t
+      simp only [slice, L, List.getElem?_take, List.getElem?_drop]
+      repeat' split
+      all_goals first | rfl | omega
+    rw [hs]
+    conv => lhs; rw [← List.take_append_drop (j + 1 - i) (L.drop i)]
+    rw [List.drop_drop, show i + (j + 1 - i) = j + 1 by omega]
+  have z1 : countAlive ((L.drop a).take (i - a)) = 0 := by
+    simp only [countAlive, List.countP_eq_zero]
+    intro e he hal
+    obtain ⟨t, ht⟩ := List.mem_iff_getElem?.mp he
+    simp only [List.getElem?_take, List.getElem?_drop] at ht
+    split at ht
+    · rename_i htl
+      rw [hL _ (by omega)] at ht
+      have := hout (a + t) (by omega) (by omega) (by simp [isAlive, ht, hal])
+      omega
+    · simp at ht
+  have z2 : countAlive (L.drop (j + 1)) = 0 := by
+    simp only [countAlive, List.countP_eq_zero]
+    intro e he hal
+    obtain ⟨t, ht⟩ := List.mem_iff_getElem?.mp he
+    simp only [List.getElem?_drop] at ht
+    have htb : j + 1 + t ≤ b := by
+      simp only [L, List.getElem?_take] at ht
+      split at ht
+      · omega
+      · simp at ht
+    rw [hL _ htb] at ht
+    have := hout (j + 1 + t) (by omega) htb (by simp [isAlive, ht, hal])
+    omega
+  rw [e1, e2]
+  simp only [countAlive, List.countP_append] at z1 z2 ⊢
+  omega
+
+theorem filter_eq_nil_of_head? {l : List Line} (h : (l.filter (·.alive)).head? = none) :
+    countAlive l = 0 := by
+  rw [List.head?_eq_none_iff] at h
+  simp [countAlive, List.countP_eq_length_filter, h]
+
+theorem cnt_aliveSpan {ls : List Line} (hn : (ids ls).Nodup) {x y u v : Nat}
+    (h : aliveSpan ls x y = some (u, v)) : cnt ls u v = cnt ls x y := by
+  obtain ⟨a, b, i, j, ha, hb, hi, hj, h1, h2, h3, h4, hli, -⟩ := aliveSpan_spec hn h
+  have hij : i ≤ j := by
+    obtain ⟨i', j', hi', hj', h5, h6⟩ := aliveSpan_bounds hn h ha hb h1 h2 hli
+    rw [hi] at hi'; rw [hj] at hj'; cases hi'; cases hj'; omega
+  unfold cnt
+  rw [ha, hb, hi, hj]
+  simp only [show i ≤ j from hij, show a ≤ b by omega, ite_true]
+  exact countAlive_shrink h1 hij h4 (fun p hp1 hp2 hal => by
+    obtain ⟨i', j', hi', hj', h5, h6⟩ := aliveSpan_bounds hn h ha hb hp1 hp2 hal
+    rw [hi] at hi'; rw [hj] at hj'; cases hi'; cases hj'; exact ⟨h5, h6⟩)
+
+theorem cnt_of_aliveSpan_none {ls : List Line} {x y a b : Nat} (ha : pos ls x = some a)
+    (hb : pos ls y = some b) (hab : a ≤ b) (h : aliveSpan ls x y = none) : cnt ls x y = 0 := by
+  unfold aliveSpan at h
+  rw [ha, hb] at h
+  simp only [show ¬ b < a by omega, ite_false] at h
+  unfold cnt
+  rw [ha, hb]
+  simp only [hab, ite_true]
+  cases hf : ((slice ls a b).filter (·.alive)).head? with
+  | none => exact filter_eq_nil_of_head? hf
+  | some f =>
+    rw [hf] at h
+    have : ((slice ls a b).filter (·.alive)) ≠ [] := by intro e; rw [e] at hf; simp at hf
+    cases hl : ((slice ls a b).filter (·.alive)).getLast? with
+    | none => rw [List.getLast?_eq_none_iff] at hl; exact absurd hl this
+    | some l => rw [hl] at h; simp at h
+
+/-- Normalizing a merge keeps exactly the alive cells it had. -/
+theorem normalizeOne_holds {g : Grid} (hr : (ids g.rows).Nodup) (hc : (ids g.cols).Nodup)
+    {m n : Merge} (h : normalizeOne g m = some n) (r c : Nat) :
+    Holds g n r c ↔ Holds g m r c := by
+  unfold normalizeOne at h
+  split at h
+  · rename_i t b l rt hrow hcol
+    split at h
+    · cases h
+      unfold Holds covers aliveCell
+      by_cases ha : (alivePos g.rows r).isSome = true ∧ (alivePos g.cols c).isSome = true
+      · rw [aliveSpan_between hr hrow ha.1, aliveSpan_between hc hcol ha.2]
+      · simp only [Bool.and_eq_true]
+        constructor <;> rintro ⟨-, h1, h2⟩ <;> exact absurd ⟨h1, h2⟩ ha
+    · simp at h
+  · simp at h
+
+/-- A merge is dropped exactly when fewer than two cells are left between its
+corners. -/
+theorem normalizeOne_none {g : Grid} (hr : (ids g.rows).Nodup) (hc : (ids g.cols).Nodup)
+    {m : Merge}
+    (hrow : ∃ a b, pos g.rows m.top = some a ∧ pos g.rows m.bottom = some b ∧ a ≤ b)
+    (hcol : ∃ a b, pos g.cols m.left = some a ∧ pos g.cols m.right = some b ∧ a ≤ b) :
+    normalizeOne g m = none ↔ cellCount g m < 2 := by
+  obtain ⟨a, b, ha, hb, hab⟩ := hrow
+  obtain ⟨a', b', ha', hb', hab'⟩ := hcol
+  unfold normalizeOne
+  cases h1 : aliveSpan g.rows m.top m.bottom with
+  | none => simp [cellCount, cnt_of_aliveSpan_none ha hb hab h1]
+  | some p =>
+    cases h2 : aliveSpan g.cols m.left m.right with
+    | none => simp [cellCount, cnt_of_aliveSpan_none ha' hb' hab' h2]
+    | some q =>
+      obtain ⟨t, bt⟩ := p
+      obtain ⟨l, rt⟩ := q
+      simp only [cellCount] at *
+      simp only [cnt_aliveSpan hr h1, cnt_aliveSpan hc h2]
+      split <;> simp <;> omega
+
+theorem deleteLine_at {ls rs : List Line} {x : Nat} (h : deleteLine ls x = some rs) :
+    ∃ i, pos ls x = some i ∧ isAlive ls i = true ∧ rs = killAt ls i := by
+  unfold deleteLine at h
+  split at h
+  · simp at h
+  · rename_i i hi
+    split at h
+    · simp at h
+    · split at h
+      · simp at h
+      · cases h; exact ⟨i, hi, by simp_all, rfl⟩
+
+theorem getElem?_killAt (ls : List Line) (i p : Nat) :
+    (killAt ls i)[p]? = (ls[p]?).map (fun l => if p = i then { l with alive := false } else l) := by
+  induction ls generalizing i p with
+  | nil => simp [killAt]
+  | cons l ls ih =>
+    cases i <;> cases p <;> simp [killAt, ih]
+
+theorem isAlive_killAt (ls : List Line) (i p : Nat) :
+    isAlive (killAt ls i) p = (isAlive ls p && decide (p ≠ i)) := by
+  unfold isAlive
+  rw [getElem?_killAt]
+  cases ls[p]? with
+  | none => simp
+  | some l => by_cases h : p = i <;> simp [h]
+
+theorem alivePos_killAt {ls : List Line} {x i : Nat}
+    (hx : pos ls x = some i) (z : Nat) :
+    (alivePos (killAt ls i) z).isSome = ((alivePos ls z).isSome && decide (z ≠ x)) := by
+  unfold alivePos
+  rw [pos_congr (ids_killAt ls i)]
+  cases hz : pos ls z with
+  | none => simp
+  | some p =>
+    simp only [isAlive_killAt]
+    have : p = i ↔ z = x := by
+      constructor
+      · intro e; subst e
+        obtain ⟨l, hl, hlz⟩ := pos_get hz
+        obtain ⟨l', hl', hlx⟩ := pos_get hx
+        rw [hl] at hl'; cases hl'; rw [← hlz, ← hlx]
+      · intro e; subst e; rw [hx] at hz; cases hz; rfl
+    by_cases hp : p = i
+    · have := this.mp hp; simp [hp, this]
+    · have : ¬ z = x := fun e => hp (this.mpr e); simp [hp, this]
+
+theorem between_killAt (ls : List Line) (i x y z : Nat) :
+    between (killAt ls i) x y z = between ls x y z := by
+  simp only [between, pos_congr (ids_killAt ls i)]
+
+/-- **Deleting a row takes it out of every merge** — Word's and Excel's rule.
+The columns are untouched; each merge is normalized (`normalizeOne`): when it
+survives it shows exactly the alive cells it showed minus the deleted row's —
+so a deleted top or bottom moves inward to the next alive row — and it is
+dropped exactly when fewer than two cells are left between its corners
+(`cellCount`, which counts alive rows and columns): deleting the last row it
+had, or leaving a single cell. -/
+theorem deleteRow_covers {g g' : Grid} {d : Nat} (hv : Valid g)
+    (h : apply g (.deleteRow d) = some g') :
+    g'.cols = g.cols ∧ g'.merges = g.merges.filterMap (normalizeOne g') ∧
+    (∀ m ∈ g.merges, ∀ n, normalizeOne g' m = some n →
+      ∀ r c, Holds g' n r c ↔ Holds g m r c ∧ r ≠ d) ∧
+    (∀ m ∈ g.merges, normalizeOne g' m = none ↔ cellCount g' m < 2) := by
+  simp only [apply, Option.map_eq_some_iff] at h
+  obtain ⟨rs, hrs, rfl⟩ := h
+  obtain ⟨i, hi, -, rfl⟩ := deleteLine_at hrs
+  have hn : (ids (killAt g.rows i)).Nodup := by rw [ids_killAt]; exact hv.rowsNodup
+  refine ⟨rfl, rfl, ?_, ?_⟩
+  · intro m _ n hn' r c
+    have key := normalizeOne_holds (g := { g with rows := killAt g.rows i }) hn hv.colsNodup hn' r c
+    refine key.trans ?_
+    simp only [Holds, covers, aliveCell, between_killAt, alivePos_killAt hi,
+      Bool.and_eq_true, decide_eq_true_eq]
+    constructor
+    · rintro ⟨hb, ⟨ha, hd⟩, hc⟩; exact ⟨⟨hb, ha, hc⟩, hd⟩
+    · rintro ⟨⟨hb, ha, hc⟩, hd⟩; exact ⟨hb, ⟨ha, hd⟩, hc⟩
+  · intro m hm
+    obtain ⟨⟨a, b, ha, hb, hab⟩, hcol⟩ := corners hv hm
+    exact normalizeOne_none (g := { g with rows := killAt g.rows i }) hn hv.colsNodup
+      ⟨a, b, by rw [pos_congr (ids_killAt _ _)]; exact ha,
+        by rw [pos_congr (ids_killAt _ _)]; exact hb, hab⟩ hcol
+
+/-! ### Columns, through the transposed grid -/
+
+theorem Holds_tr (g : Grid) (m : Merge) (r c : Nat) : Holds g.tr m.tr c r ↔ Holds g m r c := by
+  simp only [Holds, covers, aliveCell, Grid.tr, Merge.tr, Bool.and_comm]
+
+/-- **A column inserted strictly inside a merge joins it; one inserted at its
+edge does not** (`insertRow_covers` for columns). -/
+theorem insertCol_covers {g g' : Grid} {x : Nat} {after : Option Nat} (hv : Valid g)
+    (h : apply g (.insertCol x after) = some g') :
+    g'.merges = g.merges ∧ g'.rows = g.rows ∧
+    (∀ m ∈ g.merges, ∀ y, y ≠ x →
+      between g'.cols m.left m.right y = between g.cols m.left m.right y) ∧
+    (∀ m ∈ g.merges, between g'.cols m.left m.right x = true ↔
+      ∃ a i j q, after = some a ∧ pos g.cols m.left = some i ∧ pos g.cols m.right = some j ∧
+        pos g.cols a = some q ∧ i ≤ q ∧ q < j) := by
+  rw [apply_insertCol, Option.map_eq_some_iff] at h
+  obtain ⟨g'', h'', rfl⟩ := h
+  obtain ⟨h1, h2, h3, h4⟩ := insertRow_covers hv.tr h''
+  have hm : ∀ m ∈ g.merges, m.tr ∈ g.tr.merges := fun m hm => List.mem_map_of_mem hm
+  refine ⟨?_, h2, fun m mm y hy => h3 m.tr (hm m mm) y hy, fun m mm => h4 m.tr (hm m mm)⟩
+  show g''.merges.map Merge.tr = g.merges
+  rw [h1]; simp [Grid.tr, List.map_map, Function.comp_def]
+
+/-- **Deleting a column takes it out of every merge** (`deleteRow_covers` for
+columns): a deleted left or right edge moves inward, and a merge left with
+fewer than two cells is dropped. -/
+theorem deleteCol_covers {g g' : Grid} {d : Nat} (hv : Valid g)
+    (h : apply g (.deleteCol d) = some g') :
+    g'.rows = g.rows ∧ g'.merges = g.merges.filterMap (normalizeOne g') ∧
+    (∀ m ∈ g.merges, ∀ n, normalizeOne g' m = some n →
+      ∀ r c, Holds g' n r c ↔ Holds g m r c ∧ c ≠ d) ∧
+    (∀ m ∈ g.merges, normalizeOne g' m = none ↔ cellCount g' m < 2) := by
+  rw [apply_deleteCol, Option.map_eq_some_iff] at h
+  obtain ⟨g'', h'', rfl⟩ := h
+  obtain ⟨h1, h2, h3, h4⟩ := deleteRow_covers hv.tr h''
+  have hm : ∀ m ∈ g.merges, m.tr ∈ g.tr.merges := fun m hm => List.mem_map_of_mem hm
+  have hn : ∀ m, normalizeOne g''.tr m = (normalizeOne g'' m.tr).map Merge.tr := by
+    intro m; have := normalizeOne_tr g'' m.tr; simpa using this
+  refine ⟨h1, ?_, ?_, ?_⟩
+  · show g''.merges.map Merge.tr = _
+    rw [h2]
+    have e : g.tr.merges = g.merges.map Merge.tr := rfl
+    rw [e, List.filterMap_map, List.map_filterMap]
+    congr 1
+    funext m
+    exact (hn m).symm
+  · intro m mm n hmn r c
+    rw [hn, Option.map_eq_some_iff] at hmn
+    obtain ⟨n', hn', rfl⟩ := hmn
+    rw [Holds_tr g'' n' c r, h3 m.tr (hm m mm) n' hn' c r, Holds_tr g m r c]
+  · intro m mm
+    rw [hn, Option.map_eq_none_iff, h4 m.tr (hm m mm)]
+    have := cellCount_tr g'' m.tr
+    simp only [Merge.tr_tr] at this
+    rw [this]
+
 /-! ## Sanity checks mirroring `crates/jade-collab-core/tests/grid.rs` -/
 
 /-- `grid(rows, cols)` of the Rust tests: rows `1..=rows`, columns `101..=100+cols`. -/
@@ -930,6 +1481,26 @@ theorem sanity_naive_union_invalid :
     check { testGrid 3 3 with merges := [⟨1, 101, 2, 102⟩] } = true ∧
     check { testGrid 3 3 with merges := [⟨2, 102, 3, 103⟩] } = true ∧
     check { testGrid 3 3 with merges := [⟨1, 101, 2, 102⟩, ⟨2, 102, 3, 103⟩] } = false := by
+  decide
+
+/-- `a_row_inserted_inside_a_merge_joins_it`: inside joins, below the bottom
+and above the top do not. -/
+theorem sanity_insert_inside_merge :
+    ((run (testGrid 3 3) [.merge ⟨1, 101, 2, 102⟩, .insertRow 50 (some 1), .insertRow 51 (some 2),
+      .insertRow 52 none]).map fun g =>
+        (mergeAt g 50 101, mergeAt g 50 103, mergeAt g 51 101, mergeAt g 52 101, g.merges)) =
+      some (some ⟨1, 101, 2, 102⟩, none, none, none, [⟨1, 101, 2, 102⟩]) := by
+  decide
+
+/-- `deleting_a_merge_edge_moves_it_inward`. -/
+theorem sanity_delete_edges_move_inward :
+    ((run (testGrid 4 4) [.merge ⟨1, 101, 3, 103⟩, .deleteRow 3, .deleteCol 101, .deleteCol 102]).map
+      (·.merges)) = some [⟨1, 103, 2, 103⟩] := by
+  decide
+
+/-- `a_merge_without_two_cells_disappears`: a 1 × 2 merge losing a column. -/
+theorem sanity_single_cell_merge_dropped :
+    ((run (testGrid 2 2) [.merge ⟨1, 101, 1, 102⟩, .deleteCol 101]).map (·.merges)) = some [] := by
   decide
 
 theorem testGrid_valid : Valid (testGrid 3 3) := by decide

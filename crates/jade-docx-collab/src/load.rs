@@ -1,18 +1,31 @@
 //! Building the model from a jade `WordDocument`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use jade_collab_core::grid::{Grid, Merge};
 use jade_collab_core::id::{Id, ReplicaId};
+use jade_collab_core::marks::MarkSet;
 use jade_collab_core::rga::Rga;
-use jade_docx_document_core::document::{BodyElement, Table as JadeTable};
+use jade_docx_document_core::document::{
+    BodyElement, RevisionKind as JadeKind, RevisionMark, Table as JadeTable,
+};
 use jade_docx_document_core::headless_api::execute_headless_queries_on_document;
 use jade_docx_document_core::word_document::WordDocument;
 use jade_docx_headless_api::{HeadlessQuery, HeadlessQueryRequest, HeadlessQueryResult};
 
 use crate::model::{
-    Anchor, Atom, Block, Comment, CommentContent, DocxModel, Note, Placed, Placement, Story, Table,
+    Anchor, Atom, Block, Comment, CommentContent, DocxModel, Note, Placed, Placement, Revision,
+    RevisionKind, Story, Table,
 };
+
+/// What makes a loaded revision one: kind, move, `w:id`, author and date.
+type RevisionKey = (
+    RevisionKind,
+    bool,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
@@ -28,12 +41,51 @@ struct Loader {
     text_boxes: BTreeMap<Id, Story>,
     /// Model ids of the notes by `w:id`, footnotes and endnotes apart.
     note_ids: BTreeMap<(bool, String), Id>,
+    /// The file's revisions, one per kind, `w:id`, author and date.
+    revision_ids: BTreeMap<RevisionKey, Id>,
+    revisions: BTreeMap<Id, Revision>,
+    inserted: BTreeMap<Id, Id>,
+    deleted: BTreeMap<Id, BTreeSet<Id>>,
 }
 
 impl Loader {
     fn id(&mut self) -> Id {
         let id = Id::new(self.next, ReplicaId::ORIGIN);
         self.next += 1;
+        id
+    }
+
+    /// The model revision for one layer of a run's jade revision.
+    fn revision(&mut self, mark: &RevisionMark) -> Id {
+        let (kind, moved) = match mark.kind {
+            JadeKind::Inserted => (RevisionKind::Insertion, false),
+            JadeKind::MovedTo => (RevisionKind::Insertion, true),
+            JadeKind::Deleted => (RevisionKind::Deletion, false),
+            JadeKind::MovedFrom => (RevisionKind::Deletion, true),
+        };
+        let key = (
+            kind,
+            moved,
+            mark.id.clone(),
+            mark.author.clone(),
+            mark.date.clone(),
+        );
+        if let Some(id) = self.revision_ids.get(&key) {
+            return *id;
+        }
+        let id = self.id();
+        self.revision_ids.insert(key, id);
+        self.revisions.insert(
+            id,
+            Revision {
+                kind,
+                author: mark.author.clone(),
+                date: mark.date.clone(),
+                replica: ReplicaId::ORIGIN,
+                file_id: mark.id.clone(),
+                moved,
+            },
+        );
         id
     }
 
@@ -79,6 +131,8 @@ impl Loader {
             match block {
                 BodyElement::Paragraph(paragraph) => {
                     let mut atoms: Vec<Atom> = Vec::new();
+                    // (insertion, deletion) of each atom.
+                    let mut marks: Vec<(Option<Id>, Option<Id>)> = Vec::new();
                     for run in &paragraph.runs {
                         if let Some(text_box) = &run.text_box {
                             let id = self.id();
@@ -99,7 +153,18 @@ impl Loader {
                         for note in &run.endnote_reference_ids {
                             atoms.push(Atom::Anchor(Placement::Endnote(self.note(false, note))));
                         }
-                        atoms.extend(run.text.chars().map(Atom::Char));
+                        marks.resize(atoms.len(), (None, None));
+                        let mark = match &run.revision {
+                            None => (None, None),
+                            Some(mark) => (
+                                mark.insertion_layer().map(|i| self.revision(i)),
+                                mark.is_deletion().then(|| self.revision(mark)),
+                            ),
+                        };
+                        for c in run.text.chars() {
+                            atoms.push(Atom::Char(c));
+                            marks.push(mark);
+                        }
                     }
                     if !atoms.is_empty() {
                         let count = atoms.len() as u64;
@@ -107,6 +172,15 @@ impl Loader {
                         self.next += count;
                         flow.insert_run(first, previous, atoms).expect("fresh ids");
                         previous = Some(first.offset(count - 1));
+                        for (k, (insertion, deletion)) in marks.into_iter().enumerate() {
+                            let atom = first.offset(k as u64);
+                            if let Some(insertion) = insertion {
+                                self.inserted.insert(atom, insertion);
+                            }
+                            if let Some(deletion) = deletion {
+                                self.deleted.entry(atom).or_default().insert(deletion);
+                            }
+                        }
                     }
                     if Some(index) == last_paragraph {
                         anchor = Anchor::End;
@@ -134,6 +208,7 @@ impl Loader {
             flow,
             blocks: placed,
             has_paragraph: last_paragraph.is_some(),
+            marks: MarkSet::new(),
         }
     }
 
@@ -310,6 +385,10 @@ impl DocxModel {
             endnotes: BTreeMap::new(),
             text_boxes: BTreeMap::new(),
             note_ids: BTreeMap::new(),
+            revision_ids: BTreeMap::new(),
+            revisions: BTreeMap::new(),
+            inserted: BTreeMap::new(),
+            deleted: BTreeMap::new(),
         };
         let notes = |footnote: bool| {
             let notes = if footnote {
@@ -345,6 +424,11 @@ impl DocxModel {
             endnotes: loader.endnotes,
             text_boxes: loader.text_boxes,
             comments,
+            tracking: false,
+            authors: BTreeMap::new(),
+            revisions: loader.revisions,
+            inserted: loader.inserted,
+            deleted: loader.deleted,
             max_lamport: loader.next - 1,
         })
     }

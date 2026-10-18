@@ -9,7 +9,7 @@ Lean 4 proofs of the properties `docs/design.md` §7 lists for the
 
 ```sh
 cd lean
-lake build            # the proofs and the grid-oracle executable
+lake build            # the proofs and the grid-oracle and marks-oracle executables
 ```
 
 The toolchain is pinned in `lean-toolchain` (`leanprover/lean4:v4.34.0`).
@@ -40,6 +40,33 @@ descending `(lamport, replica, value)` order and tombstones filtered out.
   write changes nothing.
 - `converges`: the same writes, in any order and with any duplication, give
   the same register.
+
+### `JadeCollab/Marks.lean`: marks over the RGA (`jade_collab_core::marks`)
+
+A mark gives attribute `key` a value between two boundaries — a side of an
+atom (`before a`, `after a`) or an end of the story (`start`, `stop`). An
+atom is covered when it lies strictly between them in the story's order
+(tombstones included, so anchors never vanish); per attribute it shows the
+covering mark with the greatest identifier, as a `Lww` write.
+
+- `effective_congr`, `converges`, `deliver_comm`: an atom's formatting is a
+  function of the *set* of mark operations (any order, any duplication).
+- `format_converges`, `richRender_converges`: with `Rga.converges`, replicas
+  that received the same inserts, deletions and marks show the same text with
+  the same formatting; deletions do not enter the formatting.
+- `covers_preserved`, `effective_preserved`: atoms inserted later (any
+  number, anywhere, as long as old atoms keep their relative order, which the
+  RGA guarantees) never change the formatting of the atoms already there.
+- `covers_in_gap`, `effective_in_gap`, `covers_at_start`: an atom that lands
+  in the gap after `l` gets exactly the formatting of the marks spanning that
+  gap — whoever inserted it and whenever it arrived.
+- `markOver_covers_iff`, `typed_inside`, `typed_after_end`,
+  `typed_before_start`, `typed_at_story_start`: the expand rules of the marks
+  the intent API makes (`before first` … `before` the next atom or `stop`
+  when the attribute expands, `after last` when it does not): an atom typed
+  inside the range is covered, one typed right after the last atom is
+  covered exactly when the attribute expands, one typed right before the
+  first atom never is.
 
 ### `JadeCollab/Sequencer.lean`: why tables are sequenced
 
@@ -93,11 +120,25 @@ positions).
   leaves a valid grid.
 - `check_iff_valid`: the executable `check` (the loops of `check_invariants`)
   decides `Valid`.
+- Rows and columns through merged regions, as in Word and Excel, stated on
+  the cells a merge covers (`between`, `covers`, `Holds`):
+  `insertRow_covers` / `insertCol_covers` — merges keep their corners, every
+  other line is inside or outside each merge as before, and the new line is
+  inside a merge exactly when inserted after one of its lines other than the
+  last (strictly inside: the merge grows; at its edge: it does not);
+  `deleteRow_covers` / `deleteCol_covers` — a surviving merge covers exactly
+  its old alive cells minus the deleted line (an edge moves inward;
+  `aliveSpan_bounds`, `normalizeOne_holds`), and a merge is dropped exactly
+  when fewer than two cells are left between its corners
+  (`normalizeOne_none`, via `cnt_aliveSpan`).
+- `mergeAt_spec`: `mergeAt` (`Grid::merge_at`) returns the merge covering an
+  alive cell; in a valid grid there is at most one.
 - `sanity_*`: the unit tests of `crates/jade-collab-core/tests/grid.rs`,
   evaluated by `decide` (insert after an anchor, deleted rows still anchor
   inserts, last row/column kept, overlapping and malformed merges rejected,
   deleting an anchor row shrinks a merge and a one-cell merge disappears,
-  unmerge, the naive union of two merges is invalid).
+  unmerge, the naive union of two merges is invalid, rows and columns
+  inserted inside or at the edge of a merge, edges moving inward).
 
 ### `JadeCollab/CellCommute.lean`: cell contents are convergent
 
@@ -139,7 +180,7 @@ a visible mark, delete a table.
 ## `grid-oracle`
 
 `lake build` also builds `.lake/build/bin/grid-oracle` (`GridOracle.lean`),
-which runs the same `apply` and `check` as `Grid.lean` on a line protocol, for
+which runs the same `apply`, `check` and `mergeAt` as `Grid.lean` on a line protocol, for
 differential testing against the Rust `Grid`:
 
 ```
@@ -156,7 +197,8 @@ u <top> <left>                     Unmerge
 It prints `ok` or `err` per operation, then `rows <id>:<1|0> ...` and
 `cols <id>:<1|0> ...` (every line ever inserted, in order, with its alive
 flag), `merges <top>,<left>,<bottom>,<right> ...` (in list order; the bare word
-when there are none) and `valid` or `invalid`. A malformed line is reported on
+when there are none), `cover <row>,<col>=<top>,<left> ...` (`mergeAt` of every
+alive cell a merge covers, row by row) and `valid` or `invalid`. A malformed line is reported on
 stderr with exit code 2.
 
 ```sh
@@ -167,5 +209,31 @@ ok
 rows 1:0 2:1 3:0
 cols 101:1
 merges
+cover
 valid
+```
+
+## `marks-oracle`
+
+`lake build` also builds `.lake/build/bin/marks-oracle` (`MarksOracle.lean`):
+the RGA walk and `Marks.effective` on a line protocol, for differential
+testing against the Rust `Rga` and `MarkSet`
+(`crates/jade-collab-core/tests/marks_oracle.rs`):
+
+```
+i <lamport> <replica> <parent-lamport> <parent-replica>   insert after an atom
+i <lamport> <replica> -                                   insert at the start
+m <lamport> <replica> <key> <value> <start> <end>         mark; boundaries s | b:<l>:<r> | a:<l>:<r> | e
+k <key> <key> ...                                         attributes to report
+```
+
+It prints one line per atom in story order: `<lamport>:<replica>`, then per
+attribute `-` or the winning mark as `<lamport>:<replica>:<value>`.
+
+```sh
+$ printf 'i 1 1 -\ni 2 1 1 1\ni 3 1 2 1\ni 4 2 2 1\nm 10 1 0 1 b:1:1 b:3:1\nk 0\n' | lake exe marks-oracle
+1:1 10:1:1
+2:1 10:1:1
+4:2 10:1:1
+3:1 -
 ```

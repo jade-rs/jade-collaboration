@@ -5,3 +5,5 @@ import JadeCollab.Reconcile
 import JadeCollab.Grid
 import JadeCollab.CellCommute
 import JadeCollab.Anchor
+import JadeCollab.Revision
+import JadeCollab.Marks

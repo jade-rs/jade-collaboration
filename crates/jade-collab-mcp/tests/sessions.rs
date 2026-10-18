@@ -487,3 +487,62 @@ async fn joining_a_missing_document_fails_as_a_tool_error() {
     let session = agent.join(&hosted.url(DOCX)).await;
     assert_eq!(agent.read_all(&session).await["format"], json!("docx"));
 }
+
+/// An agent reviews with Track Changes: it switches tracking on, its edits
+/// become revisions everyone sees, a person rejects one and the agent
+/// accepts the rest.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_agent_edits_with_track_changes_and_revisions_are_decided() {
+    let hosted = Hosted::start().await;
+    let mut agent = Agent::new();
+    let doc = agent.join(&hosted.url(DOCX)).await;
+    let applied = agent
+        .apply(
+            &doc,
+            json!([
+                { "type": "set_tracking", "on": true },
+                { "type": "insert_text", "paragraph": 1, "offset": 5, "text": "!" },
+                { "type": "delete_text", "paragraph": 1, "offset": 0, "direction": "forward", "count": 1 },
+            ]),
+        )
+        .await;
+    assert_eq!(
+        statuses(&applied),
+        ["applied", "applied", "applied"],
+        "{applied}"
+    );
+    let read = agent.read_all(&doc).await;
+    assert_eq!(read["tracking"], json!(true));
+    // The deleted "W" is still in the text, marked.
+    assert_eq!(read["paragraphs"][1]["text"], json!("World!"));
+    let revisions = read["revisions"].as_array().unwrap().clone();
+    let kinds: Vec<&str> = revisions
+        .iter()
+        .map(|r| r["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["insertion", "deletion"]);
+
+    // A person (outside MCP) rejects the deletion.
+    let person = hosted.direct::<DocxModel>(DOCX).await;
+    let deletion = person.view().revisions()[1].id;
+    person
+        .submit(DocxOp::RejectRevisions {
+            revisions: vec![deletion],
+        })
+        .unwrap();
+    person.settle().await.unwrap();
+    hosted.catch_up(DOCX, &person).await;
+
+    let applied = agent
+        .apply(&doc, json!([{ "type": "accept_revisions" }]))
+        .await;
+    assert_eq!(statuses(&applied), ["applied"], "{applied}");
+    let read = agent.read_all(&doc).await;
+    assert_eq!(read["revisions"], json!([]));
+    assert_eq!(read["paragraphs"][1]["text"], json!("World!"));
+    let exported = JadeDocx::load(&hosted.server.export(DOCX).await.unwrap()).unwrap();
+    assert_eq!(exported.body_paragraph_texts()[1], "World!");
+    let reloaded = DocxModel::from_word_document(exported.word()).unwrap();
+    assert!(reloaded.revisions().is_empty());
+    assert!(hosted.server.faults(DOCX).await.unwrap().is_empty());
+}
