@@ -7,7 +7,7 @@ use jade_collab_core::id::Id;
 use serde::{Deserialize, Serialize};
 
 use crate::model::{parse_reference, XlsxModel, XlsxOp};
-use crate::CellInput;
+use crate::{CellInput, FormatChange};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -34,6 +34,23 @@ pub enum XlsxIntent {
     DeleteColumn {
         sheet: String,
         column: String,
+    },
+    SetNote {
+        sheet: String,
+        reference: String,
+        text: String,
+    },
+    DeleteNote {
+        sheet: String,
+        reference: String,
+    },
+    /// Formats `range` (`B2:D5`, or one cell `B2`): the attributes `change`
+    /// names, keeping the rest. The range is fixed to the cells it covers
+    /// now, so a row another replica inserts into it meanwhile is left out.
+    SetFormat {
+        sheet: String,
+        range: String,
+        change: FormatChange,
     },
 }
 
@@ -66,7 +83,60 @@ pub fn resolve(
             .and_then(|i| lines.get(i as usize).copied())
             .ok_or(XlsxIntentError::NoSuchCell(what))
     };
+    let cell = |sheet: &str, reference: &str| {
+        sheet_named(sheet)?;
+        view.locate(sheet, reference)
+            .ok_or_else(|| XlsxIntentError::NoSuchCell(reference.to_string()))
+    };
     Ok(match intent {
+        XlsxIntent::SetNote {
+            sheet,
+            reference,
+            text,
+        } => {
+            let (sheet, row, column) = cell(sheet, reference)?;
+            XlsxOp::SetNote {
+                sheet,
+                row,
+                column,
+                stamp: ids(1),
+                note: Some(text.clone()),
+            }
+        }
+        XlsxIntent::DeleteNote { sheet, reference } => {
+            let (sheet, row, column) = cell(sheet, reference)?;
+            XlsxOp::SetNote {
+                sheet,
+                row,
+                column,
+                stamp: ids(1),
+                note: None,
+            }
+        }
+        XlsxIntent::SetFormat {
+            sheet,
+            range,
+            change,
+        } => {
+            let s = sheet_named(sheet)?;
+            let outside = || XlsxIntentError::NoSuchCell(range.clone());
+            let (first, last) = range.split_once(':').unwrap_or((range, range));
+            let (top, left) = parse_reference(first).ok_or_else(outside)?;
+            let (bottom, right) = parse_reference(last).ok_or_else(outside)?;
+            let span = |lines: &[Id], a: u32, b: u32| {
+                lines
+                    .get(a.min(b) as usize..=a.max(b) as usize)
+                    .map(<[Id]>::to_vec)
+                    .ok_or_else(outside)
+            };
+            XlsxOp::SetFormat {
+                sheet: s.id,
+                rows: span(&s.rows, top, bottom)?,
+                columns: span(&s.columns, left, right)?,
+                stamp: ids(1),
+                change: change.clone(),
+            }
+        }
         XlsxIntent::SetCell {
             sheet,
             reference,

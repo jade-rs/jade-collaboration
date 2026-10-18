@@ -5,6 +5,10 @@ use jade_xlsx_headless_editor::HeadlessWorkbook;
 
 use crate::model::{column_label, XlsxEffect, XlsxModel};
 
+/// The author jade records on notes written through the model; the model
+/// does not track authors. (jade's own MCP server uses the same default.)
+const NOTE_AUTHOR: &str = "jade";
+
 /// The server's jade workbook. Every write patches the original package, so
 /// parts the model does not describe survive untouched.
 pub struct JadeXlsx {
@@ -60,6 +64,24 @@ impl Materializer<XlsxModel> for JadeXlsx {
                     .book
                     .delete_columns(&sheet, &column_label(at), 1)
                     .map(drop),
+                XlsxEffect::SetNote {
+                    sheet,
+                    reference,
+                    note: Some(text),
+                } => self
+                    .book
+                    .set_note(&sheet, &reference, &text, NOTE_AUTHOR)
+                    .map(drop),
+                XlsxEffect::SetNote {
+                    sheet,
+                    reference,
+                    note: None,
+                } => self.book.delete_note(&sheet, &reference).map(drop),
+                XlsxEffect::SetFormat {
+                    sheet,
+                    range,
+                    change,
+                } => self.book.set_format(&sheet, &range, &change).map(drop),
             };
             result.map_err(|e| format!("{description}: {e}"))?;
         }
