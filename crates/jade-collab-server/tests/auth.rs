@@ -528,8 +528,27 @@ fn table() -> impl Strategy<Value = std::collections::BTreeMap<String, Spec>> {
 fn document() -> impl Strategy<Value = String> {
     prop_oneof![
         prop::sample::select(NAMES.to_vec()).prop_map(str::to_string),
-        "[ab.*?]{0,6}",
+        prop::collection::vec(
+            prop::sample::select(vec!["a", "b", ".docx", ".", "*"]),
+            0..5
+        )
+        .prop_map(|pieces| pieces.concat()),
     ]
+}
+
+/// Mostly a configured token, sometimes any.
+fn presented(
+    table: &std::collections::BTreeMap<String, Spec>,
+    pick: prop::sample::Index,
+    configured: bool,
+    any: String,
+) -> String {
+    let tokens: Vec<&String> = table.keys().collect();
+    if configured && !tokens.is_empty() {
+        pick.get(&tokens).to_string()
+    } else {
+        any
+    }
 }
 
 proptest! {
@@ -540,9 +559,12 @@ proptest! {
     #[test]
     fn grants_agree_with_the_reference(
         table in table(),
-        token in "[a-c]{1,2}",
+        pick in any::<prop::sample::Index>(),
+        configured in prop::bool::weighted(0.8),
+        any_token in "[a-c]{1,2}",
         document in document(),
     ) {
+        let token = presented(&table, pick, configured, any_token);
         let tokens = Tokens::from_json(&tokens_json(&table)).unwrap();
         let actual = tokens.grant(&token).map(|grant: &Grant| grant.role_for(&document));
         prop_assert_eq!(actual, reference(&table, &token, &document));
@@ -558,9 +580,12 @@ proptest! {
     #[test]
     fn every_route_enforces_the_reference(
         table in table(),
-        token in "[a-c]{1,2}",
+        pick_token in any::<prop::sample::Index>(),
+        configured in prop::bool::weighted(0.8),
+        any_token in "[a-c]{1,2}",
         pick in any::<prop::sample::Index>(),
     ) {
+        let token = presented(&table, pick_token, configured, any_token);
         let document = *pick.get(&NAMES);
         let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
         runtime.block_on(async {

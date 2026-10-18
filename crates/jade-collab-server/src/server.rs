@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
 
 use axum::body::Bytes;
+use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
@@ -14,7 +15,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc::unbounded_channel, oneshot};
 
-use crate::auth::{authenticate, Grant, Tokens};
+use crate::auth::{access, authenticate, forbidden, Grant, Role, Tokens};
 use crate::room::{self, Command, Source};
 use crate::storage::{newest_generation, StorageOptions};
 use crate::wire::{ClientMessage, Format, ServerMessage};
@@ -226,7 +227,8 @@ impl Server {
     }
 
     /// `GET /documents`, `GET|PUT /documents/{name}`, and the editing socket
-    /// at `GET /documents/{name}/ws`; all behind the tokens, if any.
+    /// at `GET /documents/{name}/ws`; all behind the tokens, if any, and
+    /// each document behind the documents its token opens.
     pub fn router(&self) -> Router {
         Router::new()
             .route("/documents", get(list))
@@ -241,11 +243,17 @@ impl Server {
     }
 }
 
-async fn list(State(server): State<Server>) -> Json<Vec<serde_json::Value>> {
+/// The documents the token may open.
+async fn list(
+    State(server): State<Server>,
+    grant: Option<Extension<Grant>>,
+) -> Json<Vec<serde_json::Value>> {
+    let grant = grant.map(|Extension(grant)| grant);
     Json(
         server
             .documents()
             .into_iter()
+            .filter(|(name, _)| access(grant.as_ref(), name).is_some())
             .map(|(name, format)| serde_json::json!({ "name": name, "format": format }))
             .collect(),
     )
@@ -263,7 +271,15 @@ fn error_response(error: ServerError) -> Response {
     (status, error.to_string()).into_response()
 }
 
-async fn download(Path(name): Path<String>, State(server): State<Server>) -> Response {
+async fn download(
+    Path(name): Path<String>,
+    State(server): State<Server>,
+    grant: Option<Extension<Grant>>,
+) -> Response {
+    let grant = grant.map(|Extension(grant)| grant);
+    if access(grant.as_ref(), &name).is_none() {
+        return forbidden(&name);
+    }
     match server.export(&name).await {
         Ok(bytes) => ([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response(),
         Err(error) => error_response(error),
@@ -276,8 +292,13 @@ async fn upload(
     grant: Option<Extension<Grant>>,
     body: Bytes,
 ) -> Response {
-    if grant.is_some_and(|Extension(grant)| !grant.may_edit()) {
-        return (StatusCode::FORBIDDEN, "viewers cannot upload documents").into_response();
+    let grant = grant.map(|Extension(grant)| grant);
+    match access(grant.as_ref(), &name) {
+        Some(Role::Editor) => {}
+        Some(Role::Viewer) => {
+            return (StatusCode::FORBIDDEN, "viewers cannot upload documents").into_response()
+        }
+        None => return forbidden(&name),
     }
     let opened = tokio::task::spawn_blocking(move || server.open(&name, body.to_vec())).await;
     match opened {
@@ -295,18 +316,32 @@ async fn socket(
     Path(name): Path<String>,
     State(server): State<Server>,
     grant: Option<Extension<Grant>>,
-    upgrade: WebSocketUpgrade,
+    upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
     let grant = grant.map(|Extension(grant)| grant);
+    // Access is decided before anything else is looked at.
+    let Some(role) = access(grant.as_ref(), &name) else {
+        return forbidden(&name);
+    };
+    let upgrade = match upgrade {
+        Ok(upgrade) => upgrade,
+        Err(rejection) => return rejection.into_response(),
+    };
     match server.commands(&name) {
-        Ok(commands) => upgrade.on_upgrade(move |socket| connection(socket, commands, grant)),
+        Ok(commands) => upgrade.on_upgrade(move |socket| connection(socket, commands, grant, role)),
         Err(error) => error_response(error),
     }
 }
 
-/// One socket. `grant` is who it belongs to on a server with tokens.
-async fn connection(socket: WebSocket, commands: mpsc::Sender<Command>, grant: Option<Grant>) {
-    let may_edit = grant.as_ref().is_none_or(Grant::may_edit);
+/// One socket. `grant` is who it belongs to on a server with tokens, and
+/// `role` what it may do with this document.
+async fn connection(
+    socket: WebSocket,
+    commands: mpsc::Sender<Command>,
+    grant: Option<Grant>,
+    role: Role,
+) {
+    let may_edit = role == Role::Editor;
     let (mut sink, mut stream) = socket.split();
     let (outbox, mut outgoing) = unbounded_channel::<String>();
     let writer = tokio::spawn(async move {

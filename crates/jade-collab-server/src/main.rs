@@ -46,7 +46,10 @@ enum Cli {
         #[arg(long, value_enum, value_name = "WHEN", requires = "data")]
         fsync: Option<FsyncArg>,
         /// Require a bearer token on every request. The file is a JSON
-        /// object: {"<token>": {"name": "alice", "role": "editor"|"viewer"}}.
+        /// object: {"<token>": {"name": "alice", "role": "editor"|"viewer"}};
+        /// a grant may add "documents": ["contract.docx", "deck-*.pptx",
+        /// {"document": "notes.docx", "role": "viewer"}] to limit the token
+        /// to those names (globs; the first match decides the role).
         #[arg(long, value_name = "FILE")]
         tokens: Option<PathBuf>,
         files: Vec<PathBuf>,

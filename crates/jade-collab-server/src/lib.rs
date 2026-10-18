@@ -17,7 +17,7 @@ mod server;
 mod storage;
 pub mod wire;
 
-pub use auth::{Grant, Role, Tokens, TokensError};
+pub use auth::{DocumentRole, DocumentRule, Grant, Role, Tokens, TokensError};
 pub use client::{Client, ClientError, Presence};
 pub use server::{Server, ServerError};
 pub use storage::{Fsync, StorageOptions};

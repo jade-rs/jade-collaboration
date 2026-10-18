@@ -1,7 +1,8 @@
 //! Bearer tokens. A server with [`Tokens`] admits a request only with a
 //! configured token, as an `Authorization: Bearer <token>` header or a
 //! `?token=<token>` query parameter (browsers cannot set headers on a
-//! WebSocket). Viewers read and follow along; editors also write.
+//! WebSocket). Viewers read and follow along; editors also write. A token
+//! may be limited to some documents, with a role of its own on each.
 
 use std::path::Path;
 
@@ -27,17 +28,94 @@ pub enum Role {
 #[serde(deny_unknown_fields)]
 pub struct Grant {
     pub name: String,
+    /// The role on every document, unless `documents` says otherwise.
+    pub role: Role,
+    /// The documents the token opens; every document when absent. The first
+    /// rule whose pattern matches a name decides the role there; a name no
+    /// rule matches is closed to the token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub documents: Option<Vec<DocumentRule>>,
+}
+
+/// Documents a token opens: names matching a pattern — the whole name, `*`
+/// standing for any run of characters and `?` for exactly one — with the
+/// token's role or one of its own.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum DocumentRule {
+    /// `"deck-*.pptx"`: with the token's role.
+    Pattern(String),
+    /// `{"document": "contract.docx", "role": "viewer"}`.
+    WithRole(DocumentRole),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentRole {
+    pub document: String,
     pub role: Role,
 }
 
-impl Grant {
-    pub fn may_edit(&self) -> bool {
-        self.role == Role::Editor
+impl DocumentRule {
+    fn pattern(&self) -> &str {
+        match self {
+            DocumentRule::Pattern(pattern) => pattern,
+            DocumentRule::WithRole(rule) => &rule.document,
+        }
     }
 }
 
+impl Grant {
+    /// The token's role on `document`, or `None` if it may not open it.
+    pub fn role_for(&self, document: &str) -> Option<Role> {
+        let Some(rules) = &self.documents else {
+            return Some(self.role);
+        };
+        rules.iter().find_map(|rule| {
+            glob_matches(rule.pattern(), document).then_some(match rule {
+                DocumentRule::Pattern(_) => self.role,
+                DocumentRule::WithRole(rule) => rule.role,
+            })
+        })
+    }
+}
+
+/// Whether `name` matches `pattern` as a whole; `*` matches any run of
+/// characters, `?` exactly one, everything else itself.
+fn glob_matches(pattern: &str, name: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let name: Vec<char> = name.chars().collect();
+    let (mut p, mut n) = (0, 0);
+    // The last `*` seen, and where in the name it has been tried up to:
+    // on a mismatch it takes one more character.
+    let mut star: Option<(usize, usize)> = None;
+    while n < name.len() {
+        match pattern.get(p) {
+            Some('*') => {
+                star = Some((p, n));
+                p += 1;
+            }
+            Some(&c) if c == '?' || c == name[n] => {
+                p += 1;
+                n += 1;
+            }
+            _ => match star {
+                Some((star_p, star_n)) => {
+                    star = Some((star_p, star_n + 1));
+                    p = star_p + 1;
+                    n = star_n + 1;
+                }
+                None => return false,
+            },
+        }
+    }
+    pattern[p..].iter().all(|c| *c == '*')
+}
+
 /// The tokens a server accepts: a JSON object mapping each token to a
-/// [`Grant`], e.g. `{"s3cret": {"name": "alice", "role": "editor"}}`.
+/// [`Grant`], e.g. `{"s3cret": {"name": "alice", "role": "editor"}}` or
+/// `{"t0ken": {"name": "bot", "role": "viewer", "documents": ["*.xlsx",
+/// {"document": "draft.docx", "role": "editor"}]}}`.
 #[derive(Clone, Debug, Default)]
 pub struct Tokens {
     grants: Vec<(String, Grant)>,
@@ -57,6 +135,15 @@ impl Tokens {
             serde_json::from_str(text).map_err(|e| TokensError::Invalid(e.to_string()))?;
         if grants.contains_key("") {
             return Err(TokensError::Invalid("a token cannot be empty".into()));
+        }
+        for grant in grants.values() {
+            let rules = grant.documents.iter().flatten();
+            if rules.into_iter().any(|rule| rule.pattern().is_empty()) {
+                return Err(TokensError::Invalid(format!(
+                    "{}: a document pattern cannot be empty",
+                    grant.name
+                )));
+            }
         }
         Ok(Self {
             grants: grants.into_iter().collect(),
@@ -82,6 +169,24 @@ impl Tokens {
         }
         found
     }
+}
+
+/// What `grant` (none on a server without tokens) may do with the document
+/// `name`; `None` when nothing.
+pub(crate) fn access(grant: Option<&Grant>, name: &str) -> Option<Role> {
+    match grant {
+        None => Some(Role::Editor),
+        Some(grant) => grant.role_for(name),
+    }
+}
+
+/// The answer to a known token without access to `name`.
+pub(crate) fn forbidden(name: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        format!("this token has no access to {name}"),
+    )
+        .into_response()
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -131,5 +236,33 @@ pub(crate) async fn authenticate(
             "a valid token is required",
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::glob_matches;
+
+    #[test]
+    fn globs_match_whole_names() {
+        for (pattern, name, matches) in [
+            ("*", "", true),
+            ("*", "a.docx", true),
+            ("*.docx", "a.docx", true),
+            ("*.docx", "a.docx.xlsx", false),
+            ("a*b*c", "aXbYbZc", true),
+            ("a*b*c", "aXbYbZ", false),
+            ("?", "", false),
+            ("??", "ab", true),
+            ("deck-?.pptx", "deck-1.pptx", true),
+            ("deck-?.pptx", "deck-10.pptx", false),
+            ("contract.docx", "contract.docx", true),
+            ("contract.docx", "Contract.docx", false),
+            ("**a", "ba", true),
+            ("*a*", "bbb", false),
+            ("ü*", "über.docx", true),
+        ] {
+            assert_eq!(glob_matches(pattern, name), matches, "{pattern} ~ {name}");
+        }
     }
 }
