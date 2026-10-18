@@ -15,6 +15,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+mod tracked;
+
 use jade_collab_core::grid::{Grid, GridOp, Merge};
 use jade_collab_core::id::{Id, ReplicaId};
 use jade_collab_core::rga::Rga;
@@ -247,7 +249,76 @@ pub struct DocxModel {
     /// operations find it by its id.
     #[serde(default, with = "pairs")]
     pub(crate) comments: BTreeMap<Id, Comment>,
+    /// Word's Track Changes button: whether edits made through the intent
+    /// API become revisions. Operations never depend on it.
+    #[serde(default)]
+    pub(crate) tracking: bool,
+    /// Who each replica is, as the server says (`SetAuthor`).
+    #[serde(default, with = "pairs")]
+    pub(crate) authors: BTreeMap<ReplicaId, String>,
+    /// Every revision ever made or loaded, decided ones included.
+    #[serde(default, with = "pairs")]
+    pub(crate) revisions: BTreeMap<Id, Revision>,
+    /// Character → the tracked insertion that made it, until accepted.
+    #[serde(default, with = "pairs")]
+    pub(crate) inserted: BTreeMap<Id, Id>,
+    /// Character → every tracked deletion that named it (grow-only under
+    /// the convergent lane; a rejection removes one).
+    #[serde(default, with = "pairs")]
+    pub(crate) deleted: BTreeMap<Id, BTreeSet<Id>>,
     pub(crate) max_lamport: u64,
+}
+
+/// What a revision does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RevisionKind {
+    Insertion,
+    Deletion,
+}
+
+/// One tracked change: a tracked insertion or deletion made in the session
+/// (named by its first character's id, or the id its author gave the
+/// deletion), or the revisions of one kind, `w:id`, author and date loaded
+/// from the file.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Revision {
+    pub kind: RevisionKind,
+    /// The name the server had given the author's replica when the
+    /// revision was made; `None` for an anonymous one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    /// As the author's client gave it (`w:date`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date: Option<String>,
+    /// The replica that made it ([`ReplicaId::ORIGIN`] for the file's).
+    pub replica: ReplicaId,
+    /// jade's `w:id` of a revision loaded from the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
+    /// A move (`w:moveFrom` / `w:moveTo`) loaded from the file.
+    #[serde(default)]
+    pub moved: bool,
+}
+
+/// A revision with characters left, as [`DocxModel::revisions`] lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RevisionView {
+    pub id: Id,
+    pub revision: Revision,
+    /// Its characters' text, in document order.
+    pub text: String,
+    /// The paragraph ordinals holding them.
+    pub paragraphs: Vec<usize>,
+}
+
+/// A character's tracked changes, as Word shows them: the insertion that
+/// made it and the deletion it is attributed to (the least of the
+/// deletions that named it).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Tracked {
+    pub inserted: Option<Id>,
+    pub deleted: Option<Id>,
 }
 
 /// A comment's text and who wrote it, as jade's comment commands take them.
@@ -486,6 +557,9 @@ pub struct Paragraph {
     pub at: ParagraphStory,
     /// Its text boxes and note references, in order.
     pub anchors: Vec<AnchorView>,
+    /// Each character's tracked changes (one per `chars` entry). Text a
+    /// tracked deletion removed is still in `text`: jade counts it.
+    pub tracked: Vec<Tracked>,
 }
 
 /// A text box or note reference in a paragraph.
@@ -508,6 +582,7 @@ impl Paragraph {
             chars: Vec::new(),
             at: ParagraphStory::Body { index: 0 },
             anchors: Vec::new(),
+            tracked: Vec::new(),
         }
     }
 
@@ -610,6 +685,38 @@ pub enum DocxOp {
     ResolveComment { comment: Id, resolved: bool },
     /// Sequenced. Deleting a root deletes its replies.
     DeleteComment { comment: Id },
+    /// Convergent. Like `InsertText`, as a tracked insertion: revision
+    /// `first`, authored by the origin replica's name.
+    TrackInsertText {
+        story: StoryId,
+        parent: Option<Id>,
+        first: Id,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        date: Option<String>,
+    },
+    /// Convergent. A tracked deletion `revision` of characters (never
+    /// marks or anchors): they stay, shown as deleted. Characters already
+    /// removed take the revision too, so it commutes with removals.
+    TrackDeleteText {
+        story: StoryId,
+        ids: Vec<Id>,
+        revision: Id,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        date: Option<String>,
+    },
+    /// Sequenced. The document's tracking mode (Word's Track Changes).
+    SetTracking { on: bool },
+    /// Sequenced, the server's only: `replica`'s author name, which the
+    /// revisions it makes from now on carry.
+    SetAuthor { replica: ReplicaId, name: String },
+    /// Sequenced. Accepts whole revisions: an insertion's characters become
+    /// plain, a deletion's go. Refused when empty or naming an unknown
+    /// revision; a decided one is left as it is.
+    AcceptRevisions { revisions: Vec<Id> },
+    /// Sequenced. Rejects whole revisions: an insertion's characters go, a
+    /// deletion stops applying to its characters.
+    RejectRevisions { revisions: Vec<Id> },
 }
 
 /// An operation's consequence in jade terms: paragraphs by jade's story
@@ -723,6 +830,55 @@ pub enum DocxEffect {
     DeleteComment {
         comment: Id,
     },
+    /// `InsertText` with jade's revision session on for `author` and `date`.
+    TrackInsertText {
+        paragraph: ParagraphStory,
+        offset: usize,
+        text: String,
+        #[serde(default)]
+        anchors: usize,
+        #[serde(default)]
+        author: Option<String>,
+        #[serde(default)]
+        date: Option<String>,
+    },
+    /// `DeleteRange` with jade's revision session on: the text stays, as
+    /// deleted by `author`. No anchor lies inside the range.
+    TrackDeleteRange {
+        paragraph: ParagraphStory,
+        start: usize,
+        end: usize,
+        #[serde(default)]
+        anchors: usize,
+        #[serde(default)]
+        author: Option<String>,
+        #[serde(default)]
+        date: Option<String>,
+    },
+    /// Rejects the deletion jade shows on `start..end` (offsets in the
+    /// runs' text): the characters come back (inserted ones as insertions).
+    RestoreRange {
+        paragraph: ParagraphStory,
+        start: usize,
+        end: usize,
+    },
+    /// Accepts the deletion jade shows on `start..end` (offsets in the
+    /// runs' text): the characters go.
+    RemoveDeletedRange {
+        paragraph: ParagraphStory,
+        start: usize,
+        end: usize,
+    },
+    /// Accepts the insertion jade shows on `start..end` (offsets in the
+    /// runs' text): the characters become plain (or plainly deleted).
+    AcceptInsertionRange {
+        paragraph: ParagraphStory,
+        start: usize,
+        end: usize,
+    },
+    SetTracking {
+        on: bool,
+    },
 }
 
 #[derive(Default)]
@@ -810,6 +966,11 @@ impl DocxModel {
             endnotes: BTreeMap::new(),
             text_boxes: BTreeMap::new(),
             comments: BTreeMap::new(),
+            tracking: false,
+            authors: BTreeMap::new(),
+            revisions: BTreeMap::new(),
+            inserted: BTreeMap::new(),
+            deleted: BTreeMap::new(),
             max_lamport: next - 1,
         }
     }
@@ -871,6 +1032,7 @@ impl DocxModel {
                 Atom::Char(c) => {
                     current.text.push(c);
                     current.chars.push(node.id);
+                    current.tracked.push(self.tracked(node.id));
                 }
                 Atom::Anchor(placement) => current.anchors.push(AnchorView {
                     id: node.id,
@@ -1207,37 +1369,88 @@ impl DocxModel {
                 Some(_) => {}
             }
         }
-        let positions = self.locate(&ids.iter().copied().collect());
+        let effects = self.removal(&ids.iter().copied().collect());
         let flow = &mut self.story_mut(story).expect("checked").flow;
         for id in ids {
             flow.delete(*id)?;
         }
-        // Merge adjacent characters into ranges — never across an anchor, so
-        // jade gets no range holding a text box's or a reference's run — and
-        // apply from the end so earlier offsets stay valid.
-        let mut spans: Vec<(usize, usize, usize, usize)> = positions
-            .values()
-            .map(|at| (at.ordinal, at.offset, at.offset + at.len, at.anchors))
+        Ok(effects)
+    }
+
+    /// Where the visible characters among `ids` are, merged into ranges of
+    /// adjacent characters — never across an anchor, so jade gets no range
+    /// holding a text box's or a reference's run — in document order, as
+    /// (paragraph ordinal, start, end, anchors before).
+    pub(crate) fn ranges(&self, ids: &BTreeSet<Id>) -> Vec<(usize, usize, usize, usize)> {
+        self.classified_ranges(ids, |_| false)
+            .into_iter()
+            .map(|(_, range)| range)
+            .collect()
+    }
+
+    /// [`Self::ranges`], never merging characters `class` tells apart.
+    #[allow(clippy::type_complexity)]
+    fn classified_ranges(
+        &self,
+        ids: &BTreeSet<Id>,
+        class: impl Fn(Id) -> bool,
+    ) -> Vec<(bool, (usize, usize, usize, usize))> {
+        let mut spans: Vec<((usize, usize, usize, usize), bool)> = self
+            .locate(ids)
+            .iter()
+            .filter(|(_, at)| at.len > 0)
+            .map(|(id, at)| {
+                (
+                    (at.ordinal, at.offset, at.offset + at.len, at.anchors),
+                    class(*id),
+                )
+            })
             .collect();
         spans.sort();
-        let mut ranges: Vec<(usize, usize, usize, usize)> = Vec::new();
-        for (p, start, end, anchors) in spans {
+        let mut ranges: Vec<(bool, (usize, usize, usize, usize))> = Vec::new();
+        for ((p, start, end, anchors), kind) in spans {
             match ranges.last_mut() {
-                Some(last) if last.0 == p && last.2 == start && last.3 == anchors => last.2 = end,
-                _ => ranges.push((p, start, end, anchors)),
+                Some((last_kind, last))
+                    if *last_kind == kind
+                        && last.0 == p
+                        && last.2 == start
+                        && last.3 == anchors =>
+                {
+                    last.2 = end
+                }
+                _ => ranges.push((kind, (p, start, end, anchors))),
             }
         }
+        ranges
+    }
+
+    /// jade's commands removing the visible characters among `ids`, from
+    /// the end so earlier offsets stay valid. jade's text deletion leaves
+    /// text a tracked deletion holds, so that text goes by accepting the
+    /// deletion jade shows on it.
+    pub(crate) fn removal(&self, ids: &BTreeSet<Id>) -> Vec<DocxEffect> {
         let paragraphs = self.paragraphs();
-        Ok(ranges
+        self.classified_ranges(ids, |id| self.tracked(id).deleted.is_some())
             .into_iter()
             .rev()
-            .map(|(p, start, end, anchors)| DocxEffect::DeleteRange {
-                paragraph: paragraphs[p].at.clone(),
-                start,
-                end,
-                anchors,
+            .map(|(deleted, (p, start, end, anchors))| {
+                let paragraph = paragraphs[p].at.clone();
+                if deleted {
+                    DocxEffect::RemoveDeletedRange {
+                        paragraph,
+                        start,
+                        end,
+                    }
+                } else {
+                    DocxEffect::DeleteRange {
+                        paragraph,
+                        start,
+                        end,
+                        anchors,
+                    }
+                }
             })
-            .collect())
+            .collect()
     }
 
     fn split(
@@ -1878,7 +2091,9 @@ impl Document for DocxModel {
         match op {
             DocxOp::InsertText { .. }
             | DocxOp::DeleteText { .. }
-            | DocxOp::SplitParagraph { .. } => Lane::Convergent,
+            | DocxOp::SplitParagraph { .. }
+            | DocxOp::TrackInsertText { .. }
+            | DocxOp::TrackDeleteText { .. } => Lane::Convergent,
             DocxOp::JoinParagraph { .. }
             | DocxOp::InsertTable { .. }
             | DocxOp::Table { .. }
@@ -1889,11 +2104,15 @@ impl Document for DocxModel {
             | DocxOp::AddComment { .. }
             | DocxOp::ReplyToComment { .. }
             | DocxOp::ResolveComment { .. }
-            | DocxOp::DeleteComment { .. } => Lane::Sequenced,
+            | DocxOp::DeleteComment { .. }
+            | DocxOp::SetTracking { .. }
+            | DocxOp::SetAuthor { .. }
+            | DocxOp::AcceptRevisions { .. }
+            | DocxOp::RejectRevisions { .. } => Lane::Sequenced,
         }
     }
 
-    fn apply(&mut self, op: &DocxOp, _ctx: &ApplyContext) -> Result<Vec<DocxEffect>, Rejection> {
+    fn apply(&mut self, op: &DocxOp, ctx: &ApplyContext) -> Result<Vec<DocxEffect>, Rejection> {
         match op {
             DocxOp::InsertText {
                 story,
@@ -1953,6 +2172,26 @@ impl Document for DocxModel {
                 self.resolve_comment(*comment, *resolved)
             }
             DocxOp::DeleteComment { comment } => self.delete_comment(*comment),
+            DocxOp::TrackInsertText {
+                story,
+                parent,
+                first,
+                text,
+                date,
+            } => self.track_insert(*story, *parent, *first, text, date, ctx.origin),
+            DocxOp::TrackDeleteText {
+                story,
+                ids,
+                revision,
+                date,
+            } => self.track_delete(*story, ids, *revision, date, ctx.origin),
+            DocxOp::SetTracking { on } => {
+                self.tracking = *on;
+                Ok(vec![DocxEffect::SetTracking { on: *on }])
+            }
+            DocxOp::SetAuthor { replica, name } => self.set_author(*replica, name, ctx.origin),
+            DocxOp::AcceptRevisions { revisions } => self.decide(revisions, true),
+            DocxOp::RejectRevisions { revisions } => self.decide(revisions, false),
         }
     }
 

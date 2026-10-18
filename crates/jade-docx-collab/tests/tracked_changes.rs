@@ -68,33 +68,36 @@ fn insert(paragraph: usize, offset: usize, text: &str) -> HeadlessCommand {
     }
 }
 
-/// `text[kind author (inserted-by author)]` for each run of a paragraph.
+/// `text[kind author]` per stretch of text with the same tracked changes,
+/// `in ins author` for a deletion nested in an insertion.
 fn runs(word: &WordDocument, paragraph: usize) -> Vec<String> {
-    word.paragraph(paragraph)
-        .unwrap()
-        .runs
-        .iter()
-        .filter(|r| !r.text.is_empty())
-        .map(|r| match &r.revision {
-            None => r.text.clone(),
-            Some(m) => {
-                let kind = match m.kind {
-                    JadeKind::Inserted => "ins",
-                    JadeKind::Deleted => "del",
-                    JadeKind::MovedFrom => "from",
-                    JadeKind::MovedTo => "to",
-                };
-                let author = m.author.clone().unwrap_or_default();
-                match &m.insertion {
-                    Some(i) => format!(
-                        "{}[{kind} {author} in ins {}]",
-                        r.text,
-                        i.author.clone().unwrap_or_default()
-                    ),
-                    None => format!("{}[{kind} {author}]", r.text),
-                }
+    let mut stretches: Vec<(Option<String>, String)> = Vec::new();
+    for r in &word.paragraph(paragraph).unwrap().runs {
+        let mark = r.revision.as_ref().map(|m| {
+            let kind = match m.kind {
+                JadeKind::Inserted => "ins",
+                JadeKind::Deleted => "del",
+                JadeKind::MovedFrom => "from",
+                JadeKind::MovedTo => "to",
+            };
+            let author = m.author.clone().unwrap_or_default();
+            match &m.insertion {
+                Some(i) => format!(
+                    "[{kind} {author} in ins {}]",
+                    i.author.clone().unwrap_or_default()
+                ),
+                None => format!("[{kind} {author}]"),
             }
-        })
+        });
+        match stretches.last_mut() {
+            Some((last, text)) if *last == mark => text.push_str(&r.text),
+            _ => stretches.push((mark, r.text.clone())),
+        }
+    }
+    stretches
+        .into_iter()
+        .filter(|(_, text)| !text.is_empty())
+        .map(|(mark, text)| format!("{text}{}", mark.unwrap_or_default()))
         .collect()
 }
 
@@ -149,10 +152,7 @@ fn jade_tracks_typing_as_insertion_runs_of_their_own() {
     // B typing inside A's insertion splits it; A typing on gets a new run.
     run(&mut w, vec![track("B"), insert(1, 1, "b")]);
     run(&mut w, vec![track("A"), insert(1, 3, "Z")]);
-    assert_eq!(
-        runs(&w, 1),
-        ["X[ins A]", "b[ins B]", "Y[ins A]", "Z[ins A]", "World"]
-    );
+    assert_eq!(runs(&w, 1), ["X[ins A]", "b[ins B]", "YZ[ins A]", "World"]);
 }
 
 #[test]
@@ -173,6 +173,10 @@ fn jade_keeps_deleted_text_in_the_paragraph_and_its_first_author() {
         runs(&w, 1),
         ["W[del B]", "u", "o[del A]", "q[ins B]", "r[del A]", "l[del B]", "d"]
     );
+    // Deleting with tracking off leaves deleted text alone: it goes only
+    // when its deletion is accepted.
+    run(&mut w, vec![delete(1, 0, 7)]);
+    assert_eq!(runs(&w, 1), ["W[del B]", "or[del A]", "l[del B]"]);
 }
 
 /// Word nests `<w:ins><w:del>` when someone deletes text that is still a
@@ -210,7 +214,7 @@ fn jade_keeps_the_insertion_when_inserted_text_is_deleted() {
             }],
         )],
     );
-    assert_eq!(runs(&w, 1), ["X[ins A]", "Y[ins A]", "Z[ins A]", "World"]);
+    assert_eq!(runs(&w, 1), ["XYZ[ins A]", "World"]);
     run(&mut w, vec![track("B"), delete(1, 0, 3)]);
     run(&mut w, vec![reject_all()]);
     assert_eq!(runs(&w, 1), ["World"]);
@@ -684,6 +688,77 @@ fn a_files_revisions_load_as_tracked_characters() {
     );
 }
 
+/// The pairs the fast path depends on, spelled out: a tracked deletion of
+/// text that a concurrent decision removes, or that a concurrent plain
+/// deletion removes, lands the same in either order — the deletion is
+/// recorded on removed characters too.
+#[test]
+fn a_tracked_deletion_commutes_with_removing_its_characters() {
+    let mut base = DocxModel::from_paragraphs(&["abcd"]);
+    base.apply(&name(1, "Ann"), &server()).unwrap();
+    let c = base.paragraphs()[0].chars.clone();
+    apply_all(
+        &mut base,
+        &[
+            (
+                DocxOp::TrackInsertText {
+                    story: StoryId::Body,
+                    parent: Some(c[3]),
+                    first: id(60, 1),
+                    text: "XY".into(),
+                    date: None,
+                },
+                1,
+            ),
+            (
+                DocxOp::TrackDeleteText {
+                    story: StoryId::Body,
+                    ids: vec![c[0]],
+                    revision: id(62, 1),
+                    date: None,
+                },
+                1,
+            ),
+        ],
+    );
+    let xy = vec![id(60, 1), id(61, 1)];
+    let deleting = |ids: Vec<Id>| DocxOp::TrackDeleteText {
+        story: StoryId::Body,
+        ids,
+        revision: id(70, 2),
+        date: None,
+    };
+    for (removal, named) in [
+        (
+            DocxOp::RejectRevisions {
+                revisions: vec![id(60, 1)],
+            },
+            xy.clone(),
+        ),
+        (
+            DocxOp::AcceptRevisions {
+                revisions: vec![id(62, 1)],
+            },
+            vec![c[0], c[1]],
+        ),
+        (
+            DocxOp::DeleteText {
+                story: StoryId::Body,
+                ids: vec![c[1], c[2]],
+            },
+            vec![c[1], c[2]],
+        ),
+    ] {
+        let (mut one, mut two) = (base.clone(), base.clone());
+        apply_all(
+            &mut one,
+            &[(removal.clone(), 1), (deleting(named.clone()), 2)],
+        );
+        apply_all(&mut two, &[(deleting(named), 2), (removal.clone(), 1)]);
+        assert_eq!(one, two, "{removal:?}");
+    }
+}
+
 /// Any convergent operation commutes with any text or revision operation
 /// made concurrently from the same state — the condition the client fast
 /// path needs (`view == rebuilt view`). An operation that does not apply in
@@ -1003,6 +1078,21 @@ fn revisions_are_accepted_and_rejected_by_id_by_paragraphs_or_all() {
 }
 
 #[test]
+fn tracked_changes_are_dated_as_word_dates_them() {
+    use jade_docx_collab::intent::word_date;
+    use std::time::{Duration, UNIX_EPOCH};
+    assert_eq!(word_date(UNIX_EPOCH), "1970-01-01T00:00:00Z");
+    assert_eq!(
+        word_date(UNIX_EPOCH + Duration::from_secs(1_760_000_000)),
+        "2025-10-09T08:53:20Z"
+    );
+    assert_eq!(
+        word_date(UNIX_EPOCH + Duration::from_secs(951_782_400)),
+        "2000-02-29T00:00:00Z"
+    );
+}
+
+#[test]
 fn headless_change_tracking_commands_map_to_intents() {
     assert_eq!(
         IntentOp::try_from(HeadlessCommand::StartChangeTracking {
@@ -1161,7 +1251,9 @@ fn tracked_edits_are_realised_in_jade_with_their_authors() {
         ReplicaId(2),
     );
     assert!(model.revisions().is_empty());
-    assert_eq!(model.paragraph_texts()[1], "Wo!rld");
+    // Bob's "!" went in after "Ne" (before Ann's "w "); everything Ann
+    // typed is rejected, Bob's deletion of "Wo" too.
+    assert_eq!(model.paragraph_texts()[1], "!World");
     reload_agrees(&model, &jade);
 }
 
@@ -1227,6 +1319,40 @@ fn a_files_revisions_are_accepted_and_rejected_in_jade() {
             assert!(model.revisions().is_empty(), "{fixture_name}");
             reload_agrees(&model, &jade);
         }
+    }
+}
+
+/// Removing a deleted character outright cuts its deletion in two in jade;
+/// accepting the deletion afterwards decides both pieces.
+#[test]
+fn a_deletion_cut_in_two_is_decided_whole() {
+    for accept in [true, false] {
+        let (mut model, mut jade) = session("review.docx");
+        // "Hello World": "World" is deleted; remove its "r" outright.
+        let r = model.paragraphs()[0].chars[8];
+        commit_as(
+            &mut model,
+            &mut jade,
+            DocxOp::DeleteText {
+                story: StoryId::Body,
+                ids: vec![r],
+            },
+            ReplicaId(1),
+        );
+        let deletion = model.revisions()[1].id;
+        let op = if accept {
+            DocxOp::AcceptRevisions {
+                revisions: vec![deletion],
+            }
+        } else {
+            DocxOp::RejectRevisions {
+                revisions: vec![deletion],
+            }
+        };
+        commit_as(&mut model, &mut jade, op, ReplicaId(1));
+        let expected = if accept { "Hello " } else { "Hello Wold" };
+        assert_eq!(model.paragraph_texts()[0], expected);
+        reload_agrees(&model, &jade);
     }
 }
 

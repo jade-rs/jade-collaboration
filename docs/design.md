@@ -274,12 +274,15 @@ the whole document) typed text becomes a `w:ins` run of its own (a new
 `w:id` per edit, so two authors typing into each other's insertions stay
 apart), and a deletion becomes a `w:del` run whose text stays in the
 paragraph — every jade offset counts deleted text. Deleting text that is
-already deleted keeps its first author. Three things jade got wrong, all
-fixed on jade-core's `feat/collab-tracked-changes` (below): deleting
-inserted text *replaced* the insertion by the deletion, so rejecting all
-changes kept text nobody had accepted (Word nests `<w:ins><w:del>`);
-text typed with tracking off at the end of an insertion joined it; and a
-revision could be accepted or rejected only as whole runs. jade also does
+already deleted keeps its first author, and deleting with tracking off
+leaves deleted text alone (it goes only when its deletion is accepted).
+Four things jade got wrong, all fixed on jade-core's
+`feat/collab-tracked-changes` (below): deleting inserted text *replaced*
+the insertion by the deletion, so rejecting all changes kept text nobody
+had accepted (Word nests `<w:ins><w:del>`); text typed with tracking off
+at the end of an insertion joined it; a revision could be accepted or
+rejected only as whole runs; and a move decided after its paragraph was
+joined kept its `w:moveTo` in the file. jade also does
 not remove one's own insertion on deletion, as Word does — the intent API
 does that instead (below).
 
@@ -556,9 +559,11 @@ the materializer keeps it off and switches it on, with the operation's
 author and date, around exactly one jade command: the `InsertText` of a
 tracked insertion (the split and join that place text beside an anchor
 stay untracked) or the `ReplaceRange` of a tracked deletion. Removing
-tracked text (accepting a deletion, rejecting an insertion, deleting
-outright) is an untracked `ReplaceRange`; accepting an insertion and
-restoring a deletion are jade's `accept_revisions` / `reject_revisions`
+text (rejecting an insertion, deleting outright) is an untracked
+`ReplaceRange`, except for text a deletion holds, which jade's deletion
+leaves: it goes by accepting that deletion. Accepting an insertion or a
+deletion and restoring a deletion are jade's `accept_revisions` /
+`reject_revisions`
 with *revision targets* — the parts of jade's runs under the model's
 characters, read from jade with their `w:id`s, which needs jade-core's
 targets on part of a run. When the least revision of a character's set
@@ -622,11 +627,23 @@ Tests are written first. Three layers:
    The Lean model is also an executable oracle (`lake build grid-oracle`); a
    property test feeds it and the Rust grid the same random operations and
    compares every decision and the final state (CI job `lean-oracle`).
+   For tracked changes (`Revision.lean`): a model of the per-character
+   state (tombstone, insertion revision, deletion set) and of every
+   operation on it, with `convergent_comm` — each convergent operation
+   (tracked deletion, removal, insertion of fresh characters) commutes with
+   every operation that does not decide the revision it creates, sequenced
+   accept/reject included — `convergent_grows` (deletion sets only grow on
+   the convergent lane), `converges` / `shown_converges` (any order of the
+   same tracked deletions and removals gives the same state, hence the same
+   attributed revision) and `rejectDel_keeps_others`.
 2. **Property-based tests** (`proptest`) — the implementation against the
    specification (RGA differential test), convergence of random concurrent
    histories across N replicas under random message scheduling, grid
    invariants under random structural operations, docx/xlsx/pptx model ↔
-   jade agreement after random edit sequences, a restarted server
+   jade agreement after random edit sequences (every character's tracked
+   insertion and deletion, with author and date, included), convergent
+   operations commuting with every text and revision operation, a
+   restarted server
    indistinguishable from one that kept running and resuming within its
    kept tail exactly as one that never checkpointed, the journal reading
    back whatever was appended, checkpointed and torn and being synced as its
@@ -757,7 +774,14 @@ tables, text in any table cell; text of footnotes, endnotes and text boxes
 (§4; notes also split and joined), their anchors following splits, joins
 and deletions as jade moves them; docx formatting (character and paragraph)
 and comments (add, reply, resolve, delete; also comments loaded from the
-file) as sequenced operations on id ranges resolved in log order (§4); xlsx
+file) as sequenced operations on id ranges resolved in log order (§4);
+docx tracked changes (§4): a document-wide tracking mode, tracked typing
+and deleting by people and agents with the server naming each revision's
+author from the token, Word's own-insertion rule, concurrent tracked
+deletions converging on the least revision, accepting and rejecting whole
+revisions by id, paragraph range or all, a file's revisions (moves
+included) loaded, listed and decided, and every character's revision
+agreeing with jade and the written file; xlsx
 values, formulas (with rebasing), row/column structure, notes, cell
 formatting (per-attribute LWW, A1 ranges), merged cells and sheet
 management (add, rename, delete, move); pptx slide
@@ -783,8 +807,16 @@ Not yet:
   Headers and footers are not modelled.
 * xlsx borders, whole-row/column formats, conditional formats and threaded
   comments; note authors are not modelled (jade records `jade`).
+* Tracked changes: paragraph splits and joins, tables and formatting are
+  not tracked (jade cannot yet decide every paragraph-mark revision, and
+  formatting revisions — `w:rPrChange` — are not modelled); a file's
+  paragraph-mark and formatting revisions are kept in jade but neither
+  shown nor decided; the tracking mode is the model's and is not written to
+  `settings.xml` (`w:trackRevisions`) nor read from it; decisions take whole
+  revisions, not part of one; jade's own editor still marks one's own
+  insertion deleted instead of removing it (the intent API removes it).
 * docx structure of ragged and nested tables (their text is editable),
-  rows/columns through merged regions, tracked changes; creating and
+  rows/columns through merged regions; creating and
   deleting notes and text boxes; splitting or joining a text box's
   paragraphs (jade does not write them); comments in notes; the concurrent
   orders around anchors jade cannot realise (§4).

@@ -8,7 +8,7 @@ mod common;
 
 use std::collections::BTreeMap;
 
-use common::{char_styles, generate, open};
+use common::{char_styles, generate_plain, open};
 use jade_collab_core::id::Id;
 use jade_collab_sync::sim::Simulation;
 use jade_collab_sync::{ApplyContext, Document};
@@ -70,7 +70,7 @@ proptest! {
                     // Typing, deleting, splitting and joining only.
                     let choice = choice / 22 * 22 + choice % 10;
                     let view = sim.client(client).view().clone();
-                    if let Some(op) = generate(&view, choice, &mut |n| sim.client_mut(client).reserve(n)) {
+                    if let Some(op) = generate_plain(&view, choice, &mut |n| sim.client_mut(client).reserve(n)) {
                         let _ = sim.local(client, op);
                     }
                 }
