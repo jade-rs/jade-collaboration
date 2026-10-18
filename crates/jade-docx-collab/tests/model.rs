@@ -4,7 +4,11 @@
 use jade_collab_core::grid::{GridOp, Merge};
 use jade_collab_core::id::{Id, ReplicaId};
 use jade_collab_sync::{ApplyContext, Document, Lane};
-use jade_docx_collab::{Anchor, DocxEffect, DocxModel, DocxOp, StoryId};
+use jade_docx_collab::{Anchor, DocxEffect, DocxModel, DocxOp, ParagraphStory, StoryId};
+
+fn body(index: usize) -> ParagraphStory {
+    ParagraphStory::Body { index }
+}
 
 fn ctx() -> ApplyContext {
     ApplyContext {
@@ -54,9 +58,10 @@ fn inserting_text_reports_where_it_landed() {
     assert_eq!(
         effect,
         vec![DocxEffect::InsertText {
-            paragraph: 1,
+            paragraph: body(1),
             offset: 1,
-            text: "-x".into()
+            text: "-x".into(),
+            anchors: 0,
         }]
     );
 }
@@ -79,9 +84,10 @@ fn offsets_are_utf8_bytes() {
     assert_eq!(
         effect,
         vec![DocxEffect::InsertText {
-            paragraph: 0,
+            paragraph: body(0),
             offset: 6,
-            text: "語".into()
+            text: "語".into(),
+            anchors: 0,
         }]
     );
 }
@@ -105,19 +111,22 @@ fn deleting_reports_ranges_from_the_end() {
         effect,
         vec![
             DocxEffect::DeleteRange {
-                paragraph: 1,
+                paragraph: body(1),
                 start: 0,
-                end: 1
+                end: 1,
+                anchors: 0,
             },
             DocxEffect::DeleteRange {
-                paragraph: 0,
+                paragraph: body(0),
                 start: 4,
-                end: 5
+                end: 5,
+                anchors: 0,
             },
             DocxEffect::DeleteRange {
-                paragraph: 0,
+                paragraph: body(0),
                 start: 1,
-                end: 3
+                end: 3,
+                anchors: 0,
             },
         ]
     );
@@ -169,8 +178,9 @@ fn split_and_join() {
     assert_eq!(
         effect,
         vec![DocxEffect::SplitParagraph {
-            paragraph: 0,
-            offset: 6
+            paragraph: body(0),
+            offset: 6,
+            anchors: 0,
         }]
     );
 
@@ -187,7 +197,7 @@ fn split_and_join() {
     assert_eq!(
         effect,
         vec![DocxEffect::JoinParagraph {
-            paragraph: 0,
+            paragraph: body(0),
             offset: 6
         }]
     );

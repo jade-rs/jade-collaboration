@@ -8,10 +8,16 @@ use jade_collab_sync::{ApplyContext, Document, Lane};
 use jade_docx_collab::intent::{
     lane_for_command, resolve, IntentError, IntentOp, UnsupportedCommand,
 };
-use jade_docx_collab::{Anchor, DocxModel, DocxOp, FormatChange, ParagraphAlignment, StoryId};
+use jade_docx_collab::{
+    Anchor, DocxModel, DocxOp, FormatChange, ParagraphAlignment, ParagraphStory, StoryId,
+};
 use jade_docx_headless_api::{
     HeadlessCommand, HeadlessDeleteDirection, HeadlessTableCellSelection,
 };
+
+fn body(index: usize) -> ParagraphStory {
+    ParagraphStory::Body { index }
+}
 
 fn ids() -> impl FnMut(u64) -> Id {
     let mut next = 1_000u64;
@@ -840,7 +846,7 @@ proptest::proptest! {
                 let start = if p == sp { so } else { 0 };
                 let end = if p == ep { eo } else { texts[p].len() };
                 (start < end).then_some(jade_docx_collab::DocxEffect::FormatText {
-                    paragraph: p, start, end, change: bold(),
+                    paragraph: body(p), start, end, change: bold(),
                 })
             })
             .collect();
