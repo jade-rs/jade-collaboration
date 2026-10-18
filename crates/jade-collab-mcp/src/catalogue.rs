@@ -88,6 +88,74 @@ fn cell_value() -> Value {
     })
 }
 
+fn docx_format_change() -> Value {
+    let kind =
+        |name: &str| json!({ "type": "string", "const": name, "description": "The change." });
+    let variant = |name: &str, properties: Value, required: &[&str]| {
+        let mut props = properties.as_object().cloned().unwrap_or_default();
+        props.insert("kind".into(), kind(name));
+        let mut req: Vec<&str> = vec!["kind"];
+        req.extend_from_slice(required);
+        json!({
+            "type": "object",
+            "title": name,
+            "properties": props,
+            "required": req,
+            "additionalProperties": false,
+        })
+    };
+    json!({
+        "description": "What to change, tagged by `kind`.",
+        "anyOf": [
+            variant("bold", json!({ "value": { "type": "boolean", "description": "On or off." } }), &["value"]),
+            variant("italic", json!({ "value": { "type": "boolean", "description": "On or off." } }), &["value"]),
+            variant("underline", json!({
+                "value": { "type": "boolean", "description": "On or off." },
+                "style": string("Word underline style (`single`, `double`, …)."),
+            }), &["value"]),
+            variant("strike", json!({
+                "value": { "type": "boolean", "description": "On or off." },
+                "double": { "type": "boolean", "description": "Double strikethrough." },
+            }), &["value"]),
+            variant("font_size", json!({ "half_points": integer("Size in half points (21 is 10.5pt).") }), &["half_points"]),
+            variant("font_family", json!({ "family": string("Font family name.") }), &["family"]),
+            variant("font_color", json!({ "color": string("`#RRGGBB`.") }), &["color"]),
+            variant("highlight", json!({ "color": string("One of Word's highlight colour names (`yellow`, …).") }), &["color"]),
+            variant("clear_formatting", json!({}), &[]),
+            variant("alignment", json!({ "alignment": {
+                "type": "string",
+                "enum": ["left", "center", "right", "justify", "distribute"],
+                "description": "Paragraph alignment.",
+            } }), &["alignment"]),
+            variant("paragraph_style", json!({ "style_id": string("Style id; omit for the default paragraph style.") }), &[]),
+        ],
+    })
+}
+
+fn xlsx_format_change() -> Value {
+    let flag = |what: &str| json!({ "type": "boolean", "description": what });
+    json!({
+        "type": "object",
+        "description": "The attributes to set; the others keep what the cells have.",
+        "properties": {
+            "bold": flag("Bold."),
+            "italic": flag("Italic."),
+            "underline": flag("Underline."),
+            "strike": flag("Strikethrough."),
+            "font_color": string("`RRGGBB`."),
+            "font_size": { "type": "number", "description": "Points, 1 to 409." },
+            "font_name": string("Font name."),
+            "fill_color": string("`RRGGBB`, or empty for no fill."),
+            "number_format": string("Number format code (`0.00`, `yyyy/mm/dd`, `General`)."),
+            "horizontal": { "type": "string", "enum": ["General", "Left", "Center", "Right"], "description": "Horizontal alignment." },
+            "vertical": { "type": "string", "enum": ["Top", "Center", "Bottom"], "description": "Vertical alignment." },
+            "wrap_text": flag("Wrap text."),
+        },
+        "required": [],
+        "additionalProperties": false,
+    })
+}
+
 fn edits() -> Value {
     let paragraph = || integer("Zero-based paragraph index in your current view.");
     let offset = || integer("UTF-8 byte offset inside the paragraph, on a character boundary.");
@@ -125,6 +193,42 @@ fn edits() -> Value {
                     "offset": offset(),
                     "count": integer("Breaks to insert; default 1."),
                 }), &["paragraph", "offset"]),
+                edit("format", "docx: change character or paragraph formatting of a range inside one story.", json!({
+                    "start_paragraph": integer("Paragraph where the range starts."),
+                    "start_offset": integer("Byte offset where the range starts."),
+                    "end_paragraph": integer("Paragraph where the range ends."),
+                    "end_offset": integer("Byte offset where the range ends (exclusive)."),
+                    "change": docx_format_change(),
+                }), &["start_paragraph", "start_offset", "end_paragraph", "end_offset", "change"]),
+                edit("format_paragraphs", "docx: change paragraph formatting (alignment, style) of whole paragraphs.", json!({
+                    "start_paragraph": integer("First paragraph."),
+                    "end_paragraph": integer("Last paragraph (inclusive)."),
+                    "change": docx_format_change(),
+                }), &["start_paragraph", "end_paragraph", "change"]),
+                edit("add_comment", "docx: comment on a range (whole paragraphs when the offsets are omitted).", json!({
+                    "start_paragraph": integer("Paragraph where the range starts."),
+                    "start_offset": integer("Byte offset where the range starts."),
+                    "end_paragraph": integer("Paragraph where the range ends."),
+                    "end_offset": integer("Byte offset where the range ends (exclusive)."),
+                    "text": string("The comment."),
+                    "author": string("Author name."),
+                    "initials": string("Author initials."),
+                    "date": string("ISO 8601 date."),
+                }), &["start_paragraph", "end_paragraph", "text"]),
+                edit("reply_to_comment", "docx: reply to a comment thread.", json!({
+                    "comment_id": string("The comment's id (`lamport@rN`, or the file's id for a loaded comment)."),
+                    "text": string("The reply."),
+                    "author": string("Author name."),
+                    "initials": string("Author initials."),
+                    "date": string("ISO 8601 date."),
+                }), &["comment_id", "text"]),
+                edit("resolve_comment", "docx: mark a comment thread resolved or open.", json!({
+                    "comment_id": string("The comment's id."),
+                    "resolved": { "type": "boolean", "description": "Resolved or reopened." },
+                }), &["comment_id", "resolved"]),
+                edit("delete_comment", "docx: delete a comment (a thread root takes its replies).", json!({
+                    "comment_id": string("The comment's id."),
+                }), &["comment_id"]),
                 edit("set_cell", "xlsx: store a value or formula in a cell.", json!({
                     "sheet": sheet(),
                     "reference": string("The cell, in A1 form (`B3`)."),
@@ -146,6 +250,43 @@ fn edits() -> Value {
                     "sheet": sheet(),
                     "column": string("Column letters (`C`)."),
                 }), &["sheet", "column"]),
+                edit("set_note", "xlsx: put a note on a cell.", json!({
+                    "sheet": sheet(),
+                    "reference": string("The cell (`B3`)."),
+                    "text": string("The note."),
+                }), &["sheet", "reference", "text"]),
+                edit("delete_note", "xlsx: remove a cell's note.", json!({
+                    "sheet": sheet(),
+                    "reference": string("The cell (`B3`)."),
+                }), &["sheet", "reference"]),
+                edit("set_format", "xlsx: format a cell or range; each attribute is last-writer-wins.", json!({
+                    "sheet": sheet(),
+                    "range": string("`B2` or `B2:D5`."),
+                    "change": xlsx_format_change(),
+                }), &["sheet", "range", "change"]),
+                edit("merge_cells", "xlsx: merge a range; the top-left value stays, the others are cleared.", json!({
+                    "sheet": sheet(),
+                    "range": string("`B2:C3`."),
+                }), &["sheet", "range"]),
+                edit("unmerge_cells", "xlsx: undo the merge starting at the range's top-left cell.", json!({
+                    "sheet": sheet(),
+                    "range": string("The merged range or its top-left cell."),
+                }), &["sheet", "range"]),
+                edit("add_sheet", "xlsx: add an empty sheet.", json!({
+                    "name": string("The new sheet's name."),
+                    "after": string("The sheet to put it after; omit for the end."),
+                }), &["name"]),
+                edit("rename_sheet", "xlsx: rename a sheet; formulas that name it follow.", json!({
+                    "sheet": sheet(),
+                    "name": string("The new name."),
+                }), &["sheet", "name"]),
+                edit("delete_sheet", "xlsx: delete a sheet; references into it become #REF!.", json!({
+                    "sheet": sheet(),
+                }), &["sheet"]),
+                edit("move_sheet", "xlsx: move a sheet to another tab position.", json!({
+                    "sheet": sheet(),
+                    "to": integer("Tab position, 0 being the first."),
+                }), &["sheet", "to"]),
             ],
         },
     })

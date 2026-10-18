@@ -11,6 +11,7 @@ jade-collab-sync = { path = "../jade-collab-sync" }
 jade-xlsx-headless-api = { path = "../../jade-core/crates/jade-xlsx-headless-api" }
 jade-xlsx-headless-editor = { path = "../../jade-core/crates/jade-xlsx-headless-editor" }
 jade-xlsx-reader = { path = "../../jade-core/crates/jade-xlsx-reader" }
+jade-xlsx-writer = { path = "../../jade-core/crates/jade-xlsx-writer" }
 serde.workspace = true
 thiserror.workspace = true
 

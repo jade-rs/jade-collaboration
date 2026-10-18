@@ -82,6 +82,19 @@ impl Materializer<XlsxModel> for JadeXlsx {
                     range,
                     change,
                 } => self.book.set_format(&sheet, &range, &change).map(drop),
+
+                XlsxEffect::MergeCells { sheet, range } => {
+                    self.book.merge_cells(&sheet, &range).map(drop)
+                }
+                XlsxEffect::UnmergeCells { sheet, range } => {
+                    self.book.unmerge_cells(&sheet, &range).map(drop)
+                }
+                XlsxEffect::AddSheet { name, after } => {
+                    self.book.add_sheet(&name, after.as_deref()).map(drop)
+                }
+                XlsxEffect::RenameSheet { from, to } => self.book.rename_sheet(&from, &to),
+                XlsxEffect::DeleteSheet { name } => self.book.delete_sheet(&name),
+                XlsxEffect::MoveSheet { name, to } => self.book.move_sheet(&name, to as usize),
             };
             result.map_err(|e| format!("{description}: {e}"))?;
         }

@@ -4,11 +4,13 @@ use jade_collab_core::grid::{Grid, GridOp, Merge};
 use jade_collab_core::id::{Id, ReplicaId};
 use jade_collab_core::lww::LwwRegister;
 use jade_collab_sync::{ApplyContext, Document, Lane, Rejection};
-use jade_xlsx_headless_api::{CellInput, CellKind, CellView};
+use jade_xlsx_headless_api::{CellInput, CellKind, CellView, SheetVisibility};
 use jade_xlsx_headless_editor::{FormatChange, HeadlessWorkbook};
 use jade_xlsx_reader::{
-    shift_formula, Axis, HorizontalAlignment, StructureChange, VerticalAlignment,
+    delete_sheet_in_formula, rename_sheet_in_formula, shift_formula, Axis, HorizontalAlignment,
+    StructureChange, VerticalAlignment,
 };
+use jade_xlsx_writer::sheets::validate_sheet_name;
 use serde::{Deserialize, Serialize};
 
 /// How much of each sheet the model covers: the used range and its merged
@@ -62,6 +64,11 @@ struct Sheet {
     /// Excel tables. Rows and columns cannot be inserted or deleted inside
     /// one: Excel would name new columns and fill calculated ones.
     tables: Vec<TableRegion>,
+    /// Shown as a tab (hidden sheets do not count as the last sheet).
+    visible: bool,
+    /// Deleted sheets stay, invisible, so a concurrent cell write to one
+    /// still has somewhere to land and still commutes.
+    deleted: bool,
 }
 
 /// Calls `$then!` with every attribute of jade's [`FormatChange`]. The
@@ -96,20 +103,24 @@ macro_rules! each_attribute {
 /// convergent: it never depends on where in the log it lands. jade sees,
 /// in log order, exactly the writes that won when they arrived; the last of
 /// those for an attribute is the newest, so jade ends where the registers do.
+///
+/// A register holding `None` means "whatever the file has": a merge copies
+/// its anchor's format into the cells it covers, and an attribute the model
+/// does not know for the anchor becomes unknown for them too.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 struct CellFormat {
-    bold: LwwRegister<bool>,
-    italic: LwwRegister<bool>,
-    underline: LwwRegister<bool>,
-    strike: LwwRegister<bool>,
-    font_color: LwwRegister<String>,
-    font_size: LwwRegister<f32>,
-    font_name: LwwRegister<String>,
-    fill_color: LwwRegister<String>,
-    number_format: LwwRegister<String>,
-    horizontal: LwwRegister<HorizontalAlignment>,
-    vertical: LwwRegister<VerticalAlignment>,
-    wrap_text: LwwRegister<bool>,
+    bold: LwwRegister<Option<bool>>,
+    italic: LwwRegister<Option<bool>>,
+    underline: LwwRegister<Option<bool>>,
+    strike: LwwRegister<Option<bool>>,
+    font_color: LwwRegister<Option<String>>,
+    font_size: LwwRegister<Option<f32>>,
+    font_name: LwwRegister<Option<String>>,
+    fill_color: LwwRegister<Option<String>>,
+    number_format: LwwRegister<Option<String>>,
+    horizontal: LwwRegister<Option<HorizontalAlignment>>,
+    vertical: LwwRegister<Option<VerticalAlignment>>,
+    wrap_text: LwwRegister<Option<bool>>,
 }
 
 impl CellFormat {
@@ -121,7 +132,7 @@ impl CellFormat {
                 let FormatChange { $($name),* } = change;
                 FormatChange {
                     $($name: match $name {
-                        Some(value) if self.$name.apply(stamp, value.clone()) => Some(value.clone()),
+                        Some(value) if self.$name.apply(stamp, Some(value.clone())) => Some(value.clone()),
                         _ => None,
                     },)*
                 }
@@ -133,10 +144,36 @@ impl CellFormat {
     fn current(&self) -> FormatChange {
         macro_rules! current {
             ($($name:ident),*) => {
-                FormatChange { $($name: self.$name.get().cloned(),)* }
+                FormatChange { $($name: self.$name.get().cloned().flatten(),)* }
             };
         }
         each_attribute!(current)
+    }
+
+    /// Takes `anchor`'s attributes — known or not — with `stamp`, as a merge
+    /// copies its anchor's format into the cells it covers. Last-writer-wins
+    /// per attribute, so a newer concurrent write keeps its value.
+    fn inherit(&mut self, stamp: Id, anchor: &CellFormat) {
+        macro_rules! inherit {
+            ($($name:ident),*) => {{
+                $(let _ = self.$name.apply(stamp, anchor.$name.get().cloned().flatten());)*
+            }};
+        }
+        each_attribute!(inherit)
+    }
+
+    /// The known attributes written after `stamp`.
+    fn newer_than(&self, stamp: Id) -> FormatChange {
+        macro_rules! newer {
+            ($($name:ident),*) => {
+                FormatChange { $($name: self.$name
+                    .get()
+                    .cloned()
+                    .flatten()
+                    .filter(|_| self.$name.stamp() > Some(stamp)),)* }
+            };
+        }
+        each_attribute!(newer)
     }
 }
 
@@ -232,6 +269,15 @@ impl Sheet {
         Some(format!("{}{}", column_label(c as u32), r + 1))
     }
 
+    /// `B3:D5` for a merge's corners.
+    fn range(&self, merge: &Merge) -> Option<String> {
+        Some(format!(
+            "{}:{}",
+            self.reference(merge.top, merge.left)?,
+            self.reference(merge.bottom, merge.right)?
+        ))
+    }
+
     fn contains(&self, row: Id, column: Id) -> bool {
         self.grid.contains_row(row) && self.grid.contains_column(column)
     }
@@ -265,20 +311,54 @@ impl Sheet {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct TableRegion {
+    name: String,
     top: Id,
     bottom: Id,
     left: Id,
     right: Id,
 }
 
-/// A structural change at its place in the log, kept to rebase formulas
-/// written before it.
+/// A change that rewrites formulas, at its place in the log, kept to rebase
+/// formulas written before it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct StructureEntry {
     /// `None` while tentative on its origin.
     seq: Option<u64>,
     origin: ReplicaId,
-    change: StructureChange,
+    change: Change,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+enum Change {
+    /// Rows or columns inserted or deleted (`shift_formula`).
+    Shift(StructureChange),
+    /// A sheet renamed (`rename_sheet_in_formula`).
+    Rename { sheet: Id, from: String, to: String },
+    /// A sheet deleted, with the tab order before and its tables
+    /// (`delete_sheet_in_formula`).
+    Delete {
+        name: String,
+        order: Vec<String>,
+        tables: Vec<String>,
+    },
+}
+
+impl Change {
+    /// `formula`, sitting on the sheet named `on`, through this change.
+    fn rewrite(&self, formula: &str, on: &str) -> String {
+        match self {
+            Change::Shift(change) => shift_formula(formula, on, change),
+            Change::Rename { from, to, .. } => rename_sheet_in_formula(formula, from, to),
+            Change::Delete {
+                name,
+                order,
+                tables,
+            } => {
+                let order: Vec<&str> = order.iter().map(String::as_str).collect();
+                delete_sheet_in_formula(formula, name, &order, tables)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -334,6 +414,31 @@ pub enum XlsxOp {
         stamp: Id,
         change: FormatChange,
     },
+    /// Sequenced: merge a rectangle (no overlap with another merge or an
+    /// Excel table). As in Excel the top-left value stays and the others are
+    /// cleared — by a last-writer-wins write of a blank with `stamp`, so a
+    /// newer concurrent write into a covered cell survives — and the covered
+    /// cells take the anchor's format the same way.
+    MergeCells { sheet: Id, merge: Merge, stamp: Id },
+    /// Sequenced: undo the merge whose top-left cell is `(top, left)`.
+    /// Values and formats stay where they are.
+    UnmergeCells { sheet: Id, top: Id, left: Id },
+    /// Sequenced: a new empty sheet named `name` after `after` (`None`: at
+    /// the end), `rows` × `columns` big; its rows and columns get the ids
+    /// `id.offset(1)`, …, `id.offset(rows + columns)`.
+    AddSheet {
+        id: Id,
+        name: String,
+        after: Option<Id>,
+        rows: u32,
+        columns: u32,
+    },
+    /// Sequenced: formulas naming the sheet follow, as in Excel.
+    RenameSheet { sheet: Id, name: String },
+    /// Sequenced: references into the sheet become `#REF!`.
+    DeleteSheet { sheet: Id },
+    /// Sequenced: to position `to` among the sheets.
+    MoveSheet { sheet: Id, to: u32 },
 }
 
 /// What jade must do; indices are 0-based.
@@ -372,6 +477,29 @@ pub enum XlsxEffect {
         sheet: String,
         range: String,
         change: FormatChange,
+    },
+    MergeCells {
+        sheet: String,
+        range: String,
+    },
+    UnmergeCells {
+        sheet: String,
+        range: String,
+    },
+    AddSheet {
+        name: String,
+        after: Option<String>,
+    },
+    RenameSheet {
+        from: String,
+        to: String,
+    },
+    DeleteSheet {
+        name: String,
+    },
+    MoveSheet {
+        name: String,
+        to: u32,
     },
 }
 
@@ -451,6 +579,8 @@ impl XlsxModel {
                 formats: BTreeMap::new(),
                 protected: BTreeSet::new(),
                 tables: Vec::new(),
+                visible: true,
+                deleted: false,
             })
             .collect();
         Self {
@@ -489,6 +619,9 @@ impl XlsxModel {
             })
             .collect();
         let mut model = Self::blank(&shapes);
+        for (sheet, summary) in model.sheets.iter_mut().zip(&summary.sheets) {
+            sheet.visible = summary.visibility == SheetVisibility::Visible;
+        }
         let mut stamp = model.max_lamport;
         for (sheet, (name, rows, columns)) in model.sheets.iter_mut().zip(&shapes) {
             if *rows == 0 || *columns == 0 {
@@ -549,8 +682,9 @@ impl XlsxModel {
                 .collect();
             sheet.grid = Grid::with_merges_unchecked(row_ids.clone(), column_ids.clone(), merges);
             sheet.tables = tables
-                .into_values()
-                .map(|(top, bottom, left, right)| TableRegion {
+                .into_iter()
+                .map(|(name, (top, bottom, left, right))| TableRegion {
+                    name,
                     top: row_ids[top],
                     bottom: row_ids[bottom],
                     left: column_ids[left],
@@ -562,9 +696,11 @@ impl XlsxModel {
         Ok(model)
     }
 
+    /// The sheets, in tab order (deleted ones left out).
     pub fn sheets(&self) -> Vec<SheetView> {
         self.sheets
             .iter()
+            .filter(|s| !s.deleted)
             .map(|s| SheetView {
                 id: s.id,
                 name: s.name.clone(),
@@ -572,6 +708,15 @@ impl XlsxModel {
                 columns: s.grid.columns(),
             })
             .collect()
+    }
+
+    /// The merged regions of a sheet.
+    pub fn merges(&self, sheet: Id) -> Vec<Merge> {
+        self.sheets
+            .iter()
+            .find(|s| s.id == sheet)
+            .map(|s| s.grid.merges().to_vec())
+            .unwrap_or_default()
     }
 
     /// The value a cell holds (also for cells in deleted rows or columns).
@@ -642,7 +787,7 @@ impl XlsxModel {
 
     /// `(sheet, row, column)` ids of `reference` (`B3`) on the sheet named `sheet`.
     pub fn locate(&self, sheet: &str, reference: &str) -> Option<(Id, Id, Id)> {
-        let s = self.sheets.iter().find(|s| s.name == sheet)?;
+        let s = self.sheets.iter().find(|s| !s.deleted && s.name == sheet)?;
         let (row, column) = parse_reference(reference)?;
         Some((
             s.id,
@@ -680,15 +825,7 @@ impl XlsxModel {
         }
         let mut value = normalize(value);
         if let CellInput::Formula(formula) = &mut value {
-            // Move the references through every structural change the author
-            // had not seen when typing it.
-            for entry in &self.structure {
-                let unseen =
-                    entry.origin != ctx.origin && entry.seq.is_none_or(|seq| seq > ctx.base_seq);
-                if unseen {
-                    *formula = shift_formula(formula, &name, &entry.change);
-                }
-            }
+            *formula = self.rebase(formula, sheet, ctx);
         }
         self.max_lamport = self.max_lamport.max(stamp.lamport);
         let sheet = &mut self.sheets[index];
@@ -700,8 +837,11 @@ impl XlsxModel {
         {
             return Ok(Vec::new());
         }
-        let (Some(r), Some(c)) = (sheet.grid.row_index(row), sheet.grid.column_index(column))
-        else {
+        let (Some(r), Some(c), false) = (
+            sheet.grid.row_index(row),
+            sheet.grid.column_index(column),
+            sheet.deleted,
+        ) else {
             return Ok(Vec::new());
         };
         Ok(vec![XlsxEffect::SetCell {
@@ -736,6 +876,7 @@ impl XlsxModel {
         }
         Ok(sheet
             .reference(row, column)
+            .filter(|_| !sheet.deleted)
             .map(|reference| XlsxEffect::SetNote {
                 sheet: sheet.name.clone(),
                 reference,
@@ -783,6 +924,9 @@ impl XlsxModel {
                 }
             }
         }
+        if sheet.deleted {
+            return Ok(Vec::new());
+        }
         Ok(rectangles(&sheet.name, won))
     }
 
@@ -792,13 +936,15 @@ impl XlsxModel {
         op: &GridOp,
         ctx: &ApplyContext,
     ) -> Result<Vec<XlsxEffect>, Rejection> {
-        let index = self.sheet_index(sheet)?;
+        let index = self.alive_sheet(sheet)?;
         let s = &self.sheets[index];
         let name = s.name.clone();
         let mut grid = s.grid.clone();
         let (axis, inserted, at, new) = match op {
             GridOp::Merge(_) | GridOp::Unmerge { .. } => {
-                return Err(reject("merged cells are not supported for xlsx yet"))
+                return Err(reject(
+                    "merge and unmerge cells with merge_cells / unmerge_cells",
+                ))
             }
             GridOp::InsertRow { id, .. } => {
                 grid.apply(op)?;
@@ -850,18 +996,7 @@ impl XlsxModel {
             count: 1,
             inserted,
         };
-        for sheet in &mut self.sheets {
-            for register in sheet.cells.values_mut() {
-                if let Some(CellInput::Formula(formula)) = register.value_mut() {
-                    *formula = shift_formula(formula, &sheet.name, &change);
-                }
-            }
-        }
-        self.structure.push(StructureEntry {
-            seq: ctx.seq,
-            origin: ctx.origin,
-            change,
-        });
+        self.record(Change::Shift(change), ctx);
         if let Some(id) = new {
             self.max_lamport = self.max_lamport.max(id.lamport);
         }
@@ -871,6 +1006,332 @@ impl XlsxModel {
             (Axis::Columns, true) => XlsxEffect::InsertColumn { sheet: name, at },
             (Axis::Columns, false) => XlsxEffect::DeleteColumn { sheet: name, at },
         }])
+    }
+}
+
+impl XlsxModel {
+    fn alive_sheet(&self, sheet: Id) -> Result<usize, Rejection> {
+        let index = self.sheet_index(sheet)?;
+        if self.sheets[index].deleted {
+            return Err(reject(format!("sheet {sheet} was deleted")));
+        }
+        Ok(index)
+    }
+
+    /// Rewrites every formula of every sheet through `change`, as jade does
+    /// in the file, and logs it for formulas typed before it.
+    fn record(&mut self, change: Change, ctx: &ApplyContext) {
+        for sheet in self.sheets.iter_mut().filter(|s| !s.deleted) {
+            for register in sheet.cells.values_mut() {
+                if let Some(CellInput::Formula(formula)) = register.value_mut() {
+                    *formula = change.rewrite(formula, &sheet.name);
+                }
+            }
+        }
+        self.structure.push(StructureEntry {
+            seq: ctx.seq,
+            origin: ctx.origin,
+            change,
+        });
+    }
+
+    /// `formula`, typed on `sheet` by `ctx.origin` when it had seen the log up
+    /// to `ctx.base_seq`, moved through every change it had not seen — with
+    /// jade's own rewriters, in log order, under the name the sheet had at
+    /// each change.
+    fn rebase(&self, formula: &str, sheet: Id, ctx: &ApplyContext) -> String {
+        let unseen = |entry: &StructureEntry| {
+            entry.origin != ctx.origin && entry.seq.is_none_or(|seq| seq > ctx.base_seq)
+        };
+        let Some(first) = self.structure.iter().position(unseen) else {
+            return formula.to_string();
+        };
+        let mut name = self
+            .sheets
+            .iter()
+            .find(|s| s.id == sheet)
+            .map(|s| s.name.clone())
+            .unwrap_or_default();
+        for entry in self.structure[first..].iter().rev() {
+            if let Change::Rename {
+                sheet: renamed,
+                from,
+                ..
+            } = &entry.change
+            {
+                if *renamed == sheet {
+                    name = from.clone();
+                }
+            }
+        }
+        let mut formula = formula.to_string();
+        for entry in &self.structure[first..] {
+            if unseen(entry) {
+                formula = entry.change.rewrite(&formula, &name);
+            }
+            if let Change::Rename {
+                sheet: renamed, to, ..
+            } = &entry.change
+            {
+                if *renamed == sheet {
+                    name = to.clone();
+                }
+            }
+        }
+        formula
+    }
+
+    fn merge_cells(
+        &mut self,
+        sheet: Id,
+        merge: &Merge,
+        stamp: Id,
+    ) -> Result<Vec<XlsxEffect>, Rejection> {
+        let index = self.alive_sheet(sheet)?;
+        let s = &self.sheets[index];
+        let mut grid = s.grid.clone();
+        grid.apply(&GridOp::Merge(*merge))?;
+        let rows = lines_between(&s.grid.rows(), merge.top, merge.bottom);
+        let columns = lines_between(&s.grid.columns(), merge.left, merge.right);
+        let touches_table = s.tables.iter().any(|t| {
+            let t_rows = lines_between(&s.grid.rows(), t.top, t.bottom);
+            let t_columns = lines_between(&s.grid.columns(), t.left, t.right);
+            rows.iter().any(|r| t_rows.contains(r)) && columns.iter().any(|c| t_columns.contains(c))
+        });
+        if touches_table {
+            return Err(reject("cells inside an Excel table cannot be merged"));
+        }
+        let range = s.range(merge).expect("the grid validated the corners");
+        let name = s.name.clone();
+        self.max_lamport = self.max_lamport.max(stamp.lamport);
+        let s = &mut self.sheets[index];
+        s.grid = grid;
+        let anchor = (merge.top, merge.left);
+        let anchor_format = s.formats.get(&anchor).cloned().unwrap_or_default();
+        // After jade's merge, put back what was written after it.
+        let mut restore = Vec::new();
+        let mut formats = BTreeMap::new();
+        for row in &rows {
+            for column in &columns {
+                let cell = (*row, *column);
+                if cell == anchor {
+                    continue;
+                }
+                let reference = s.reference(*row, *column).expect("alive");
+                let register = s.cells.entry(cell).or_default();
+                register.apply(stamp, CellInput::Blank);
+                if let Some(value) = register.get().filter(|_| register.stamp() > Some(stamp)) {
+                    restore.push(XlsxEffect::SetCell {
+                        sheet: name.clone(),
+                        reference,
+                        value: value.clone(),
+                    });
+                }
+                let format = s.formats.entry(cell).or_default();
+                format.inherit(stamp, &anchor_format);
+                let newer = format.newer_than(stamp);
+                if !newer.is_empty() {
+                    let at = (
+                        s.grid.row_index(*row).expect("alive"),
+                        s.grid.column_index(*column).expect("alive"),
+                    );
+                    formats.insert(at, newer);
+                }
+            }
+        }
+        let mut effects = vec![XlsxEffect::MergeCells {
+            sheet: name.clone(),
+            range,
+        }];
+        effects.extend(restore);
+        effects.extend(rectangles(&name, formats));
+        Ok(effects)
+    }
+
+    fn unmerge_cells(
+        &mut self,
+        sheet: Id,
+        top: Id,
+        left: Id,
+    ) -> Result<Vec<XlsxEffect>, Rejection> {
+        let index = self.alive_sheet(sheet)?;
+        let s = &mut self.sheets[index];
+        let merge = *s
+            .grid
+            .merges()
+            .iter()
+            .find(|m| m.top == top && m.left == left)
+            .ok_or_else(|| reject("no merged region starts at that cell"))?;
+        let range = s.range(&merge).expect("merge corners are alive");
+        s.grid.apply(&GridOp::Unmerge { top, left })?;
+        Ok(vec![XlsxEffect::UnmergeCells {
+            sheet: s.name.clone(),
+            range,
+        }])
+    }
+
+    fn alive_names(&self, except: Option<Id>) -> Vec<&str> {
+        self.sheets
+            .iter()
+            .filter(|s| !s.deleted && Some(s.id) != except)
+            .map(|s| s.name.as_str())
+            .collect()
+    }
+
+    fn add_sheet(
+        &mut self,
+        id: Id,
+        name: &str,
+        after: Option<Id>,
+        rows: u32,
+        columns: u32,
+    ) -> Result<Vec<XlsxEffect>, Rejection> {
+        validate_sheet_name(name, &self.alive_names(None))?;
+        if !(1..=LoadOptions::MAX_ROWS).contains(&rows)
+            || !(1..=LoadOptions::MAX_COLUMNS).contains(&columns)
+        {
+            return Err(reject(
+                "a new sheet needs between one and the modelled number of rows and columns",
+            ));
+        }
+        let lines = u64::from(rows) + u64::from(columns);
+        let taken = |candidate: Id| {
+            self.sheets.iter().any(|s| {
+                s.id == candidate
+                    || s.grid.contains_row(candidate)
+                    || s.grid.contains_column(candidate)
+            })
+        };
+        if (0..=lines).any(|k| taken(id.offset(k))) {
+            return Err(reject(format!("sheet id {id} is taken")));
+        }
+        let (at, after_name) = match after {
+            None => (self.sheets.len(), None),
+            Some(after) => {
+                let index = self.alive_sheet(after)?;
+                (index + 1, Some(self.sheets[index].name.clone()))
+            }
+        };
+        self.sheets.insert(
+            at,
+            Sheet {
+                id,
+                name: name.to_string(),
+                grid: Grid::new(
+                    (1..=u64::from(rows)).map(|k| id.offset(k)),
+                    (1..=u64::from(columns)).map(|k| id.offset(u64::from(rows) + k)),
+                ),
+                cells: BTreeMap::new(),
+                notes: BTreeMap::new(),
+                formats: BTreeMap::new(),
+                protected: BTreeSet::new(),
+                tables: Vec::new(),
+                visible: true,
+                deleted: false,
+            },
+        );
+        self.max_lamport = self.max_lamport.max(id.offset(lines).lamport);
+        Ok(vec![XlsxEffect::AddSheet {
+            name: name.to_string(),
+            after: after_name,
+        }])
+    }
+
+    fn rename_sheet(
+        &mut self,
+        sheet: Id,
+        name: &str,
+        ctx: &ApplyContext,
+    ) -> Result<Vec<XlsxEffect>, Rejection> {
+        let index = self.alive_sheet(sheet)?;
+        validate_sheet_name(name, &self.alive_names(Some(sheet)))?;
+        let from = self.sheets[index].name.clone();
+        if from == name {
+            return Ok(Vec::new());
+        }
+        self.sheets[index].name = name.to_string();
+        self.record(
+            Change::Rename {
+                sheet,
+                from: from.clone(),
+                to: name.to_string(),
+            },
+            ctx,
+        );
+        Ok(vec![XlsxEffect::RenameSheet {
+            from,
+            to: name.to_string(),
+        }])
+    }
+
+    fn delete_sheet(
+        &mut self,
+        sheet: Id,
+        ctx: &ApplyContext,
+    ) -> Result<Vec<XlsxEffect>, Rejection> {
+        let index = self.alive_sheet(sheet)?;
+        if !self
+            .sheets
+            .iter()
+            .any(|s| !s.deleted && s.visible && s.id != sheet)
+        {
+            return Err(reject("the last visible sheet cannot be deleted"));
+        }
+        let order = self
+            .alive_names(None)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let s = &mut self.sheets[index];
+        s.deleted = true;
+        let name = s.name.clone();
+        let tables = s.tables.iter().map(|t| t.name.clone()).collect();
+        self.record(
+            Change::Delete {
+                name: name.clone(),
+                order,
+                tables,
+            },
+            ctx,
+        );
+        Ok(vec![XlsxEffect::DeleteSheet { name }])
+    }
+
+    fn move_sheet(&mut self, sheet: Id, to: u32) -> Result<Vec<XlsxEffect>, Rejection> {
+        let index = self.alive_sheet(sheet)?;
+        let alive: Vec<usize> = (0..self.sheets.len())
+            .filter(|i| !self.sheets[*i].deleted)
+            .collect();
+        if to as usize >= alive.len() {
+            return Err(reject(format!("there are only {} sheets", alive.len())));
+        }
+        let from = alive.iter().position(|i| *i == index).expect("alive");
+        if from == to as usize {
+            return Ok(Vec::new());
+        }
+        let moving = self.sheets.remove(index);
+        let name = moving.name.clone();
+        // Place it so that it is the `to`-th alive sheet.
+        let alive_after: Vec<usize> = (0..self.sheets.len())
+            .filter(|i| !self.sheets[*i].deleted)
+            .collect();
+        let at = alive_after
+            .get(to as usize)
+            .copied()
+            .unwrap_or(self.sheets.len());
+        self.sheets.insert(at, moving);
+        Ok(vec![XlsxEffect::MoveSheet { name, to }])
+    }
+}
+
+/// The ids of `lines` from `first` to `last`, inclusive.
+fn lines_between(lines: &[Id], first: Id, last: Id) -> Vec<Id> {
+    match (
+        lines.iter().position(|l| *l == first),
+        lines.iter().position(|l| *l == last),
+    ) {
+        (Some(a), Some(b)) if a <= b => lines[a..=b].to_vec(),
+        _ => Vec::new(),
     }
 }
 
@@ -885,7 +1346,13 @@ impl Document for XlsxModel {
                 ..
             } => Lane::Sequenced,
             XlsxOp::SetCell { .. } => Lane::Convergent,
-            XlsxOp::Structure { .. } => Lane::Sequenced,
+            XlsxOp::Structure { .. }
+            | XlsxOp::MergeCells { .. }
+            | XlsxOp::UnmergeCells { .. }
+            | XlsxOp::AddSheet { .. }
+            | XlsxOp::RenameSheet { .. }
+            | XlsxOp::DeleteSheet { .. }
+            | XlsxOp::MoveSheet { .. } => Lane::Sequenced,
             // Id-keyed last-writer-wins registers (per attribute for
             // formats) commute and do not depend on the log position.
             XlsxOp::SetNote { .. } | XlsxOp::SetFormat { .. } => Lane::Convergent,
@@ -916,6 +1383,22 @@ impl Document for XlsxModel {
                 stamp,
                 change,
             } => self.set_format(*sheet, rows, columns, *stamp, change),
+            XlsxOp::MergeCells {
+                sheet,
+                merge,
+                stamp,
+            } => self.merge_cells(*sheet, merge, *stamp),
+            XlsxOp::UnmergeCells { sheet, top, left } => self.unmerge_cells(*sheet, *top, *left),
+            XlsxOp::AddSheet {
+                id,
+                name,
+                after,
+                rows,
+                columns,
+            } => self.add_sheet(*id, name, *after, *rows, *columns),
+            XlsxOp::RenameSheet { sheet, name } => self.rename_sheet(*sheet, name, ctx),
+            XlsxOp::DeleteSheet { sheet } => self.delete_sheet(*sheet, ctx),
+            XlsxOp::MoveSheet { sheet, to } => self.move_sheet(*sheet, *to),
         }
     }
 

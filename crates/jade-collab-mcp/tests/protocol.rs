@@ -230,7 +230,13 @@ async fn advertised_edits_match_the_intent_apis() {
             "insert_text",
             "replace_range",
             "delete_text",
-            "insert_paragraph_break"
+            "insert_paragraph_break",
+            "format",
+            "format_paragraphs",
+            "add_comment",
+            "reply_to_comment",
+            "resolve_comment",
+            "delete_comment"
         ]
     );
     assert_eq!(
@@ -240,7 +246,16 @@ async fn advertised_edits_match_the_intent_apis() {
             "insert_row",
             "delete_row",
             "insert_column",
-            "delete_column"
+            "delete_column",
+            "set_note",
+            "delete_note",
+            "set_format",
+            "merge_cells",
+            "unmerge_cells",
+            "add_sheet",
+            "rename_sheet",
+            "delete_sheet",
+            "move_sheet"
         ]
     );
 }

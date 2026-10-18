@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use jade_collab_core::grid::GridOp;
+use jade_collab_core::grid::{GridOp, Merge};
 use jade_collab_core::id::Id;
 use jade_xlsx_collab::{
     column_label, CellInput, FormatChange, HorizontalAlignment, JadeXlsx, LoadOptions,
@@ -232,7 +232,7 @@ pub fn generate(view: &XlsxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
             1 + pick(sheet.rows.len(), salt + 6)
         )
     };
-    match choice % 16 {
+    match choice % 21 {
         0..=5 => {
             let value = match (choice >> 28) % 6 {
                 0 => CellInput::Number(((choice >> 34) % 1000) as f64 / 4.0),
@@ -252,7 +252,7 @@ pub fn generate(view: &XlsxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
         }
         6 | 7 => Some(XlsxOp::Structure {
             sheet: sheet.id,
-            op: if choice % 16 == 6 {
+            op: if choice % 21 == 6 {
                 GridOp::InsertRow {
                     id: ids(1),
                     after: (pick(4, 30) != 0).then_some(row),
@@ -303,6 +303,55 @@ pub fn generate(view: &XlsxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
                 change: format_change(choice >> 30),
             })
         }
+        16 | 17 => {
+            // A 1 × 2 to 2 × 2 merge below row 4 (the fixtures' Excel table
+            // is A1:C4, where merges are refused).
+            let first = 4.min(sheet.rows.len() - 1);
+            let top = first + pick(sheet.rows.len() - first, 12);
+            let left = pick(sheet.columns.len().min(4), 20);
+            let bottom = (top + pick(2, 26)).min(sheet.rows.len() - 1);
+            let right = (left + 1).min(sheet.columns.len() - 1);
+            Some(XlsxOp::MergeCells {
+                sheet: sheet.id,
+                merge: Merge {
+                    top: sheet.rows[top],
+                    left: sheet.columns[left],
+                    bottom: sheet.rows[bottom],
+                    right: sheet.columns[right],
+                },
+                stamp: ids(1),
+            })
+        }
+        18 => {
+            let merges = view.merges(sheet.id);
+            let merge = merges.get(pick(merges.len(), 12))?;
+            Some(XlsxOp::UnmergeCells {
+                sheet: sheet.id,
+                top: merge.top,
+                left: merge.left,
+            })
+        }
+        19 => Some(match pick(3, 12) {
+            0 => {
+                let (rows, columns) = (1 + pick(4, 16) as u32, 1 + pick(3, 20) as u32);
+                XlsxOp::AddSheet {
+                    id: ids(1 + u64::from(rows + columns)),
+                    name: ["Extra", "日本語", "Sheet 9", "operations"][pick(4, 24)].to_string(),
+                    after: (pick(2, 28) == 0).then_some(sheet.id),
+                    rows,
+                    columns,
+                }
+            }
+            1 => XlsxOp::RenameSheet {
+                sheet: sheet.id,
+                name: ["Renamed", "Q1 ops", "Operations", "a/b"][pick(4, 24)].to_string(),
+            },
+            _ => XlsxOp::MoveSheet {
+                sheet: sheet.id,
+                to: pick(sheets.len(), 24) as u32,
+            },
+        }),
+        20 => Some(XlsxOp::DeleteSheet { sheet: sheet.id }),
         _ => unreachable!(),
     }
 }

@@ -2,11 +2,11 @@
 //! resolved against a view into identifier-addressed [`XlsxOp`]s — what a
 //! person's UI or an agent naturally produces.
 
-use jade_collab_core::grid::GridOp;
+use jade_collab_core::grid::{GridOp, Merge};
 use jade_collab_core::id::Id;
 use serde::{Deserialize, Serialize};
 
-use crate::model::{parse_reference, XlsxModel, XlsxOp};
+use crate::model::{parse_reference, LoadOptions, XlsxModel, XlsxOp};
 use crate::{CellInput, FormatChange};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -52,6 +52,34 @@ pub enum XlsxIntent {
         range: String,
         change: FormatChange,
     },
+    /// Merges `range` (`B2:C3`): the top-left value stays, the rest clear.
+    MergeCells {
+        sheet: String,
+        range: String,
+    },
+    /// Undoes the merge starting at `range`'s top-left cell.
+    UnmergeCells {
+        sheet: String,
+        range: String,
+    },
+    /// A new empty sheet after `after` (or at the end).
+    AddSheet {
+        name: String,
+        #[serde(default)]
+        after: Option<String>,
+    },
+    RenameSheet {
+        sheet: String,
+        name: String,
+    },
+    DeleteSheet {
+        sheet: String,
+    },
+    /// To tab position `to` (0 is the first tab).
+    MoveSheet {
+        sheet: String,
+        to: u32,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -60,6 +88,25 @@ pub enum XlsxIntentError {
     NoSuchSheet(String),
     #[error("{0} is outside the editable part of the sheet")]
     NoSuchCell(String),
+}
+
+/// The rows and columns `range` (`B2:D5` or `B2`) covers, top-left first.
+fn rectangle(
+    rows: &[Id],
+    columns: &[Id],
+    range: &str,
+) -> Result<(Vec<Id>, Vec<Id>), XlsxIntentError> {
+    let outside = || XlsxIntentError::NoSuchCell(range.to_string());
+    let (first, last) = range.split_once(':').unwrap_or((range, range));
+    let (top, left) = parse_reference(first).ok_or_else(outside)?;
+    let (bottom, right) = parse_reference(last).ok_or_else(outside)?;
+    let span = |lines: &[Id], a: u32, b: u32| {
+        lines
+            .get(a.min(b) as usize..=a.max(b) as usize)
+            .map(<[Id]>::to_vec)
+            .ok_or_else(outside)
+    };
+    Ok((span(rows, top, bottom)?, span(columns, left, right)?))
 }
 
 fn column_index(label: &str) -> Option<u32> {
@@ -119,24 +166,61 @@ pub fn resolve(
             change,
         } => {
             let s = sheet_named(sheet)?;
-            let outside = || XlsxIntentError::NoSuchCell(range.clone());
-            let (first, last) = range.split_once(':').unwrap_or((range, range));
-            let (top, left) = parse_reference(first).ok_or_else(outside)?;
-            let (bottom, right) = parse_reference(last).ok_or_else(outside)?;
-            let span = |lines: &[Id], a: u32, b: u32| {
-                lines
-                    .get(a.min(b) as usize..=a.max(b) as usize)
-                    .map(<[Id]>::to_vec)
-                    .ok_or_else(outside)
-            };
+            let (rows, columns) = rectangle(&s.rows, &s.columns, range)?;
             XlsxOp::SetFormat {
                 sheet: s.id,
-                rows: span(&s.rows, top, bottom)?,
-                columns: span(&s.columns, left, right)?,
+                rows,
+                columns,
                 stamp: ids(1),
                 change: change.clone(),
             }
         }
+        XlsxIntent::MergeCells { sheet, range } => {
+            let s = sheet_named(sheet)?;
+            let (rows, columns) = rectangle(&s.rows, &s.columns, range)?;
+            XlsxOp::MergeCells {
+                sheet: s.id,
+                merge: Merge {
+                    top: rows[0],
+                    left: columns[0],
+                    bottom: *rows.last().expect("non-empty"),
+                    right: *columns.last().expect("non-empty"),
+                },
+                stamp: ids(1),
+            }
+        }
+        XlsxIntent::UnmergeCells { sheet, range } => {
+            let s = sheet_named(sheet)?;
+            let (rows, columns) = rectangle(&s.rows, &s.columns, range)?;
+            XlsxOp::UnmergeCells {
+                sheet: s.id,
+                top: rows[0],
+                left: columns[0],
+            }
+        }
+        XlsxIntent::AddSheet { name, after } => {
+            let after = after.as_deref().map(sheet_named).transpose()?.map(|s| s.id);
+            let defaults = LoadOptions::default();
+            let (rows, columns) = (defaults.min_rows, defaults.min_columns);
+            XlsxOp::AddSheet {
+                id: ids(1 + u64::from(rows) + u64::from(columns)),
+                name: name.clone(),
+                after,
+                rows,
+                columns,
+            }
+        }
+        XlsxIntent::RenameSheet { sheet, name } => XlsxOp::RenameSheet {
+            sheet: sheet_named(sheet)?.id,
+            name: name.clone(),
+        },
+        XlsxIntent::DeleteSheet { sheet } => XlsxOp::DeleteSheet {
+            sheet: sheet_named(sheet)?.id,
+        },
+        XlsxIntent::MoveSheet { sheet, to } => XlsxOp::MoveSheet {
+            sheet: sheet_named(sheet)?.id,
+            to: *to,
+        },
         XlsxIntent::SetCell {
             sheet,
             reference,

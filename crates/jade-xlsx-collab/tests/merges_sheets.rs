@@ -98,39 +98,23 @@ fn lanes() {
 #[test]
 fn merging_keeps_the_top_left_value_and_clears_the_rest() {
     let (mut model, mut jade) = open("grid-operations-workbook.xlsx");
-    run(
-        &mut model,
-        &mut jade,
-        &set(&model, "A6", 1, CellInput::Number(1.0)),
-        &ctx(1, 0, 1),
-    );
-    run(
-        &mut model,
-        &mut jade,
-        &set(&model, "B7", 2, CellInput::Text("x".into())),
-        &ctx(1, 1, 2),
-    );
-    run(
-        &mut model,
-        &mut jade,
-        &merge(&model, "A6", "B7", 3),
-        &ctx(1, 2, 3),
-    );
+    let op = set(&model, "A6", 1, CellInput::Number(1.0));
+    run(&mut model, &mut jade, &op, &ctx(1, 0, 1));
+    let op = set(&model, "B7", 2, CellInput::Text("x".into()));
+    run(&mut model, &mut jade, &op, &ctx(1, 1, 2));
+    let op = merge(&model, "A6", "B7", 3);
+    run(&mut model, &mut jade, &op, &ctx(1, 2, 3));
     let (sheet, a6r, a6c) = cell(&model, "A6");
     let (_, b7r, b7c) = cell(&model, "B7");
     assert_eq!(model.value(sheet, a6r, a6c), Some(&CellInput::Number(1.0)));
     assert_eq!(model.value(sheet, b7r, b7c), Some(&CellInput::Blank));
     // Unmerging leaves values where they are.
-    run(
-        &mut model,
-        &mut jade,
-        &XlsxOp::UnmergeCells {
-            sheet,
-            top: a6r,
-            left: a6c,
-        },
-        &ctx(1, 3, 4),
-    );
+    let op = XlsxOp::UnmergeCells {
+        sheet,
+        top: a6r,
+        left: a6c,
+    };
+    run(&mut model, &mut jade, &op, &ctx(1, 3, 4));
     assert_eq!(model.value(sheet, a6r, a6c), Some(&CellInput::Number(1.0)));
 }
 
@@ -140,30 +124,18 @@ fn a_newer_concurrent_write_into_a_merged_cell_survives_the_merge() {
     // Replica 2 typed into B7 with a newer stamp than the merge, and its
     // write reached the server first; the merge (older stamp) must not erase
     // it — in the model or in the file.
-    run(
-        &mut model,
-        &mut jade,
-        &set(&model, "B7", 50, CellInput::Text("newer".into())),
-        &ctx(2, 0, 1),
-    );
-    run(
-        &mut model,
-        &mut jade,
-        &merge(&model, "A6", "B7", 10),
-        &ctx(1, 0, 2),
-    );
+    let op = set(&model, "B7", 50, CellInput::Text("newer".into()));
+    run(&mut model, &mut jade, &op, &ctx(2, 0, 1));
+    let op = merge(&model, "A6", "B7", 10);
+    run(&mut model, &mut jade, &op, &ctx(1, 0, 2));
     let (sheet, row, column) = cell(&model, "B7");
     assert_eq!(
         model.value(sheet, row, column),
         Some(&CellInput::Text("newer".into()))
     );
     // An older write arriving after the merge loses to it.
-    run(
-        &mut model,
-        &mut jade,
-        &set(&model, "A7", 5, CellInput::Text("older".into())),
-        &ctx(3, 0, 3),
-    );
+    let op = set(&model, "A7", 5, CellInput::Text("older".into()));
+    run(&mut model, &mut jade, &op, &ctx(3, 0, 3));
     let (_, row, column) = cell(&model, "A7");
     assert_eq!(model.value(sheet, row, column), Some(&CellInput::Blank));
 }
@@ -189,39 +161,27 @@ fn merges_are_refused_over_other_merges_tables_and_single_cells() {
 fn merged_cells_show_the_anchor_format() {
     let (mut model, mut jade) = open("grid-operations-workbook.xlsx");
     let (sheet, row, column) = cell(&model, "A6");
-    run(
-        &mut model,
-        &mut jade,
-        &XlsxOp::SetFormat {
-            sheet,
-            rows: vec![row],
-            columns: vec![column],
-            stamp: stamp(1),
-            change: FormatChange {
-                bold: Some(true),
-                ..FormatChange::default()
-            },
+    let op = XlsxOp::SetFormat {
+        sheet,
+        rows: vec![row],
+        columns: vec![column],
+        stamp: stamp(1),
+        change: FormatChange {
+            bold: Some(true),
+            ..FormatChange::default()
         },
-        &ctx(1, 0, 1),
-    );
-    run(
-        &mut model,
-        &mut jade,
-        &merge(&model, "A6", "B7", 2),
-        &ctx(1, 1, 2),
-    );
+    };
+    run(&mut model, &mut jade, &op, &ctx(1, 0, 1));
+    let op = merge(&model, "A6", "B7", 2);
+    run(&mut model, &mut jade, &op, &ctx(1, 1, 2));
     let (_, b7r, b7c) = cell(&model, "B7");
     assert_eq!(model.format(sheet, b7r, b7c).bold, Some(true));
-    run(
-        &mut model,
-        &mut jade,
-        &XlsxOp::UnmergeCells {
-            sheet,
-            top: row,
-            left: column,
-        },
-        &ctx(1, 2, 3),
-    );
+    let op = XlsxOp::UnmergeCells {
+        sheet,
+        top: row,
+        left: column,
+    };
+    run(&mut model, &mut jade, &op, &ctx(1, 2, 3));
     // jade copied the anchor's format into the cells it covered.
     assert_eq!(model.format(sheet, b7r, b7c).bold, Some(true));
 }
@@ -245,65 +205,45 @@ fn sheets_are_added_renamed_moved_and_deleted() {
             .collect::<Vec<_>>()
     };
     let first = model.sheets()[0].id;
-    run(
-        &mut model,
-        &mut jade,
-        &XlsxOp::AddSheet {
-            id: stamp(1),
-            name: "Notes".into(),
-            after: Some(first),
-            rows: 3,
-            columns: 2,
-        },
-        &ctx(1, 0, 1),
-    );
+    let op = XlsxOp::AddSheet {
+        id: stamp(1),
+        name: "Notes".into(),
+        after: Some(first),
+        rows: 3,
+        columns: 2,
+    };
+    run(&mut model, &mut jade, &op, &ctx(1, 0, 1));
     assert_eq!(names(&model), jade_names(&jade));
     assert_eq!(names(&model)[1], "Notes");
     // A formula on the new sheet that points at the first one…
     let notes = model.sheets()[1].clone();
-    run(
-        &mut model,
-        &mut jade,
-        &XlsxOp::SetCell {
-            sheet: notes.id,
-            row: notes.rows[0],
-            column: notes.columns[0],
-            stamp: stamp(2),
-            value: CellInput::Formula("Operations!B2*2".into()),
-        },
-        &ctx(1, 1, 2),
-    );
+    let op = XlsxOp::SetCell {
+        sheet: notes.id,
+        row: notes.rows[0],
+        column: notes.columns[0],
+        stamp: stamp(2),
+        value: CellInput::Formula("Operations!B2*2".into()),
+    };
+    run(&mut model, &mut jade, &op, &ctx(1, 1, 2));
     // …follows a rename, as in jade.
-    run(
-        &mut model,
-        &mut jade,
-        &XlsxOp::RenameSheet {
-            sheet: first,
-            name: "Q1 ops".into(),
-        },
-        &ctx(1, 2, 3),
-    );
+    let op = XlsxOp::RenameSheet {
+        sheet: first,
+        name: "Q1 ops".into(),
+    };
+    run(&mut model, &mut jade, &op, &ctx(1, 2, 3));
     assert_eq!(
         model.value(notes.id, notes.rows[0], notes.columns[0]),
         Some(&CellInput::Formula("'Q1 ops'!B2*2".into()))
     );
-    run(
-        &mut model,
-        &mut jade,
-        &XlsxOp::MoveSheet {
-            sheet: notes.id,
-            to: 0,
-        },
-        &ctx(1, 3, 4),
-    );
+    let op = XlsxOp::MoveSheet {
+        sheet: notes.id,
+        to: 0,
+    };
+    run(&mut model, &mut jade, &op, &ctx(1, 3, 4));
     assert_eq!(names(&model), jade_names(&jade));
     assert_eq!(names(&model)[0], "Notes");
-    run(
-        &mut model,
-        &mut jade,
-        &XlsxOp::DeleteSheet { sheet: first },
-        &ctx(1, 4, 5),
-    );
+    let op = XlsxOp::DeleteSheet { sheet: first };
+    run(&mut model, &mut jade, &op, &ctx(1, 4, 5));
     assert_eq!(names(&model), jade_names(&jade));
     assert_eq!(
         model.value(notes.id, notes.rows[0], notes.columns[0]),
@@ -345,27 +285,19 @@ fn a_formula_typed_before_a_rename_it_did_not_see_is_rewritten() {
     let target = model.sheets()[1].clone();
     // Replica 2 renames (seq 1); replica 1, still at seq 0, typed a formula
     // naming the old sheet.
-    run(
-        &mut model,
-        &mut jade,
-        &XlsxOp::RenameSheet {
-            sheet: first,
-            name: "Renamed".into(),
-        },
-        &ctx(2, 0, 1),
-    );
-    run(
-        &mut model,
-        &mut jade,
-        &XlsxOp::SetCell {
-            sheet: target.id,
-            row: target.rows[0],
-            column: target.columns[0],
-            stamp: stamp(3),
-            value: CellInput::Formula("Operations!A2".into()),
-        },
-        &ctx(1, 0, 2),
-    );
+    let op = XlsxOp::RenameSheet {
+        sheet: first,
+        name: "Renamed".into(),
+    };
+    run(&mut model, &mut jade, &op, &ctx(2, 0, 1));
+    let op = XlsxOp::SetCell {
+        sheet: target.id,
+        row: target.rows[0],
+        column: target.columns[0],
+        stamp: stamp(3),
+        value: CellInput::Formula("Operations!A2".into()),
+    };
+    run(&mut model, &mut jade, &op, &ctx(1, 0, 2));
     assert_eq!(
         model.value(target.id, target.rows[0], target.columns[0]),
         Some(&CellInput::Formula("Renamed!A2".into()))
@@ -376,12 +308,8 @@ fn a_formula_typed_before_a_rename_it_did_not_see_is_rewritten() {
 fn writes_to_a_deleted_sheet_are_accepted_and_invisible() {
     let (mut model, mut jade) = open("clipboard-workbook.xlsx");
     let gone = model.sheets()[1].clone();
-    run(
-        &mut model,
-        &mut jade,
-        &XlsxOp::DeleteSheet { sheet: gone.id },
-        &ctx(2, 0, 1),
-    );
+    let op = XlsxOp::DeleteSheet { sheet: gone.id };
+    run(&mut model, &mut jade, &op, &ctx(2, 0, 1));
     // A convergent write made before the deletion was seen still applies
     // (it must commute with the deletion) but shows nowhere.
     let op = XlsxOp::SetCell {

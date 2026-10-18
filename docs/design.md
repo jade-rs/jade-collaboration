@@ -225,6 +225,28 @@ table's header or totals row are safe — jade leaves the header text and
 column name alone when only the format or the note changes — so unlike
 values they are not read-only there.
 
+**Merging cells** is sequenced (two merges can overlap) and validated by
+the grid (no overlap, at least two cells, not touching an Excel table). As
+in Excel, jade keeps the top-left value and clears the others, and the
+covered cells take the anchor's format. The model clears with a
+last-writer-wins write of a blank stamped by the merge, and copies the
+anchor's format the same way (an attribute the model does not know for the
+anchor becomes unknown — "whatever the file has" — for the covered cells).
+Written as LWW writes, the clear commutes with every concurrent cell write:
+one with a newer stamp survives in whatever order a replica applies the two,
+and when it reached the server first, the materializer writes it back after
+jade's merge. Unmerging leaves values and formats where they are.
+
+**Sheets** are added, renamed, deleted and moved on the sequenced lane,
+through jade-core's headless editor (jade-rs/jade-core#11). Names are
+validated with jade's own Excel rules on every replica. A rename rewrites
+every formula naming the sheet with jade's `rename_sheet_in_formula`; a
+deletion turns references into `#REF!` with `delete_sheet_in_formula`; both
+are logged next to row/column changes so a formula typed before them is
+rebased through them in log order, under the name its sheet had at each
+change. A deleted sheet stays in the model, invisible, so a convergent
+write made before the deletion was seen still lands and commutes.
+
 Excel tables (ListObjects) rewrite what is typed into their header and totals
 rows (a blank header becomes `Column1`) and name or fill new rows and columns
 inserted inside them. The model cannot predict that, so those cells are
@@ -356,8 +378,9 @@ split/join, table insertion/deletion and row/column structure on simple
 tables, text in any table cell; docx formatting (character and paragraph)
 and comments (add, reply, resolve, delete; also comments loaded from the
 file) as sequenced operations on id ranges resolved in log order (§4); xlsx
-values, formulas (with rebasing), row/column structure, notes, and cell
-formatting (per-attribute LWW, A1 ranges); index/A1-addressed intent APIs
+values, formulas (with rebasing), row/column structure, notes, cell
+formatting (per-attribute LWW, A1 ranges), merged cells and sheet
+management (add, rename, delete, move); index/A1-addressed intent APIs
 for people and agents; the `jade-collab` CLI; resume after a disconnect; an
 MCP server (`jade-collab-mcp`) through which agents join, read, edit and
 watch documents as replicas without a shell; durable documents with
@@ -374,8 +397,7 @@ Not yet:
 * docx merged cells and structure of merged/ragged/nested tables (their
   text is editable; the model already validates merges in `Grid`), text
   boxes, notes, tracked changes.
-* Creating or removing xlsx merges (the file's merges are loaded and
-  follow structural changes), sheets added/renamed, Excel table structure.
+* Excel table (ListObject) structure and header edits.
 * Durability and access, beyond what §8 covers: per-document permissions
   (a token is valid for every document), token rotation without a restart,
   an fsync per journal record (records are written to the OS at once; only
