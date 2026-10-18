@@ -173,12 +173,17 @@ async fn a_restarted_server_resumes_every_replica_where_it_was() {
         "replica ids are not reused"
     );
     type_text(&e, 0, "[e] ");
+    // Everyone's edits are in before anyone catches up.
     for client in [&a, &b, &e] {
         client.settle().await.unwrap();
-        catch_up(&server, "hello.docx", client).await;
     }
     for client in [&c, &d] {
         client.settle().await.unwrap();
+    }
+    for client in [&a, &b, &e] {
+        catch_up(&server, "hello.docx", client).await;
+    }
+    for client in [&c, &d] {
         catch_up(&server, "book.xlsx", client).await;
     }
     assert_eq!(a.view(), b.view());
