@@ -400,11 +400,10 @@ fn notes_are_typed_split_and_joined_through_export() {
     assert_eq!(again.paragraph_texts(), model.paragraph_texts());
 }
 
-/// jade writes a text box's text to the file but not new or removed
-/// paragraphs in it (see `jade_drops_text_box_paragraph_breaks_on_export`),
-/// so a text box's text is editable and its paragraphs are fixed.
+/// A text box's paragraphs split and join like any story's, and jade writes
+/// them to the file (jade-core once kept them in memory only).
 #[test]
-fn text_box_text_is_editable_and_its_paragraphs_are_fixed() {
+fn text_box_paragraphs_are_split_and_joined_through_export() {
     let (mut model, mut jade) = open(MIXED);
     let box_text = 10;
     edit(
@@ -419,33 +418,50 @@ fn text_box_text_is_editable_and_its_paragraphs_are_fixed() {
         },
     );
     assert_eq!(layout(&model, box_text), "Small text[4]");
-    let p = model.paragraphs()[box_text].clone();
-    let before = model.clone();
-    let split = DocxOp::SplitParagraph {
-        story: p.story,
-        parent: Some(p.chars[2]),
-        id: Id::new(5_000_000, ReplicaId(1)),
-    };
-    assert!(model.apply(&split, &ctx()).is_err());
-    assert_eq!(model, before);
-    assert!(resolve(
-        &model,
-        &IntentOp::InsertParagraphBreak {
+    edit(
+        &mut model,
+        &mut jade,
+        IntentOp::InsertParagraphBreak {
             paragraph: box_text,
             offset: 2,
-            count: 1
+            count: 2,
         },
-        &mut fresh(1)
-    )
-    .is_err());
+    );
+    let p = model.paragraphs();
+    assert_eq!(layout(&model, box_text), "Sm");
+    assert_eq!(p[box_text + 1].text, "");
+    assert_eq!(layout(&model, box_text + 2), "all text[4]");
+    assert_eq!(
+        p[box_text + 2].at,
+        ParagraphStory::TextBox {
+            host: 5,
+            text_box: 0,
+            paragraph: 2
+        }
+    );
+    let (again, _) = reloaded(&jade);
+    assert_eq!(layouts(&again), layouts(&model));
+    // Joined again, one paragraph end at a time.
+    for _ in 0..2 {
+        edit(
+            &mut model,
+            &mut jade,
+            IntentOp::DeleteText {
+                paragraph: box_text,
+                offset: 2,
+                direction: jade_docx_headless_api::HeadlessDeleteDirection::Forward,
+                count: 1,
+            },
+        );
+    }
+    assert_eq!(layout(&model, box_text), "Small text[4]");
     let (again, _) = reloaded(&jade);
     assert_eq!(layouts(&again), layouts(&model));
 }
 
-/// Why text-box paragraphs are fixed: jade splits the paragraph in memory
-/// but writes the text box's original paragraphs.
+/// jade writes a text box's new paragraphs to the file.
 #[test]
-fn jade_drops_text_box_paragraph_breaks_on_export() {
+fn jade_writes_text_box_paragraph_breaks_on_export() {
     use jade_docx_document_core::headless_api::apply_headless_commands_to_document;
     use jade_docx_headless_api::{HeadlessCommand, HeadlessEditRequest};
     let (_, mut jade) = open("textbox.docx");
@@ -465,7 +481,7 @@ fn jade_drops_text_box_paragraph_breaks_on_export() {
     jade = JadeDocx::new(word);
     assert_eq!(jade.paragraph_texts(), ["Hello", "He", "llo", "World"]);
     let reloaded = JadeDocx::load(&jade.export().unwrap()).unwrap();
-    assert_eq!(reloaded.paragraph_texts(), ["Hello", "Hello", "World"]);
+    assert_eq!(reloaded.paragraph_texts(), ["Hello", "He", "llo", "World"]);
 }
 
 /// A comment in a text box works in jade; jade cannot anchor one in a note,
