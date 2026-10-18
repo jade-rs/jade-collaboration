@@ -15,6 +15,7 @@ jade-collab-server = { path = "../jade-collab-server" }
 jade-collab-sync = { path = "../jade-collab-sync" }
 jade-docx-collab = { path = "../jade-docx-collab" }
 jade-xlsx-collab = { path = "../jade-xlsx-collab" }
+jade-pptx-collab = { path = "../jade-pptx-collab" }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }

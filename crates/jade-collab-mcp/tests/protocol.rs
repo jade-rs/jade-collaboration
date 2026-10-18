@@ -4,6 +4,7 @@ mod common;
 
 use common::{Agent, Hosted, DOCX};
 use jade_docx_collab::intent::IntentOp;
+use jade_pptx_collab::intent::PptxIntent;
 use jade_xlsx_collab::intent::XlsxIntent;
 use serde_json::{json, Value};
 
@@ -204,26 +205,50 @@ async fn advertised_edits_match_the_intent_apis() {
         .expect("edits are a list of variants");
     let mut docx = Vec::new();
     let mut xlsx = Vec::new();
+    let mut pptx = Vec::new();
     for variant in variants {
         let name = variant["properties"]["type"]["const"].as_str().unwrap();
         assert_eq!(variant["additionalProperties"], json!(false), "{name}");
+        let description = variant["description"].as_str().unwrap_or_default();
         let payload = sample(variant);
-        if serde_json::from_value::<IntentOp>(payload.clone()).is_ok() {
-            docx.push(name.to_string());
-        } else {
-            serde_json::from_value::<XlsxIntent>(payload.clone())
-                .unwrap_or_else(|e| panic!("{name}: {payload} is neither edit kind: {e}"));
-            xlsx.push(name.to_string());
-        }
         // Every advertised optional property is one the API reads.
         let mut full = payload.clone();
         for (property, schema) in variant["properties"].as_object().unwrap() {
             full[property] = sample(schema);
         }
-        let accepted = serde_json::from_value::<IntentOp>(full.clone()).is_ok()
-            || serde_json::from_value::<XlsxIntent>(full.clone()).is_ok();
-        assert!(accepted, "{name}: {full}");
+        // The description names the format; the payload must be that
+        // format's intent, minimal and with every optional property.
+        let format = description.split(':').next().unwrap_or_default();
+        let parses = |value: &Value| match format {
+            "docx" => serde_json::from_value::<IntentOp>(value.clone()).map(drop).map_err(|e| e.to_string()),
+            "xlsx" => serde_json::from_value::<XlsxIntent>(value.clone()).map(drop).map_err(|e| e.to_string()),
+            "pptx" => serde_json::from_value::<PptxIntent>(value.clone()).map(drop).map_err(|e| e.to_string()),
+            other => Err(format!("{name}: no format in {other:?}")),
+        };
+        parses(&payload).unwrap_or_else(|e| panic!("{name}: {payload}: {e}"));
+        parses(&full).unwrap_or_else(|e| panic!("{name}: {full}: {e}"));
+        match format {
+            "docx" => docx.push(name.to_string()),
+            "xlsx" => xlsx.push(name.to_string()),
+            _ => pptx.push(name.to_string()),
+        }
     }
+    assert_eq!(
+        pptx,
+        [
+            "insert_text",
+            "replace_range",
+            "delete_text",
+            "insert_paragraph_break",
+            "set_geometry",
+            "insert_slide",
+            "delete_slide",
+            "move_slide",
+            "duplicate_slide",
+            "insert_text_box",
+            "delete_shape"
+        ]
+    );
     assert_eq!(
         docx,
         [

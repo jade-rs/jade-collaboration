@@ -353,3 +353,59 @@ fn jade_refuses_what_the_model_cannot_see() {
         "after the refusal",
     );
 }
+
+/// A server restored from storage has the model (from JSON) and the file,
+/// but not the materializer's memory of which file id jade gave each text
+/// box made in the session. `JadePptx::restore` rebuilds it from the two, so
+/// later edits still land on the right shape.
+#[test]
+fn a_restored_materializer_finds_text_boxes_whose_ids_jade_reused() {
+    let mut s = Session::open("sample-deck.pptx");
+    // Delete the slide's highest-numbered deletable shape, so jade gives the
+    // next text box that number again while the model numbers it afresh.
+    let slide = s.model.slides()[0].clone();
+    let doomed = slide
+        .shapes
+        .iter()
+        .filter(|shape| shape.deletable)
+        .max_by_key(|shape| shape.number)
+        .unwrap()
+        .clone();
+    s.step(PptxOp::DeleteShape {
+        slide: slide.id,
+        shape: doomed.id,
+    });
+    s.intent(PptxIntent::InsertTextBox {
+        slide: 1,
+        x: 0,
+        y: 0,
+        width: 1_000_000,
+        height: 400_000,
+        text: "box".into(),
+    });
+    let boxed = s.model.slides()[0].shapes.last().unwrap().clone();
+
+    let model: PptxModel = serde_json::from_str(&serde_json::to_string(&s.model).unwrap()).unwrap();
+    let mut restored = JadePptx::restore(&s.jade.export().unwrap(), &model).unwrap();
+    assert_agree(&model, &restored, "restored");
+    let mut model = model;
+    let story = StoryId::Shape {
+        slide: slide.id,
+        shape: boxed.id,
+    };
+    let end = model.paragraphs(story).unwrap()[0].chars.last().copied();
+    let op = PptxOp::InsertText {
+        story,
+        parent: end,
+        first: Id::new(9_000_000, ReplicaId(2)),
+        text: "ed".into(),
+    };
+    let ctx = ApplyContext {
+        origin: ReplicaId(2),
+        base_seq: s.seq,
+        seq: Some(s.seq + 1),
+    };
+    let effect = model.apply(&op, &ctx).unwrap();
+    restored.materialize(&model, effect, &ctx).unwrap();
+    assert_agree(&model, &restored, "after editing the restored text box");
+}
