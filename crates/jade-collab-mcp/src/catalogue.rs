@@ -3,6 +3,7 @@
 //! variants mirror `IntentOp` and `XlsxIntent` (a test builds a payload
 //! from each advertised schema and checks the intent APIs accept it).
 
+use jade_xlsx_collab::BorderStyle;
 use serde_json::{json, Value};
 
 /// Usage notes returned from `initialize`.
@@ -153,6 +154,50 @@ fn xlsx_format_change() -> Value {
             "horizontal": { "type": "string", "enum": ["General", "Left", "Center", "Right"], "description": "Horizontal alignment." },
             "vertical": { "type": "string", "enum": ["Top", "Center", "Bottom"], "description": "Vertical alignment." },
             "wrap_text": flag("Wrap text."),
+            "border_left": border_line("Every cell's left edge."),
+            "border_right": border_line("Every cell's right edge."),
+            "border_top": border_line("Every cell's top edge."),
+            "border_bottom": border_line("Every cell's bottom edge."),
+            "border_diagonal": border_line("Every cell's diagonal line (shown in the directions diagonal_up / diagonal_down turn on)."),
+            "diagonal_up": flag("Show the diagonal from bottom-left to top-right."),
+            "diagonal_down": flag("Show the diagonal from top-left to bottom-right."),
+        },
+        "required": [],
+        "additionalProperties": false,
+    })
+}
+
+/// One border line: style and colour, last-writer-wins together per edge.
+fn border_line(what: &str) -> Value {
+    let styles: Vec<&str> = BorderStyle::ALL.iter().map(|s| s.as_str()).collect();
+    json!({
+        "type": "object",
+        "description": format!("{what} `none` removes the line."),
+        "properties": {
+            "style": { "type": "string", "enum": styles, "description": "Line style, as Excel names it." },
+            "color": string("`RRGGBB`; omit for Excel's automatic colour."),
+        },
+        "required": ["style"],
+        "additionalProperties": false,
+    })
+}
+
+fn xlsx_range_borders() -> Value {
+    json!({
+        "type": "object",
+        "description": "Lines over the range, as Excel's border dialog draws them; an edge of its own wins over `outline`, a direction of its own over `inside`.",
+        "properties": {
+            "outline": border_line("The range's four outer edges."),
+            "inside": border_line("The lines between its cells, both ways."),
+            "top": border_line("The range's top edge."),
+            "bottom": border_line("The range's bottom edge."),
+            "left": border_line("The range's left edge."),
+            "right": border_line("The range's right edge."),
+            "inside_horizontal": border_line("The lines between its rows."),
+            "inside_vertical": border_line("The lines between its columns."),
+            "diagonal": border_line("Every cell's diagonal line."),
+            "diagonal_up": { "type": "boolean", "description": "Show the diagonal from bottom-left to top-right." },
+            "diagonal_down": { "type": "boolean", "description": "Show the diagonal from top-left to bottom-right." },
         },
         "required": [],
         "additionalProperties": false,
@@ -284,11 +329,16 @@ fn edits() -> Value {
                     "sheet": sheet(),
                     "reference": string("The cell (`B3`)."),
                 }), &["sheet", "reference"]),
-                edit("set_format", "xlsx: format a cell or range; each attribute is last-writer-wins.", json!({
+                edit("set_format", "xlsx: format a cell, a range, or whole rows or columns; each attribute is last-writer-wins, and a cell shows the newest of its own, its row's and its column's.", json!({
                     "sheet": sheet(),
-                    "range": string("`B2` or `B2:D5`."),
+                    "range": string("`B2` or `B2:D5`; whole rows `3:5` or columns `B:D` (also the cells they get later)."),
                     "change": xlsx_format_change(),
                 }), &["sheet", "range", "change"]),
+                edit("set_borders", "xlsx: draw border lines over a range (outline, inside lines, single edges, diagonals); each cell's edge is last-writer-wins.", json!({
+                    "sheet": sheet(),
+                    "range": string("`B2` or `B2:D5`."),
+                    "borders": xlsx_range_borders(),
+                }), &["sheet", "range", "borders"]),
                 edit("merge_cells", "xlsx: merge a range; the top-left value stays, the others are cleared.", json!({
                     "sheet": sheet(),
                     "range": string("`B2:C3`."),
@@ -522,7 +572,19 @@ fn tools() -> Vec<Tool> {
                             "type": "object",
                             "description": "A1 reference → value (`{kind, value}`, as set_cell takes it).",
                         },
-                    }), &["name", "rows", "columns", "cells"]),
+                        "formats": {
+                            "type": "object",
+                            "description": "A1 reference → the format attributes written through this collaboration that show at the cell (as set_format takes them, borders included; its row's and column's formats count, a merged cell shows its anchor's). Listed for cells formatted on their own or merged; formats the file already had are not listed.",
+                        },
+                        "row_formats": {
+                            "type": "object",
+                            "description": "Row number (`3`) → the whole-row format written through this collaboration.",
+                        },
+                        "column_formats": {
+                            "type": "object",
+                            "description": "Column letter (`B`) → the whole-column format written through this collaboration.",
+                        },
+                    }), &["name", "rows", "columns", "cells", "formats", "row_formats", "column_formats"]),
                 },
                 "slide_count": integer("pptx: how many slides there are."),
                 "slides": {

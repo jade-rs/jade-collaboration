@@ -90,7 +90,7 @@ claude mcp add jade-collab -- jade-collab-mcp   # or any MCP client's config
 | --- | --- |
 | `list_documents` | `{server: "http://host:port"}` → names, formats and socket URLs |
 | `join_document` | `{url: "ws://…/documents/<name>/ws"}` → `session_id`, format, replica id, seq |
-| `read_document` | the session's view, paged: docx paragraphs (with their story) and tables, xlsx non-blank cells in A1 form |
+| `read_document` | the session's view, paged: docx paragraphs (with their story) and tables, xlsx non-blank cells in A1 form with the cell, row and column formats written in the session |
 | `apply_edits` | the CLI's edit JSON, applied in order; each reported `applied`, `rejected` (reason), `invalid` (error) or `pending` |
 | `wait_for_changes` | returns once someone's edit arrives (seq > `after_seq`) or on timeout |
 | `leave_document` | disconnects the session |

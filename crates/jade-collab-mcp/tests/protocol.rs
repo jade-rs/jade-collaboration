@@ -283,6 +283,7 @@ async fn advertised_edits_match_the_intent_apis() {
             "set_note",
             "delete_note",
             "set_format",
+            "set_borders",
             "merge_cells",
             "unmerge_cells",
             "add_sheet",

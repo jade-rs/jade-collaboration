@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use jade_collab_core::id::Id;
 use jade_docx_collab::{DocxModel, Paragraph, ParagraphStory, StoryId};
 use jade_pptx_collab::PptxModel;
-use jade_xlsx_collab::XlsxModel;
+use jade_xlsx_collab::{LineAxis, XlsxModel};
 use serde_json::{json, Value};
 
 /// A line's position among a table's rows or columns, by id.
@@ -141,7 +141,7 @@ fn anchors(model: &DocxModel, paragraph: &Paragraph) -> Value {
 
 /// What `read_document` reports for an xlsx view, without `seq`/`pending`:
 /// cells `start..start + limit` of the non-blank cells of every sheet in
-/// order.
+/// order, and each sheet's formats written through the collaboration.
 pub fn read_xlsx(model: &XlsxModel, start: usize, limit: usize) -> Value {
     let sheets = model.sheets();
     let cells: Vec<Vec<(String, Value)>> = sheets
@@ -172,11 +172,32 @@ pub fn read_xlsx(model: &XlsxModel, start: usize, limit: usize) -> Value {
                 .filter(|(i, _)| range.contains(&(offset + i)))
                 .map(|(_, cell)| cell)
                 .collect();
+            let formats: serde_json::Map<String, Value> = model
+                .formatted_cells(sheet.id)
+                .into_iter()
+                .map(|(reference, format)| {
+                    let format = serde_json::to_value(format).expect("formats serialize");
+                    (reference, format)
+                })
+                .collect();
+            let lines = |axis| -> serde_json::Map<String, Value> {
+                model
+                    .line_formats(sheet.id, axis)
+                    .into_iter()
+                    .map(|(label, format)| {
+                        let format = serde_json::to_value(format).expect("formats serialize");
+                        (label, format)
+                    })
+                    .collect()
+            };
             json!({
                 "name": sheet.name,
                 "rows": sheet.rows.len(),
                 "columns": sheet.columns.len(),
                 "cells": listed,
+                "formats": formats,
+                "row_formats": lines(LineAxis::Rows),
+                "column_formats": lines(LineAxis::Columns),
             })
         })
         .collect();

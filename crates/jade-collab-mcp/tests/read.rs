@@ -6,7 +6,7 @@
 mod common;
 
 use common::fixture;
-use jade_collab_mcp::read_docx;
+use jade_collab_mcp::{read_docx, read_xlsx};
 use jade_docx_collab::{DocxModel, JadeDocx};
 use serde_json::json;
 
@@ -48,4 +48,56 @@ fn read_document_names_note_and_text_box_paragraphs() {
     // "Cell C" places nothing.
     assert_eq!(paragraphs[6]["text"], json!("Cell C"));
     assert!(paragraphs[6].get("anchors").is_none());
+}
+
+/// An xlsx read lists, per sheet, the formats written through the
+/// collaboration — borders included — by A1 reference.
+#[test]
+fn read_document_lists_formats_and_borders_written_in_the_session() {
+    use jade_collab_core::id::{Id, ReplicaId};
+    use jade_collab_sync::{ApplyContext, Document};
+    use jade_xlsx_collab::intent::{resolve, XlsxIntent};
+    use jade_xlsx_collab::XlsxModel;
+
+    let mut model = XlsxModel::blank(&[("S", 3, 3)]);
+    let mut next = 100;
+    for intent in [
+        json!({ "type": "set_borders", "sheet": "S", "range": "A1:B1",
+                "borders": { "outline": { "style": "thin", "color": "FF0000" } } }),
+        json!({ "type": "set_format", "sheet": "S", "range": "C3", "change": { "bold": true } }),
+        json!({ "type": "set_format", "sheet": "S", "range": "B:B", "change": { "italic": true } }),
+        json!({ "type": "set_format", "sheet": "S", "range": "3:3", "change": { "fill_color": "FFFF00" } }),
+    ] {
+        let intent: XlsxIntent = serde_json::from_value(intent).unwrap();
+        let op = resolve(&model, &intent, &mut |n| {
+            next += n;
+            Id::new(next, ReplicaId(2))
+        })
+        .unwrap();
+        let ctx = ApplyContext {
+            origin: ReplicaId(2),
+            base_seq: 0,
+            seq: None,
+        };
+        model.apply(&op, &ctx).unwrap();
+    }
+    let read = read_xlsx(&model, 0, 100);
+    let line = json!({ "style": "thin", "color": "FF0000" });
+    assert_eq!(
+        read["sheets"][0]["formats"],
+        json!({
+            "A1": { "border_left": line, "border_top": line, "border_bottom": line },
+            "B1": { "border_right": line, "border_top": line, "border_bottom": line, "italic": true },
+            "C3": { "bold": true, "fill_color": "FFFF00" },
+        })
+    );
+    // Whole rows and columns are listed by their own labels.
+    assert_eq!(
+        read["sheets"][0]["column_formats"],
+        json!({ "B": { "italic": true } })
+    );
+    assert_eq!(
+        read["sheets"][0]["row_formats"],
+        json!({ "3": { "fill_color": "FFFF00" } })
+    );
 }
