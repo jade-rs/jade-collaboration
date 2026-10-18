@@ -610,6 +610,9 @@ pub enum DocxOp {
     ResolveComment { comment: Id, resolved: bool },
     /// Sequenced. Deleting a root deletes its replies.
     DeleteComment { comment: Id },
+    /// Sequenced. Replaces a live comment's text (root or reply); the last
+    /// replacement in log order wins.
+    UpdateComment { comment: Id, text: String },
 }
 
 /// An operation's consequence in jade terms: paragraphs by jade's story
@@ -723,6 +726,10 @@ pub enum DocxEffect {
     DeleteComment {
         comment: Id,
     },
+    UpdateComment {
+        comment: Id,
+        text: String,
+    },
 }
 
 #[derive(Default)]
@@ -774,6 +781,26 @@ fn fixed_paragraphs(story: StoryId) -> Result<(), Rejection> {
         )),
         _ => Ok(()),
     }
+}
+
+/// Refuses comment text jade would not read back from the file as written:
+/// it keeps the text as typed while the file is open, but reads line breaks
+/// back as spaces and trims the ends.
+fn comment_text(text: &str) -> Result<(), Rejection> {
+    if text.trim().is_empty() {
+        return Err(reject("a comment needs text"));
+    }
+    if text.trim() != text {
+        return Err(reject(
+            "a comment's text cannot start or end with whitespace: jade does not keep it",
+        ));
+    }
+    if text.chars().any(|c| c.is_control() && c != '\t') {
+        return Err(reject(
+            "a comment's text cannot hold line breaks or control characters: jade does not keep them",
+        ));
+    }
+    Ok(())
 }
 
 impl DocxModel {
@@ -1720,9 +1747,7 @@ impl DocxModel {
     }
 
     fn new_comment(&self, id: Id, content: &CommentContent) -> Result<(), Rejection> {
-        if content.text.trim().is_empty() {
-            return Err(reject("a comment needs text"));
-        }
+        comment_text(&content.text)?;
         if self.comments.contains_key(&id) {
             return Err(reject(format!("comment {id} already exists")));
         }
@@ -1821,6 +1846,20 @@ impl DocxModel {
         Ok(vec![DocxEffect::ResolveComment { comment, resolved }])
     }
 
+    fn update_comment(&mut self, comment: Id, text: &str) -> Result<Vec<DocxEffect>, Rejection> {
+        self.live_comment(comment)?;
+        comment_text(text)?;
+        self.comments
+            .get_mut(&comment)
+            .expect("checked")
+            .content
+            .text = text.to_string();
+        Ok(vec![DocxEffect::UpdateComment {
+            comment,
+            text: text.to_string(),
+        }])
+    }
+
     fn delete_comment(&mut self, comment: Id) -> Result<Vec<DocxEffect>, Rejection> {
         self.live_comment(comment)?;
         self.delete_thread(comment);
@@ -1889,7 +1928,8 @@ impl Document for DocxModel {
             | DocxOp::AddComment { .. }
             | DocxOp::ReplyToComment { .. }
             | DocxOp::ResolveComment { .. }
-            | DocxOp::DeleteComment { .. } => Lane::Sequenced,
+            | DocxOp::DeleteComment { .. }
+            | DocxOp::UpdateComment { .. } => Lane::Sequenced,
         }
     }
 
@@ -1953,6 +1993,7 @@ impl Document for DocxModel {
                 self.resolve_comment(*comment, *resolved)
             }
             DocxOp::DeleteComment { comment } => self.delete_comment(*comment),
+            DocxOp::UpdateComment { comment, text } => self.update_comment(*comment, text),
         }
     }
 

@@ -21,8 +21,8 @@ fn page(total: usize, start: usize, limit: usize) -> (std::ops::Range<usize>, Op
 
 /// What `read_document` reports for a docx view, without `seq`/`pending`:
 /// paragraphs `start..start + limit` — body, table cells, text boxes,
-/// footnotes and endnotes, in the order edits index them — and every
-/// top-level table.
+/// footnotes and endnotes, in the order edits index them — every live
+/// comment and every top-level table.
 pub fn read_docx(model: &DocxModel, start: usize, limit: usize) -> Value {
     let paragraphs = model.paragraphs();
     // A text box names its host by body paragraph; an agent needs the index.
@@ -96,6 +96,18 @@ pub fn read_docx(model: &DocxModel, start: usize, limit: usize) -> Value {
                 }
                 entry
             })
+            .collect::<Vec<_>>(),
+        "comments": model
+            .comments()
+            .iter()
+            .map(|c| json!({
+                "id": c.id.to_string(),
+                "file_id": c.file_id,
+                "reply_to": c.parent.map(|p| p.to_string()),
+                "text": c.content.text,
+                "author": c.content.author,
+                "resolved": c.resolved,
+            }))
             .collect::<Vec<_>>(),
         "tables": tables
             .iter()

@@ -117,6 +117,11 @@ pub enum IntentOp {
     DeleteComment {
         comment_id: String,
     },
+    /// Replaces a comment's text (a root or a reply).
+    UpdateComment {
+        comment_id: String,
+        text: String,
+    },
     /// Merges the rectangle of a top-level table's cells (zero-based rows and
     /// columns, as `read_document` lists them).
     MergeTableCells {
@@ -393,6 +398,9 @@ impl TryFrom<HeadlessCommand> for IntentOp {
                 resolved,
             }),
             HeadlessCommand::DeleteComment { comment_id } => Ok(Self::DeleteComment { comment_id }),
+            HeadlessCommand::UpdateComment { comment_id, text } => {
+                Ok(Self::UpdateComment { comment_id, text })
+            }
             other => Err(UnsupportedCommand {
                 command_name: other.name(),
                 lane,
@@ -736,6 +744,10 @@ pub fn resolve(
         }]),
         IntentOp::DeleteComment { comment_id } => Ok(vec![DocxOp::DeleteComment {
             comment: comment(view, comment_id)?,
+        }]),
+        IntentOp::UpdateComment { comment_id, text } => Ok(vec![DocxOp::UpdateComment {
+            comment: comment(view, comment_id)?,
+            text: text.clone(),
         }]),
         IntentOp::MergeTableCells {
             table,

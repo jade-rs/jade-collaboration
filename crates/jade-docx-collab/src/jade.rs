@@ -607,6 +607,10 @@ impl JadeDocx {
             DocxEffect::DeleteComment { comment } => HeadlessCommand::DeleteComment {
                 comment_id: self.jade_comment(model, comment)?,
             },
+            DocxEffect::UpdateComment { comment, text } => HeadlessCommand::UpdateComment {
+                comment_id: self.jade_comment(model, comment)?,
+                text,
+            },
         };
         self.run(command)
     }
@@ -633,6 +637,7 @@ impl Materializer<DocxModel> for JadeDocx {
                 | DocxOp::ReplyToComment { .. }
                 | DocxOp::ResolveComment { .. }
                 | DocxOp::DeleteComment { .. }
+                | DocxOp::UpdateComment { .. }
         ) {
             return self.preflight(model, op);
         }

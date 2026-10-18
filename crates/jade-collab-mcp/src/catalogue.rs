@@ -242,6 +242,10 @@ fn edits() -> Value {
                 edit("delete_comment", "docx: delete a comment (a thread root takes its replies).", json!({
                     "comment_id": string("The comment's id."),
                 }), &["comment_id"]),
+                edit("update_comment", "docx: replace a comment's text (a thread root or a reply).", json!({
+                    "comment_id": string("The comment's id."),
+                    "text": string("The new text: no line breaks, nor whitespace at either end."),
+                }), &["comment_id", "text"]),
                 edit("merge_table_cells", "docx: merge a rectangle of a top-level table's cells; the top-left cell shows their content, row by row.", json!({
                     "table": integer("The table's index (read_document lists them)."),
                     "top_row": integer("First row, zero-based."),
@@ -467,7 +471,7 @@ fn tools() -> Vec<Tool> {
         Tool {
             name: "read_document",
             title: "Read a document",
-            description: "Your current view, a page at a time. docx: paragraphs (index, text, which story — body, a table cell, a text box, a footnote or an endnote — and where its text boxes and note references sit) and the top-level tables; xlsx: every sheet's size and its non-blank cells in A1 form, paged over all sheets in order; pptx: slides (numbered from 1) with their shapes' numbers, text and geometry and the speaker notes. Your own unanswered edits are included.",
+            description: "Your current view, a page at a time. docx: paragraphs (index, text, which story — body, a table cell, a text box, a footnote or an endnote — and where its text boxes and note references sit), the comments and the top-level tables; xlsx: every sheet's size and its non-blank cells in A1 form, paged over all sheets in order; pptx: slides (numbered from 1) with their shapes' numbers, text and geometry and the speaker notes. Your own unanswered edits are included.",
             input: object("Arguments.", json!({
                 "session_id": session_id(),
                 "start": integer("First paragraph (docx), cell (xlsx) or slide (pptx, zero-based) to list; default 0."),
@@ -495,6 +499,18 @@ fn tools() -> Vec<Tool> {
                             "description": "Where it is: `{kind: body}`, `{kind: table_cell, table, row, column}` (zero-based), or `{kind: nested_table_cell}`.",
                         },
                     }), &["index", "text", "story"]),
+                },
+                "comments": {
+                    "type": "array",
+                    "description": "docx: every live comment, oldest first.",
+                    "items": object("A comment.", json!({
+                        "id": string("The id edits name it by (`lamport@rN`)."),
+                        "file_id": string("Its `w:id` in the file (edits take it too), or null while the server has not numbered it yet."),
+                        "reply_to": string("The id of the thread's root, or null for a root."),
+                        "text": string("Its text."),
+                        "author": string("Its author, or null."),
+                        "resolved": json!({ "type": "boolean", "description": "Whether its thread is resolved." }),
+                    }), &["id", "file_id", "reply_to", "text", "author", "resolved"]),
                 },
                 "tables": {
                     "type": "array",
