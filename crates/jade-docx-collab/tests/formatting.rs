@@ -328,6 +328,10 @@ fn formatting_and_comments_are_sequenced() {
             comment: id(3),
             resolved: true,
         },
+        DocxOp::UpdateComment {
+            comment: id(3),
+            text: "edited".into(),
+        },
         DocxOp::DeleteComment { comment: id(3) },
     ] {
         assert_eq!(DocxModel::lane(&op), Lane::Sequenced, "{op:?}");
@@ -605,6 +609,133 @@ fn resolving_and_deleting() {
 }
 
 #[test]
+fn comment_text_is_replaced_in_log_order() {
+    let mut model = DocxModel::from_paragraphs(&["abc"]);
+    let c = model.paragraphs()[0].chars.clone();
+    add_comment(&mut model, c[0], c[2], id(100), "root");
+    apply(
+        &mut model,
+        DocxOp::ReplyToComment {
+            comment: id(100),
+            id: id(101),
+            content: CommentContent {
+                text: "reply".into(),
+                author: Some("Bob".into()),
+                initials: Some("B".into()),
+                date: None,
+            },
+        },
+    );
+    for (comment, text) in [(id(100), "first"), (id(101), "answer"), (id(100), "second")] {
+        assert_eq!(
+            apply(
+                &mut model,
+                DocxOp::UpdateComment {
+                    comment,
+                    text: text.into()
+                }
+            ),
+            vec![DocxEffect::UpdateComment {
+                comment,
+                text: text.into()
+            }]
+        );
+    }
+    let comments = model.comments();
+    assert_eq!(comments[0].content.text, "second");
+    assert_eq!(comments[1].content.text, "answer");
+    // Only the text changes: author, thread and state stay.
+    assert_eq!(comments[1].content.author.as_deref(), Some("Bob"));
+    assert_eq!(comments[1].parent, Some(id(100)));
+
+    let before = model.clone();
+    for op in [
+        DocxOp::UpdateComment {
+            comment: id(7),
+            text: "unknown".into(),
+        },
+        DocxOp::UpdateComment {
+            comment: id(100),
+            text: " \t".into(),
+        },
+    ] {
+        assert!(model.apply(&op, &ctx()).is_err(), "{op:?} was accepted");
+        assert_eq!(model, before);
+    }
+    apply(&mut model, DocxOp::DeleteComment { comment: id(100) });
+    let op = DocxOp::UpdateComment {
+        comment: id(101),
+        text: "late".into(),
+    };
+    assert!(
+        model.apply(&op, &ctx()).is_err(),
+        "a deleted reply was edited"
+    );
+}
+
+/// jade keeps a comment's text as typed while the file is open, but reads
+/// it back from the file with line breaks turned into spaces and the ends
+/// trimmed; the model refuses such text everywhere, so a restored server and
+/// the replicas never disagree on it.
+#[test]
+fn comment_text_jade_cannot_read_back_is_refused() {
+    let mut model = DocxModel::from_paragraphs(&["abc"]);
+    let c = model.paragraphs()[0].chars.clone();
+    add_comment(&mut model, c[0], c[2], id(100), "root");
+    let before = model.clone();
+    for (n, text) in ["a\nb", "a\r\nb", " lead", "trail ", "x\u{0}y"]
+        .into_iter()
+        .enumerate()
+    {
+        let n = n as u64;
+        for op in [
+            DocxOp::AddComment {
+                story: StoryId::Body,
+                start: c[0],
+                end: c[1],
+                id: id(200 + n),
+                content: CommentContent::new(text),
+            },
+            DocxOp::ReplyToComment {
+                comment: id(100),
+                id: id(300 + n),
+                content: CommentContent::new(text),
+            },
+            DocxOp::UpdateComment {
+                comment: id(100),
+                text: text.into(),
+            },
+        ] {
+            assert!(model.apply(&op, &ctx()).is_err(), "{op:?} was accepted");
+            assert_eq!(model, before);
+        }
+    }
+    // Inner spaces and tabs survive.
+    apply(
+        &mut model,
+        DocxOp::UpdateComment {
+            comment: id(100),
+            text: "a  b\tc".into(),
+        },
+    );
+}
+
+#[test]
+fn update_comment_has_a_wire_format() {
+    let op: DocxOp = serde_json::from_str(
+        r#"{"type":"update_comment","comment":{"lamport":3,"replica":1},"text":"new"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        op,
+        DocxOp::UpdateComment {
+            comment: id(3),
+            text: "new".into()
+        }
+    );
+}
+
+#[test]
 fn the_model_round_trips_through_json_with_comments() {
     let mut model = DocxModel::from_paragraphs(&["abc"]);
     let c = model.paragraphs()[0].chars.clone();
@@ -719,12 +850,14 @@ proptest! {
     /// changes nothing.
     #[test]
     fn comment_threads_stay_well_formed(
-        steps in prop::collection::vec((0..4u8, any::<prop::sample::Index>(), any::<bool>()), 1..40),
+        steps in prop::collection::vec((0..5u8, any::<prop::sample::Index>(), any::<bool>()), 1..40),
     ) {
         let mut model = DocxModel::from_paragraphs(&["abcdef", "ghi"]);
         let chars: Vec<Id> = model.paragraphs().iter().flat_map(|p| p.chars.clone()).collect();
         let mut next = 1_000;
         let mut known: Vec<Id> = Vec::new();
+        // Each comment's text: the last one written, in log order.
+        let mut texts: std::collections::BTreeMap<Id, String> = Default::default();
         for (kind, pick, flag) in steps {
             next += 1;
             let op = match kind {
@@ -745,18 +878,32 @@ proptest! {
                     content: CommentContent::new("r"),
                 },
                 2 => DocxOp::ResolveComment { comment: *pick.get(&known), resolved: flag },
+                3 => DocxOp::UpdateComment {
+                    comment: *pick.get(&known),
+                    text: if flag { format!("edit {next}") } else { " ".into() },
+                },
                 _ => DocxOp::DeleteComment { comment: *pick.get(&known) },
             };
             let before = model.clone();
             match model.apply(&op, &ctx()) {
-                Ok(_) => {
-                    if let DocxOp::AddComment { id, .. } | DocxOp::ReplyToComment { id, .. } = op {
-                        known.push(id);
+                Ok(_) => match &op {
+                    DocxOp::AddComment { id, content, .. }
+                    | DocxOp::ReplyToComment { id, content, .. } => {
+                        known.push(*id);
+                        texts.insert(*id, content.text.clone());
                     }
-                }
+                    DocxOp::UpdateComment { comment, text } => {
+                        prop_assert!(flag, "blank text was accepted");
+                        texts.insert(*comment, text.clone());
+                    }
+                    _ => {}
+                },
                 Err(_) => prop_assert_eq!(&model, &before),
             }
             let live = model.comments();
+            for comment in &live {
+                prop_assert_eq!(&comment.content.text, &texts[&comment.id]);
+            }
             let roots: BTreeSet<Id> = live.iter().filter(|c| c.parent.is_none()).map(|c| c.id).collect();
             for comment in &live {
                 if let Some(parent) = comment.parent {

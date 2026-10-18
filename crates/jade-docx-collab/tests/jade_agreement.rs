@@ -768,6 +768,69 @@ fn comments_in_the_file_are_addressable_by_their_file_ids() {
     assert!(model.comments().is_empty());
 }
 
+/// Comment text is replaced in jade — for comments loaded with the file and
+/// made in the session, roots and replies — and survives an export.
+#[test]
+fn comment_text_is_edited_in_jade() {
+    let (mut model, mut jade) = open("comment.docx");
+    let mut next = model.max_lamport();
+    let mut ids = |n: u64| {
+        let id = Id::new(next + 1, ReplicaId(1));
+        next += n;
+        id
+    };
+    for (comment_id, text) in [("0", "root, edited"), ("1", "reply, edited")] {
+        let intent = IntentOp::UpdateComment {
+            comment_id: comment_id.into(),
+            text: text.into(),
+        };
+        for op in resolve(&model, &intent, &mut ids).unwrap() {
+            commit(&mut model, &mut jade, op);
+        }
+    }
+    let p = model.paragraphs();
+    let (root, reply) = (ids(1), ids(1));
+    commit(
+        &mut model,
+        &mut jade,
+        DocxOp::AddComment {
+            story: StoryId::Body,
+            start: p[0].chars[0],
+            end: p[0].chars[1],
+            id: root,
+            content: CommentContent::new("new"),
+        },
+    );
+    commit(
+        &mut model,
+        &mut jade,
+        DocxOp::ReplyToComment {
+            comment: root,
+            id: reply,
+            content: CommentContent::new("new reply"),
+        },
+    );
+    for (comment, text) in [(root, "新しい"), (reply, "answer  two"), (root, "last")] {
+        commit(
+            &mut model,
+            &mut jade,
+            DocxOp::UpdateComment {
+                comment,
+                text: text.into(),
+            },
+        );
+    }
+    let reloaded = JadeDocx::load(&jade.export().unwrap()).unwrap();
+    let texts: BTreeSet<String> = jade_comments(&reloaded)
+        .into_iter()
+        .map(|c| c.text)
+        .collect();
+    assert_eq!(
+        texts,
+        BTreeSet::from(["root, edited", "reply, edited", "last", "answer  two"].map(String::from))
+    );
+}
+
 /// The model cannot know that jade re-anchors a reply on the root's text;
 /// once that text is gone jade cannot place the reply, and `admit` refuses it
 /// instead of letting the server fault.

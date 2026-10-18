@@ -268,6 +268,7 @@ async fn advertised_edits_match_the_intent_apis() {
             "reply_to_comment",
             "resolve_comment",
             "delete_comment",
+            "update_comment",
             "merge_table_cells",
             "unmerge_table_cells"
         ]

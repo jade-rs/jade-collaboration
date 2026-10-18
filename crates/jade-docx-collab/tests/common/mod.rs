@@ -322,24 +322,27 @@ pub fn generate(view: &DocxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
             };
             resolve(view, &op, ids).ok()?.into_iter().next()
         }
-        // Answering or resolving a live comment.
+        // Answering, resolving or editing a live comment.
         20 => {
             let comments = view.comments();
             if comments.is_empty() {
                 return None;
             }
             let comment = comments[pick(comments.len(), 8)].id;
-            Some(if pick(2, 16) == 0 {
-                DocxOp::ReplyToComment {
+            Some(match pick(3, 16) {
+                0 => DocxOp::ReplyToComment {
                     comment,
                     id: ids(1),
                     content: CommentContent::new("reply"),
-                }
-            } else {
-                DocxOp::ResolveComment {
+                },
+                1 => DocxOp::UpdateComment {
+                    comment,
+                    text: ["edited", "直した", "a  b"][pick(3, 24)].to_string(),
+                },
+                _ => DocxOp::ResolveComment {
                     comment,
                     resolved: pick(3, 20) != 0,
-                }
+                },
             })
         }
         // Merging up to 2 × 2 cells of an editable table.
