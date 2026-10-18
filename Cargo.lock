@@ -1196,6 +1196,7 @@ dependencies = [
  "jade-xlsx-headless-api",
  "jade-xlsx-headless-editor",
  "jade-xlsx-reader",
+ "jade-xlsx-writer",
  "proptest",
  "serde",
  "serde_json",
