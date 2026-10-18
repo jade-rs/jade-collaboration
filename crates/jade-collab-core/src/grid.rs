@@ -179,6 +179,31 @@ impl Grid {
         &self.merges
     }
 
+    /// The merged region covering the alive cell (`row`, `column`); `None`
+    /// for a cell no merge covers, or a deleted or unknown line.
+    ///
+    /// Lines inserted between a merge's corners belong to it, so a row
+    /// inserted strictly inside a merge joins it and one inserted above its
+    /// top or below its bottom does not — Word's and Excel's rule — and a
+    /// deleted corner moves to the next alive line inward (Lean:
+    /// `Grid.insertRow_covers`, `Grid.deleteRow_covers`).
+    pub fn merge_at(&self, row: Id, column: Id) -> Option<&Merge> {
+        self.row_index(row)?;
+        self.column_index(column)?;
+        let inside = |lines: &[Line], from: Id, to: Id, id: Id| match (
+            position(lines, from),
+            position(lines, to),
+            position(lines, id),
+        ) {
+            (Some(a), Some(b), Some(i)) => a <= i && i <= b,
+            _ => false,
+        };
+        self.merges.iter().find(|m| {
+            inside(&self.rows, m.top, m.bottom, row)
+                && inside(&self.columns, m.left, m.right, column)
+        })
+    }
+
     /// Whether `op` would apply; exactly what [`Grid::apply`] would return.
     pub fn validate(&self, op: &GridOp) -> Result<(), GridError> {
         self.clone().apply(op)
