@@ -44,7 +44,7 @@ pub fn generate(view: &DocxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
     let paragraphs = view.paragraphs();
     let pick = |n: usize, salt: u32| ((choice >> salt) as usize) % n.max(1);
     let words = ["x", "日本", "é", "Lorem ", "  ", "ab"];
-    match choice % 22 {
+    match choice % 25 {
         // Typing at a random caret, through the index-addressed intent API.
         0..=4 => {
             let p = pick(paragraphs.len(), 8);
@@ -141,7 +141,7 @@ pub fn generate(view: &DocxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
             let table = editable[pick(editable.len(), 8)];
             let row = table.rows[pick(table.rows.len(), 12)];
             let column = table.columns[pick(table.columns.len(), 16)];
-            let op = match choice % 22 {
+            let op = match choice % 25 {
                 11 => GridOp::InsertRow {
                     id: ids(1),
                     after: (pick(3, 20) != 0).then_some(row),
@@ -228,6 +228,41 @@ pub fn generate(view: &DocxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
                     resolved: pick(3, 20) != 0,
                 }
             })
+        }
+        // Merging up to 2 × 2 cells of an editable table.
+        22 | 23 => {
+            let tables = view.tables();
+            let editable: Vec<(usize, _)> = tables
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| !t.locked)
+                .collect();
+            let (index, table) = editable.get(pick(editable.len(), 8))?;
+            let top = pick(table.rows.len(), 12);
+            let left = pick(table.columns.len(), 16);
+            let op = IntentOp::MergeTableCells {
+                table: *index,
+                top_row: top,
+                left_column: left,
+                bottom_row: (top + pick(2, 20)).min(table.rows.len() - 1),
+                right_column: (left + 1).min(table.columns.len() - 1),
+            };
+            resolve(view, &op, ids).ok()?.into_iter().next()
+        }
+        24 => {
+            let tables = view.tables();
+            let merged: Vec<(usize, (usize, usize, usize, usize))> = tables
+                .iter()
+                .enumerate()
+                .flat_map(|(i, t)| t.merges.iter().map(move |m| (i, *m)))
+                .collect();
+            let (table, (row, column, _, _)) = merged.get(pick(merged.len(), 8))?;
+            let op = IntentOp::UnmergeTableCells {
+                table: *table,
+                row: *row,
+                column: *column,
+            };
+            resolve(view, &op, ids).ok()?.into_iter().next()
         }
         _ => {
             let comments = view.comments();

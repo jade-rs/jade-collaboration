@@ -10,7 +10,7 @@ use jade_docx_document_core::headless_api::apply_headless_commands_to_document;
 use jade_docx_document_core::selection::TextPosition;
 use jade_docx_document_core::word_document::{DocxExportError, WordDocument};
 use jade_docx_document_core::Options;
-use jade_docx_headless_api::{HeadlessCommand, HeadlessEditRequest};
+use jade_docx_headless_api::{HeadlessCommand, HeadlessEditRequest, HeadlessTableCellSelection};
 
 use crate::model::{DocxEffect, DocxModel, DocxOp, FormatChange};
 
@@ -76,7 +76,7 @@ impl JadeDocx {
             .collect()
     }
 
-    /// (rows, widest row) of each top-level body table.
+    /// (rows, widest row in grid columns) of each top-level body table.
     pub fn table_shapes(&self) -> Vec<(usize, usize)> {
         let Some(body) = self.word.document.as_ref().and_then(|d| d.body.as_ref()) else {
             return Vec::new();
@@ -84,9 +84,19 @@ impl JadeDocx {
         body.elements
             .iter()
             .filter_map(|e| match e {
+                // Columns of the grid: a merged cell spans several.
                 BodyElement::Table(t) => Some((
                     t.rows.len(),
-                    t.rows.iter().map(|r| r.cells.len()).max().unwrap_or(0),
+                    t.rows
+                        .iter()
+                        .map(|r| {
+                            r.cells
+                                .iter()
+                                .map(|c| c.span.unwrap_or(1).max(1) as usize)
+                                .sum::<usize>()
+                        })
+                        .max()
+                        .unwrap_or(0),
                 )),
                 _ => None,
             })
@@ -341,6 +351,30 @@ impl JadeDocx {
             DocxEffect::DeleteTableColumn { table, column } => HeadlessCommand::DeleteTableColumn {
                 table_order_index: self.table_order_index(table)?,
                 column_index: column,
+            },
+            DocxEffect::MergeTableCells { table, cells } => HeadlessCommand::MergeTableCells {
+                table_order_index: self.table_order_index(table)?,
+                selected_cells: cells
+                    .into_iter()
+                    .map(|(row, column)| HeadlessTableCellSelection {
+                        row,
+                        column,
+                        column_span: 1,
+                    })
+                    .collect(),
+            },
+            DocxEffect::UnmergeTableCells {
+                table,
+                row,
+                column,
+                column_span,
+            } => HeadlessCommand::UnmergeTableCells {
+                table_order_index: self.table_order_index(table)?,
+                target_cells: vec![HeadlessTableCellSelection {
+                    row,
+                    column,
+                    column_span,
+                }],
             },
             DocxEffect::DeleteTable { table } => HeadlessCommand::DeleteTable {
                 table_order_index: self.table_order_index(table)?,

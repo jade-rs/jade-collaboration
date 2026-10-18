@@ -52,7 +52,10 @@ impl Session {
                 .admit(&self.model, &op)
                 .unwrap_or_else(|e| panic!("jade refused {op:?}: {e}"));
         }
-        let effect = self.model.apply(&op, &ctx).unwrap_or_else(|e| panic!("{op:?}: {e}"));
+        let effect = self
+            .model
+            .apply(&op, &ctx)
+            .unwrap_or_else(|e| panic!("{op:?}: {e}"));
         self.jade
             .materialize(&self.model, effect, &ctx)
             .unwrap_or_else(|e| panic!("{op:?}: {e}"));
@@ -106,7 +109,14 @@ fn first_table(model: &DocxModel) -> Id {
     model.tables()[0].id
 }
 
-fn region(rows: &[Id], columns: &[Id], top: usize, left: usize, bottom: usize, right: usize) -> Merge {
+fn region(
+    rows: &[Id],
+    columns: &[Id],
+    top: usize,
+    left: usize,
+    bottom: usize,
+    right: usize,
+) -> Merge {
     Merge {
         top: rows[top],
         left: columns[left],
@@ -119,18 +129,19 @@ fn region(rows: &[Id], columns: &[Id], top: usize, left: usize, bottom: usize, r
 fn merging_shows_the_covered_cells_in_the_top_left_one() {
     let mut s = Session::open("jade-core/hello.docx");
     let (table, rows, columns) = s.table();
-    s.step(DocxOp::Table {
+    s.step(DocxOp::MergeCells {
         table,
-        op: GridOp::Merge(region(&rows, &columns, 0, 0, 1, 1)),
+        merge: region(&rows, &columns, 0, 0, 1, 1),
+        first: Id::new(7_000_000, ReplicaId(3)),
     });
     let texts = s.model.paragraph_texts();
     // Row-major: r0c0, r0c1, r1c0, r1c1 all in the merged cell, then r0c2,
-    // then row 1's remaining cell r1c2 (r1c0's position is a follower with
-    // no paragraph), then row 2.
+    // then row 1's follower (one empty paragraph, as Word keeps it) and its
+    // remaining cell r1c2, then row 2.
     let at = texts.iter().position(|t| t == "r0c0").unwrap();
     assert_eq!(
-        texts[at..at + 9],
-        ["r0c0", "r0c1", "r1c0", "r1c1", "r0c2", "r1c2", "r2c0", "r2c1", "r2c2"]
+        texts[at..at + 10],
+        ["r0c0", "r0c1", "r1c0", "r1c1", "r0c2", "", "r1c2", "r2c0", "r2c1", "r2c2"]
     );
     let view = &s.model.tables()[0];
     assert!(!view.locked);
@@ -141,9 +152,10 @@ fn merging_shows_the_covered_cells_in_the_top_left_one() {
 fn text_typed_into_a_covered_cell_lands_in_the_merged_cell() {
     let mut s = Session::open("jade-core/hello.docx");
     let (table, rows, columns) = s.table();
-    s.step(DocxOp::Table {
+    s.step(DocxOp::MergeCells {
         table,
-        op: GridOp::Merge(region(&rows, &columns, 0, 0, 0, 1)),
+        merge: region(&rows, &columns, 0, 0, 0, 1),
+        first: Id::new(7_000_000, ReplicaId(3)),
     });
     // A replica that had not seen the merge types into r0c1.
     let story = StoryId::Cell {
@@ -151,7 +163,15 @@ fn text_typed_into_a_covered_cell_lands_in_the_merged_cell() {
         row: rows[0],
         column: columns[1],
     };
-    let end = s.model.paragraphs().iter().find(|p| p.story == story).unwrap().chars.last().copied();
+    let end = s
+        .model
+        .paragraphs()
+        .iter()
+        .find(|p| p.story == story)
+        .unwrap()
+        .chars
+        .last()
+        .copied();
     let first = s.reserve(1);
     s.step(DocxOp::InsertText {
         story,
@@ -166,9 +186,10 @@ fn text_typed_into_a_covered_cell_lands_in_the_merged_cell() {
 fn unmerging_keeps_the_content_and_frees_new_empty_cells() {
     let mut s = Session::open("jade-core/hello.docx");
     let (table, rows, columns) = s.table();
-    s.step(DocxOp::Table {
+    s.step(DocxOp::MergeCells {
         table,
-        op: GridOp::Merge(region(&rows, &columns, 1, 1, 2, 2)),
+        merge: region(&rows, &columns, 1, 1, 2, 2),
+        first: Id::new(7_000_000, ReplicaId(3)),
     });
     let first = s.reserve(3);
     s.step(DocxOp::UnmergeCells {
@@ -200,9 +221,10 @@ fn unmerging_keeps_the_content_and_frees_new_empty_cells() {
 fn rows_and_columns_through_a_merge_are_refused() {
     let mut s = Session::open("jade-core/hello.docx");
     let (table, rows, columns) = s.table();
-    s.step(DocxOp::Table {
+    s.step(DocxOp::MergeCells {
         table,
-        op: GridOp::Merge(region(&rows, &columns, 0, 0, 1, 1)),
+        merge: region(&rows, &columns, 0, 0, 1, 1),
+        first: Id::new(7_000_000, ReplicaId(3)),
     });
     let refused = |s: &mut Session, op: GridOp| {
         let before = s.model.clone();
@@ -223,16 +245,31 @@ fn rows_and_columns_through_a_merge_are_refused() {
         assert_eq!(s.model, before);
     };
     let id = s.id();
-    refused(&mut s, GridOp::InsertRow { id, after: Some(rows[0]) });
+    refused(
+        &mut s,
+        GridOp::InsertRow {
+            id,
+            after: Some(rows[0]),
+        },
+    );
     refused(&mut s, GridOp::DeleteRow { id: rows[1] });
     let id = s.id();
-    refused(&mut s, GridOp::InsertColumn { id, after: Some(columns[0]) });
+    refused(
+        &mut s,
+        GridOp::InsertColumn {
+            id,
+            after: Some(columns[0]),
+        },
+    );
     refused(&mut s, GridOp::DeleteColumn { id: columns[0] });
     // Outside the merge they still work.
     let id = s.id();
     s.step(DocxOp::Table {
         table,
-        op: GridOp::InsertRow { id, after: Some(rows[2]) },
+        op: GridOp::InsertRow {
+            id,
+            after: Some(rows[2]),
+        },
     });
 }
 
@@ -240,12 +277,19 @@ fn rows_and_columns_through_a_merge_are_refused() {
 fn tables_with_merges_in_the_file_load_unlocked() {
     let dir = jade_core().join("public/fixtures");
     let mut unlocked_with_merges = 0;
-    for name in ["table-complex-merged-continuations.docx", "merged-table-over-page.docx"] {
+    for name in [
+        "table-complex-merged-continuations.docx",
+        "merged-table-over-page.docx",
+    ] {
         if !dir.join(name).exists() {
             continue;
         }
         let (model, jade) = open(name);
-        assert_eq!(model.paragraph_texts(), jade.body_paragraph_texts(), "{name}");
+        assert_eq!(
+            model.paragraph_texts(),
+            jade.body_paragraph_texts(),
+            "{name}"
+        );
         unlocked_with_merges += model
             .tables()
             .iter()
@@ -267,7 +311,7 @@ proptest! {
     ) {
         let mut s = Session::open("jade-core/hello.docx");
         let (table, rows, columns) = s.table();
-        let merge = DocxOp::Table { table, op: GridOp::Merge(region(&rows, &columns, top, left, top + 1, left + 1)) };
+        let merge = DocxOp::MergeCells { table, merge: region(&rows, &columns, top, left, top + 1, left + 1), first: Id::new(7_000_000, ReplicaId(3)) };
         let edits: Vec<DocxOp> = cells
             .iter()
             .enumerate()

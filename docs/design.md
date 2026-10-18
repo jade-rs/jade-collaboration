@@ -136,7 +136,25 @@ cell in a deleted row still commutes — it lands in an invisible story.
 
 Merge regions are rectangles named by their corner row/column identifiers. The
 grid's validity predicate (all regions alive, well-formed and pairwise
-non-overlapping) is checked by the sequencer for every structural operation.
+non-overlapping) is checked by the sequencer for every structural operation;
+Lean proves that the grid's `apply` keeps it (`Grid.apply_preserves_valid`).
+
+**Merged cells in docx.** A table keeps every story it ever held, by
+identity, and separately *which stories each cell position shows* (jade's
+`w:tc` there). Merging (sequenced, `MergeCells`) changes only the latter, as
+Word and jade do: the top-left cell shows every covered cell's stories, row
+by row; each cell below it in its column becomes a follower showing a new
+empty story (Word keeps a paragraph in every `w:tc`); the other covered cells
+go. Unmerging (`UnmergeCells`) keeps what the merged cell shows and gives the
+cells it frees new empty stories. Because stories never move, text typed
+into any cell's story commutes with merging and unmerging — the property the
+client fast path needs (Lean: `CellCommute.cell_edit_comm_grid`; property
+test `merges_commute_with_cell_text`). Rows and columns may not be inserted
+or deleted through a merged region. Tables whose merges come from the file
+(`w:gridSpan`, `w:vMerge`) load unlocked; ragged or nested tables stay
+structurally read-only. A jade-core bug surfaced here — a merge wrote an
+empty paragraph into each follower's XML but not into the model, so a save
+added a paragraph — and is fixed in jade-rs/jade-core#12.
 
 ### Formatting and comments (`jade-docx-collab`)
 
@@ -452,9 +470,8 @@ Not yet:
   name it by); editing comment text; comments in notes and headers.
 * xlsx borders, whole-row/column formats, conditional formats and threaded
   comments; note authors are not modelled (jade records `jade`).
-* docx merged cells and structure of merged/ragged/nested tables (their
-  text is editable; the model already validates merges in `Grid`), text
-  boxes, notes, tracked changes.
+* docx structure of ragged and nested tables (their text is editable),
+  rows/columns through merged regions, text boxes, notes, tracked changes.
 * Excel table (ListObject) structure and header edits.
 * Durability and access, beyond what §8 covers: per-document permissions
   (a token is valid for every document), token rotation without a restart,

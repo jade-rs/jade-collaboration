@@ -267,7 +267,9 @@ async fn advertised_edits_match_the_intent_apis() {
             "add_comment",
             "reply_to_comment",
             "resolve_comment",
-            "delete_comment"
+            "delete_comment",
+            "merge_table_cells",
+            "unmerge_table_cells"
         ]
     );
     assert_eq!(

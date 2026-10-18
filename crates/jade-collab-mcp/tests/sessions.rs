@@ -255,7 +255,7 @@ async fn edits_the_document_refuses_are_reported_as_rejected() {
     let read = agent.read_all(&doc).await;
     assert_eq!(
         read["tables"],
-        json!([{ "index": 0, "rows": 1, "columns": 1, "locked": false }])
+        json!([{ "index": 0, "rows": 1, "columns": 1, "locked": false, "merges": [] }])
     );
     let stories: Vec<Value> = read["paragraphs"]
         .as_array()

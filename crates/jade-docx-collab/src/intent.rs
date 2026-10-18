@@ -15,6 +15,7 @@
 //! [`DocxModel::comments`] lists them) or, for a comment that came with the
 //! file, by jade's `w:id`.
 
+use jade_collab_core::grid::Merge;
 use jade_collab_core::id::Id;
 use jade_collab_sync::Lane;
 use jade_docx_headless_api::{HeadlessCommand, HeadlessDeleteDirection};
@@ -109,6 +110,21 @@ pub enum IntentOp {
     DeleteComment {
         comment_id: String,
     },
+    /// Merges the rectangle of a top-level table's cells (zero-based rows and
+    /// columns, as `read_document` lists them).
+    MergeTableCells {
+        table: usize,
+        top_row: usize,
+        left_column: usize,
+        bottom_row: usize,
+        right_column: usize,
+    },
+    /// Undoes the merge whose top-left cell is (`row`, `column`).
+    UnmergeTableCells {
+        table: usize,
+        row: usize,
+        column: usize,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -129,6 +145,10 @@ pub enum IntentError {
     InvalidFormat(String),
     #[error("no comment {0:?}")]
     NoSuchComment(String),
+    #[error("no top-level table {0}")]
+    NoSuchTable(usize),
+    #[error("cell ({row}, {column}) is outside the table or starts no merge")]
+    NoSuchCell { row: usize, column: usize },
 }
 
 /// A headless command with no collaborative intent form.
@@ -695,6 +715,58 @@ pub fn resolve(
         IntentOp::DeleteComment { comment_id } => Ok(vec![DocxOp::DeleteComment {
             comment: comment(view, comment_id)?,
         }]),
+        IntentOp::MergeTableCells {
+            table,
+            top_row,
+            left_column,
+            bottom_row,
+            right_column,
+        } => {
+            let t = view
+                .tables()
+                .into_iter()
+                .nth(*table)
+                .ok_or(IntentError::NoSuchTable(*table))?;
+            let outside = |row: usize, column: usize| IntentError::NoSuchCell { row, column };
+            let row = |r: usize, c: usize| t.rows.get(r).copied().ok_or(outside(r, c));
+            let column = |r: usize, c: usize| t.columns.get(c).copied().ok_or(outside(r, c));
+            let merge = Merge {
+                top: row(*top_row, *left_column)?,
+                left: column(*top_row, *left_column)?,
+                bottom: row(*bottom_row, *right_column)?,
+                right: column(*bottom_row, *right_column)?,
+            };
+            // One new story per follower: the cells below the top-left one.
+            let followers = bottom_row.saturating_sub(*top_row) as u64;
+            Ok(vec![DocxOp::MergeCells {
+                table: t.id,
+                merge,
+                first: ids(followers.max(1)),
+            }])
+        }
+        IntentOp::UnmergeTableCells { table, row, column } => {
+            let t = view
+                .tables()
+                .into_iter()
+                .nth(*table)
+                .ok_or(IntentError::NoSuchTable(*table))?;
+            let &(top, left, bottom, right) = t
+                .merges
+                .iter()
+                .find(|(top, left, _, _)| (*top, *left) == (*row, *column))
+                .ok_or(IntentError::NoSuchCell {
+                    row: *row,
+                    column: *column,
+                })?;
+            // One new story per cell the merge removed (all but its first column).
+            let freed = ((bottom - top + 1) * (right - left)) as u64;
+            Ok(vec![DocxOp::UnmergeCells {
+                table: t.id,
+                top: t.rows[top],
+                left: t.columns[left],
+                first: ids(freed.max(1)),
+            }])
+        }
     }
 }
 

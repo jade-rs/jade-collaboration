@@ -239,6 +239,18 @@ fn edits() -> Value {
                 edit("delete_comment", "docx: delete a comment (a thread root takes its replies).", json!({
                     "comment_id": string("The comment's id."),
                 }), &["comment_id"]),
+                edit("merge_table_cells", "docx: merge a rectangle of a top-level table's cells; the top-left cell shows their content, row by row.", json!({
+                    "table": integer("The table's index (read_document lists them)."),
+                    "top_row": integer("First row, zero-based."),
+                    "left_column": integer("First column, zero-based."),
+                    "bottom_row": integer("Last row (inclusive)."),
+                    "right_column": integer("Last column (inclusive)."),
+                }), &["table", "top_row", "left_column", "bottom_row", "right_column"]),
+                edit("unmerge_table_cells", "docx: undo the merge whose top-left cell is (row, column); the freed cells come back empty.", json!({
+                    "table": integer("The table's index."),
+                    "row": integer("The merge's first row, zero-based."),
+                    "column": integer("The merge's first column, zero-based."),
+                }), &["table", "row", "column"]),
                 edit("set_cell", "xlsx: store a value or formula in a cell.", json!({
                     "sheet": sheet(),
                     "reference": string("The cell, in A1 form (`B3`)."),
@@ -488,8 +500,12 @@ fn tools() -> Vec<Tool> {
                         "index": integer("Its order among top-level tables."),
                         "rows": integer("Row count."),
                         "columns": integer("Column count."),
-                        "locked": json!({ "type": "boolean", "description": "Merged, ragged or nested: its text is editable, its structure is not." }),
-                    }), &["index", "rows", "columns", "locked"]),
+                        "locked": json!({ "type": "boolean", "description": "Ragged or nested: its text is editable, its structure is not." }),
+                        "merges": {
+                            "type": "array",
+                            "description": "Merged regions: `{top, left, bottom, right}` zero-based rows and columns.",
+                        },
+                    }), &["index", "rows", "columns", "locked", "merges"]),
                 },
                 "cell_count": integer("xlsx: how many non-blank cells all sheets hold."),
                 "sheets": {

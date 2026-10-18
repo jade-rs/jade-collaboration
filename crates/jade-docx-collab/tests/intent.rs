@@ -847,3 +847,49 @@ proptest::proptest! {
         proptest::prop_assert_eq!(effects, expected);
     }
 }
+
+#[test]
+fn merge_and_unmerge_table_cells_by_position() {
+    use jade_docx_collab::{Anchor, StoryId};
+    let mut model = DocxModel::from_paragraphs(&["before", "after"]);
+    let mark = model.paragraphs()[0].mark.unwrap();
+    let ctx = ApplyContext {
+        origin: ReplicaId(7),
+        base_seq: 0,
+        seq: None,
+    };
+    let first = Id::new(500, ReplicaId(7));
+    model
+        .apply(
+            &DocxOp::InsertTable {
+                anchor: Anchor::After(mark),
+                id: first,
+                rows: vec![first.offset(1), first.offset(2)],
+                columns: vec![first.offset(3), first.offset(4)],
+            },
+            &ctx,
+        )
+        .unwrap();
+    run(
+        &mut model,
+        serde_json::from_str(r#"{"type":"merge_table_cells","table":0,"top_row":0,"left_column":0,"bottom_row":1,"right_column":1}"#).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(model.tables()[0].merges, vec![(0, 0, 1, 1)]);
+    assert!(run(
+        &mut model,
+        serde_json::from_str(r#"{"type":"merge_table_cells","table":3,"top_row":0,"left_column":0,"bottom_row":1,"right_column":1}"#).unwrap(),
+    )
+    .is_err());
+    run(
+        &mut model,
+        serde_json::from_str(r#"{"type":"unmerge_table_cells","table":0,"row":0,"column":0}"#)
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(model.tables()[0].merges.is_empty());
+    assert!(model
+        .paragraphs()
+        .iter()
+        .any(|p| matches!(p.story, StoryId::Split { .. })));
+}

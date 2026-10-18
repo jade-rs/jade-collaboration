@@ -34,9 +34,11 @@ pub fn read_docx(model: &DocxModel, start: usize, limit: usize) -> Value {
             (table.id, (index, lines(&table.rows), lines(&table.columns)))
         })
         .collect();
-    let story = |story: StoryId| match story {
-        StoryId::Body => json!({ "kind": "body" }),
-        StoryId::Cell { table, row, column } => {
+    // A cell's story is listed at the cell that shows it — after a merge,
+    // the merged cell.
+    let story = |story: StoryId| match model.cell_of(story) {
+        None => json!({ "kind": "body" }),
+        Some((table, row, column)) => {
             let at = positions.get(&table).and_then(|(index, rows, columns)| {
                 Some((*index, *rows.get(&row)?, *columns.get(&column)?))
             });
@@ -67,6 +69,9 @@ pub fn read_docx(model: &DocxModel, start: usize, limit: usize) -> Value {
                 "rows": t.rows.len(),
                 "columns": t.columns.len(),
                 "locked": t.locked,
+                "merges": t.merges.iter()
+                    .map(|(top, left, bottom, right)| json!({ "top": top, "left": left, "bottom": bottom, "right": right }))
+                    .collect::<Vec<_>>(),
             }))
             .collect::<Vec<_>>(),
     })

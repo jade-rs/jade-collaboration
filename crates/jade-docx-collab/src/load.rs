@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use jade_collab_core::grid::Grid;
+use jade_collab_core::grid::{Grid, Merge};
 use jade_collab_core::id::{Id, ReplicaId};
 use jade_collab_core::rga::Rga;
 use jade_docx_document_core::document::{BodyElement, Table as JadeTable};
@@ -87,45 +87,106 @@ impl Loader {
 
     fn table(&mut self, table: &JadeTable, top_level: bool) -> Id {
         let id = self.id();
-        let width = table.rows.iter().map(|r| r.cells.len()).max().unwrap_or(0);
-        let rows: Vec<Id> = table.rows.iter().map(|_| self.id()).collect();
-        let columns: Vec<Id> = (0..width.max(1)).map(|_| self.id()).collect();
-        let simple = top_level
-            && !table.rows.is_empty()
-            && table.columns.len() == width
-            && table.rows.iter().all(|row| {
-                row.cells.len() == width
-                    && row.grid_before.unwrap_or(0) == 0
-                    && row.grid_after.unwrap_or(0) == 0
-                    && row.cells.iter().all(|cell| {
-                        cell.span.unwrap_or(1) == 1
-                            && cell.vertical_merge.is_none()
-                            && !cell.blocks.is_empty()
-                            && cell
-                                .blocks
-                                .iter()
-                                .all(|b| matches!(b, BodyElement::Paragraph(_)))
+        match regular_layout(table).filter(|_| top_level) {
+            Some((width, merges)) => {
+                let rows: Vec<Id> = table.rows.iter().map(|_| self.id()).collect();
+                let columns: Vec<Id> = (0..width).map(|_| self.id()).collect();
+                let mut model = Table::new(&[], &[], false, top_level);
+                for (r, row) in table.rows.iter().enumerate() {
+                    let mut c = 0;
+                    for cell in &row.cells {
+                        let story = self.story(&cell.blocks, false);
+                        model.add_cell(rows[r], columns[c], story);
+                        c += span(cell);
+                    }
+                }
+                let merges = merges
+                    .into_iter()
+                    .map(|(top, left, bottom, right)| Merge {
+                        top: rows[top],
+                        left: columns[left],
+                        bottom: rows[bottom],
+                        right: columns[right],
                     })
-            });
-        let mut cells = BTreeMap::new();
-        for (row, jade_row) in rows.iter().zip(&table.rows) {
-            for (column, cell) in columns.iter().zip(&jade_row.cells) {
-                let story = self.story(&cell.blocks, false);
-                cells.insert((*row, *column), story);
+                    .collect();
+                model.grid = Grid::with_merges_unchecked(rows, columns, merges);
+                // Merges the file got wrong (overlapping) keep the table's
+                // structure read-only.
+                model.locked = model.grid.check_invariants().is_err();
+                self.tables.insert(id, model);
+            }
+            None => {
+                // Ragged, nested or not at the top level: cell text is
+                // editable, structure is not. Cells are placed by their
+                // index in the row, which is the order jade lists them in.
+                let width = table.rows.iter().map(|r| r.cells.len()).max().unwrap_or(0);
+                let rows: Vec<Id> = table.rows.iter().map(|_| self.id()).collect();
+                let columns: Vec<Id> = (0..width.max(1)).map(|_| self.id()).collect();
+                let mut model = Table::new(&[], &[], true, top_level);
+                for (row, jade_row) in rows.iter().zip(&table.rows) {
+                    for (column, cell) in columns.iter().zip(&jade_row.cells) {
+                        let story = self.story(&cell.blocks, false);
+                        model.add_cell(*row, *column, story);
+                    }
+                }
+                model.grid = Grid::new(rows, columns);
+                self.tables.insert(id, model);
             }
         }
-        self.tables.insert(
-            id,
-            Table {
-                grid: Grid::new(rows, columns),
-                cells,
-                locked: !simple,
-                deleted: false,
-                top_level,
-            },
-        );
         id
     }
+}
+
+fn span(cell: &jade_docx_document_core::document::TableCell) -> usize {
+    cell.span.unwrap_or(1).max(1) as usize
+}
+
+/// (top, left, bottom, right) indices of a merged region.
+type Region = (usize, usize, usize, usize);
+
+/// For a table whose rows all fill the same grid with cells holding only
+/// paragraphs: the grid width and its merged regions as (top, left, bottom,
+/// right) indices — `w:gridSpan` across, `w:vMerge` restart/continue down.
+/// `None` for anything else.
+fn regular_layout(table: &JadeTable) -> Option<(usize, Vec<Region>)> {
+    let width = table.columns.len();
+    if table.rows.is_empty() || width == 0 {
+        return None;
+    }
+    let mut merges: Vec<Region> = Vec::new();
+    for (r, row) in table.rows.iter().enumerate() {
+        if row.grid_before.unwrap_or(0) != 0 || row.grid_after.unwrap_or(0) != 0 {
+            return None;
+        }
+        let mut c = 0;
+        for cell in &row.cells {
+            if !cell
+                .blocks
+                .iter()
+                .all(|b| matches!(b, BodyElement::Paragraph(_)))
+            {
+                return None;
+            }
+            let right = c + span(cell) - 1;
+            match cell.vertical_merge.as_deref() {
+                Some("continue") => {
+                    let above = merges
+                        .iter_mut()
+                        .find(|m| m.1 == c && m.3 == right && m.2 + 1 == r)?;
+                    above.2 = r;
+                }
+                Some(_) => merges.push((r, c, r, right)),
+                None if right > c => merges.push((r, c, r, right)),
+                None => {}
+            }
+            c = right + 1;
+        }
+        if c != width {
+            return None;
+        }
+    }
+    merges.retain(|(top, left, bottom, right)| (bottom - top + 1) * (right - left + 1) >= 2);
+    Some((width, merges))
 }
 
 impl Loader {

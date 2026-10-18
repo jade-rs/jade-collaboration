@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use jade_collab_core::grid::{Grid, GridOp};
+use jade_collab_core::grid::{Grid, GridOp, Merge};
 use jade_collab_core::id::{Id, ReplicaId};
 use jade_collab_core::rga::Rga;
 use jade_collab_sync::{ApplyContext, Document, Lane, Rejection};
@@ -22,7 +22,18 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StoryId {
     Body,
-    Cell { table: Id, row: Id, column: Id },
+    /// The story a table cell was created with. It keeps its identity when
+    /// a merge shows it inside another cell.
+    Cell {
+        table: Id,
+        row: Id,
+        column: Id,
+    },
+    /// A story an unmerge created for a cell it freed.
+    Split {
+        table: Id,
+        id: Id,
+    },
 }
 
 /// Where a block sits in its story.
@@ -76,15 +87,102 @@ pub(crate) enum Block {
     Opaque,
 }
 
+/// A table's story, by identity: the one a cell was created with, or one an
+/// unmerge created.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum StoryKey {
+    Cell(Id, Id),
+    Split(Id),
+}
+
+/// A table: its grid (rows, columns, merges), every story it ever held, and
+/// which stories each cell position shows.
+///
+/// Stories never move: a merge changes which position shows them, not
+/// where they live, so text typed into a cell's story commutes with merging
+/// and unmerging (Lean: `CellCommute.cell_edit_comm_grid`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Table {
     pub(crate) grid: Grid,
     #[serde(with = "pairs")]
-    pub(crate) cells: BTreeMap<(Id, Id), Story>,
-    /// Merged, ragged or nested tables: cell text is editable, structure is not.
+    pub(crate) stories: BTreeMap<StoryKey, Story>,
+    /// The stories each cell position shows, in order — jade's `w:tc` at that
+    /// position. A position a horizontal merge covers has no entry (jade has
+    /// no cell there); a vertical merge's follower shows nothing (jade
+    /// cleared it) or, loaded from a file, what the file had there.
+    #[serde(with = "pairs")]
+    pub(crate) layout: BTreeMap<(Id, Id), Vec<StoryKey>>,
+    /// Ragged or nested tables, or ones not at the top level: cell text is
+    /// editable, structure is not.
     pub(crate) locked: bool,
     pub(crate) deleted: bool,
     pub(crate) top_level: bool,
+}
+
+impl Table {
+    /// A grid of single cells, each showing its own new story.
+    pub(crate) fn new(rows: &[Id], columns: &[Id], locked: bool, top_level: bool) -> Self {
+        let mut table = Self {
+            grid: Grid::new(rows.iter().copied(), columns.iter().copied()),
+            stories: BTreeMap::new(),
+            layout: BTreeMap::new(),
+            locked,
+            deleted: false,
+            top_level,
+        };
+        for row in rows {
+            for column in columns {
+                table.add_cell(*row, *column, Story::empty_paragraph());
+            }
+        }
+        table
+    }
+
+    pub(crate) fn add_cell(&mut self, row: Id, column: Id, story: Story) {
+        let key = StoryKey::Cell(row, column);
+        self.stories.insert(key, story);
+        self.layout.insert((row, column), vec![key]);
+    }
+
+    /// Alive (row, column) positions of `merge`, row by row.
+    fn positions(&self, merge: &Merge) -> Vec<(Id, Id)> {
+        let between = |lines: Vec<Id>, first: Id, last: Id| {
+            let a = lines.iter().position(|l| *l == first);
+            let b = lines.iter().position(|l| *l == last);
+            match (a, b) {
+                (Some(a), Some(b)) if a <= b => lines[a..=b].to_vec(),
+                _ => Vec::new(),
+            }
+        };
+        let rows = between(self.grid.rows(), merge.top, merge.bottom);
+        let columns = between(self.grid.columns(), merge.left, merge.right);
+        rows.iter()
+            .flat_map(|r| columns.iter().map(move |c| (*r, *c)))
+            .collect()
+    }
+
+    /// (top, left, bottom, right) alive indices of every merge.
+    fn merge_indices(&self) -> Vec<(usize, usize, usize, usize)> {
+        self.grid
+            .merges()
+            .iter()
+            .filter_map(|m| {
+                Some((
+                    self.grid.row_index(m.top)?,
+                    self.grid.column_index(m.left)?,
+                    self.grid.row_index(m.bottom)?,
+                    self.grid.column_index(m.right)?,
+                ))
+            })
+            .collect()
+    }
+}
+
+fn story_id(table: Id, key: StoryKey) -> StoryId {
+    match key {
+        StoryKey::Cell(row, column) => StoryId::Cell { table, row, column },
+        StoryKey::Split(id) => StoryId::Split { table, id },
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -340,6 +438,9 @@ pub struct TableView {
     pub rows: Vec<Id>,
     pub columns: Vec<Id>,
     pub locked: bool,
+    /// Merged regions as (top, left, bottom, right) indices into `rows` and
+    /// `columns`.
+    pub merges: Vec<(usize, usize, usize, usize)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -373,6 +474,20 @@ pub enum DocxOp {
     },
     /// Sequenced. Row and column structure of a top-level table.
     Table { table: Id, op: GridOp },
+    /// Sequenced. Merges a rectangle of cells as Word and jade do: the
+    /// top-left cell shows every covered cell's content, row by row; each
+    /// cell below it in its column becomes an empty follower with a new
+    /// story `first`, `first.offset(1)`, … (top to bottom).
+    MergeCells { table: Id, merge: Merge, first: Id },
+    /// Sequenced. Undoes the merge whose top-left cell is (`top`, `left`); the
+    /// cells it frees get new empty stories `first`, `first.offset(1)`, …
+    /// (row by row, skipping the merge's first column).
+    UnmergeCells {
+        table: Id,
+        top: Id,
+        left: Id,
+        first: Id,
+    },
     /// Sequenced.
     DeleteTable { table: Id },
     /// Sequenced. Formats the atoms from `start` through `end` (characters,
@@ -458,6 +573,17 @@ pub enum DocxEffect {
     DeleteTableColumn {
         table: usize,
         column: usize,
+    },
+    /// Merge the cells at these (row, column) indices into the first one.
+    MergeTableCells {
+        table: usize,
+        cells: Vec<(usize, usize)>,
+    },
+    UnmergeTableCells {
+        table: usize,
+        row: usize,
+        column: usize,
+        column_span: usize,
     },
     DeleteTable {
         table: usize,
@@ -603,17 +729,13 @@ impl DocxModel {
                     rows: rows.clone(),
                     columns: columns.clone(),
                     locked: table.locked,
+                    merges: table.merge_indices(),
                 });
             }
             for &row in &rows {
                 for &column in &columns {
-                    if let Some(cell) = table.cells.get(&(row, column)) {
-                        let cell_id = StoryId::Cell {
-                            table: table_id,
-                            row,
-                            column,
-                        };
-                        self.walk_story(cell_id, cell, out);
+                    for key in table.layout.get(&(row, column)).into_iter().flatten() {
+                        self.walk_story(story_id(table_id, *key), &table.stories[key], out);
                     }
                 }
             }
@@ -637,18 +759,46 @@ impl DocxModel {
     pub(crate) fn story(&self, id: StoryId) -> Option<&Story> {
         match id {
             StoryId::Body => Some(&self.body),
-            StoryId::Cell { table, row, column } => {
-                self.tables.get(&table)?.cells.get(&(row, column))
+            StoryId::Cell { table, row, column } => self
+                .tables
+                .get(&table)?
+                .stories
+                .get(&StoryKey::Cell(row, column)),
+            StoryId::Split { table, id } => {
+                self.tables.get(&table)?.stories.get(&StoryKey::Split(id))
             }
         }
+    }
+
+    /// The table cell position (table, row, column) whose `w:tc` shows
+    /// `story`: its own, or the merged cell it is shown in.
+    pub fn cell_of(&self, story: StoryId) -> Option<(Id, Id, Id)> {
+        let (table, key) = match story {
+            StoryId::Body => return None,
+            StoryId::Cell { table, row, column } => (table, StoryKey::Cell(row, column)),
+            StoryId::Split { table, id } => (table, StoryKey::Split(id)),
+        };
+        self.tables
+            .get(&table)?
+            .layout
+            .iter()
+            .find(|(_, keys)| keys.contains(&key))
+            .map(|((row, column), _)| (table, *row, *column))
     }
 
     fn story_mut(&mut self, id: StoryId) -> Option<&mut Story> {
         match id {
             StoryId::Body => Some(&mut self.body),
-            StoryId::Cell { table, row, column } => {
-                self.tables.get_mut(&table)?.cells.get_mut(&(row, column))
-            }
+            StoryId::Cell { table, row, column } => self
+                .tables
+                .get_mut(&table)?
+                .stories
+                .get_mut(&StoryKey::Cell(row, column)),
+            StoryId::Split { table, id } => self
+                .tables
+                .get_mut(&table)?
+                .stories
+                .get_mut(&StoryKey::Split(id)),
         }
     }
 
@@ -879,24 +1029,8 @@ impl DocxModel {
                 return Err(reject("split the last paragraph to place a table after it"))
             }
         };
-        let cells = rows
-            .iter()
-            .flat_map(|r| {
-                columns
-                    .iter()
-                    .map(move |c| ((*r, *c), Story::empty_paragraph()))
-            })
-            .collect();
-        self.tables.insert(
-            id,
-            Table {
-                grid: Grid::new(rows.iter().copied(), columns.iter().copied()),
-                cells,
-                locked: false,
-                deleted: false,
-                top_level: true,
-            },
-        );
+        self.tables
+            .insert(id, Table::new(rows, columns, false, true));
         let placed = Placed {
             anchor,
             block: Block::Table(id),
@@ -938,66 +1072,208 @@ impl DocxModel {
         let (table, order) = self.structural_table(table_id)?;
         if table.locked {
             return Err(reject(
-                "this table has merged, ragged or nested cells; its structure is read-only",
+                "this table has ragged or nested cells; its structure is read-only",
             ));
         }
-        let before = (
-            match op {
-                GridOp::DeleteRow { id } => table.grid.row_index(*id),
-                GridOp::DeleteColumn { id } => table.grid.column_index(*id),
-                _ => None,
-            },
-            table.grid.all_rows(),
-            table.grid.all_columns(),
-        );
-        let table = self.tables.get_mut(&table_id).expect("checked");
-        let effect = match op {
-            GridOp::Merge(_) | GridOp::Unmerge { .. } => {
-                return Err(reject("merged cells are not supported for docx yet"))
+        if let GridOp::Merge(_) | GridOp::Unmerge { .. } = op {
+            return Err(reject(
+                "merge and unmerge cells with merge_cells / unmerge_cells",
+            ));
+        }
+        // Rows and columns stay clear of merged regions: jade would have to
+        // split or grow the merge, which the model does not follow.
+        let mut grid = table.grid.clone();
+        let deleted_at = match op {
+            GridOp::DeleteRow { id } => table.grid.row_index(*id),
+            GridOp::DeleteColumn { id } => table.grid.column_index(*id),
+            _ => None,
+        };
+        grid.apply(op)?;
+        let rows_axis = matches!(op, GridOp::InsertRow { .. } | GridOp::DeleteRow { .. });
+        let at = match op {
+            GridOp::InsertRow { id, .. } => grid.row_index(*id),
+            GridOp::InsertColumn { id, .. } => grid.column_index(*id),
+            _ => deleted_at,
+        }
+        .expect("the grid validated the line");
+        let inserted = matches!(op, GridOp::InsertRow { .. } | GridOp::InsertColumn { .. });
+        let merges = table.merge_indices();
+        let span = |(top, left, bottom, right): (usize, usize, usize, usize)| {
+            if rows_axis {
+                (top, bottom)
+            } else {
+                (left, right)
             }
+        };
+        let through = merges.iter().any(|m| {
+            let (first, last) = span(*m);
+            if inserted {
+                first < at && at <= last
+            } else {
+                first <= at && at <= last
+            }
+        });
+        if through {
+            return Err(reject("rows and columns cannot go through merged cells"));
+        }
+        // A new line copies its neighbour's formatting, unless the neighbour
+        // is part of a merge (jade would copy its spans).
+        let template = at.checked_sub(1).filter(|i| {
+            !merges.iter().any(|m| {
+                let (first, last) = span(*m);
+                first <= *i && *i <= last
+            })
+        });
+        let (all_rows, all_columns) = (table.grid.all_rows(), table.grid.all_columns());
+        let table = self.tables.get_mut(&table_id).expect("checked");
+        table.grid = grid;
+        let effect = match op {
             GridOp::InsertRow { id, .. } => {
-                table.grid.apply(op)?;
-                for column in &before.2 {
-                    table.cells.insert((*id, *column), Story::empty_paragraph());
+                for column in &all_columns {
+                    table.add_cell(*id, *column, Story::empty_paragraph());
                 }
-                let row = table.grid.row_index(*id).expect("just inserted");
                 DocxEffect::InsertTableRow {
                     table: order,
-                    row,
-                    template: row.checked_sub(1),
+                    row: at,
+                    template,
                 }
             }
             GridOp::InsertColumn { id, .. } => {
-                table.grid.apply(op)?;
-                for row in &before.1 {
-                    table.cells.insert((*row, *id), Story::empty_paragraph());
+                for row in &all_rows {
+                    table.add_cell(*row, *id, Story::empty_paragraph());
                 }
-                let column = table.grid.column_index(*id).expect("just inserted");
                 DocxEffect::InsertTableColumn {
                     table: order,
-                    column,
-                    template: column.checked_sub(1),
+                    column: at,
+                    template,
                 }
             }
-            GridOp::DeleteRow { .. } => {
-                table.grid.apply(op)?;
-                DocxEffect::DeleteTableRow {
-                    table: order,
-                    row: before.0.expect("validated by the grid"),
-                }
-            }
-            GridOp::DeleteColumn { .. } => {
-                table.grid.apply(op)?;
-                DocxEffect::DeleteTableColumn {
-                    table: order,
-                    column: before.0.expect("validated by the grid"),
-                }
-            }
+            GridOp::DeleteRow { .. } => DocxEffect::DeleteTableRow {
+                table: order,
+                row: at,
+            },
+            GridOp::DeleteColumn { .. } => DocxEffect::DeleteTableColumn {
+                table: order,
+                column: at,
+            },
+            GridOp::Merge(_) | GridOp::Unmerge { .. } => unreachable!("handled above"),
         };
         if let GridOp::InsertRow { id, .. } | GridOp::InsertColumn { id, .. } = op {
             self.observe([*id]);
         }
         Ok(vec![effect])
+    }
+
+    /// Merges `merge` as jade does: the top-left cell shows every covered
+    /// cell's stories, row by row; the cells below it in its column stay as
+    /// empty followers; the other covered cells go.
+    fn merge_cells(
+        &mut self,
+        table_id: Id,
+        merge: &Merge,
+        first: Id,
+    ) -> Result<Vec<DocxEffect>, Rejection> {
+        let (table, order) = self.structural_table(table_id)?;
+        if table.locked {
+            return Err(reject("this table's structure is read-only"));
+        }
+        let mut grid = table.grid.clone();
+        grid.apply(&GridOp::Merge(*merge))?;
+        let positions = table.positions(merge);
+        if positions.iter().any(|p| !table.layout.contains_key(p)) {
+            return Err(reject("only whole cells can be merged"));
+        }
+        let cells = positions
+            .iter()
+            .map(|(row, column)| {
+                (
+                    table.grid.row_index(*row).expect("alive"),
+                    table.grid.column_index(*column).expect("alive"),
+                )
+            })
+            .collect();
+        let followers = positions
+            .iter()
+            .filter(|p| p.1 == merge.left && p.0 != merge.top)
+            .count();
+        let fresh = |k: usize| first.offset(k as u64);
+        if (0..followers).any(|k| table.stories.contains_key(&StoryKey::Split(fresh(k)))) {
+            return Err(reject(format!("story id {first} is taken")));
+        }
+        let table = self.tables.get_mut(&table_id).expect("checked");
+        table.grid = grid;
+        let master = (merge.top, merge.left);
+        let shown: Vec<StoryKey> = positions
+            .iter()
+            .flat_map(|p| table.layout.get(p).cloned().unwrap_or_default())
+            .collect();
+        let mut k = 0;
+        for position in &positions {
+            if *position == master {
+                table.layout.insert(master, shown.clone());
+            } else if position.1 == merge.left {
+                let key = StoryKey::Split(fresh(k));
+                k += 1;
+                table.stories.insert(key, Story::empty_paragraph());
+                table.layout.insert(*position, vec![key]);
+            } else {
+                table.layout.remove(position);
+            }
+        }
+        if followers > 0 {
+            self.observe([fresh(followers - 1)]);
+        }
+        Ok(vec![DocxEffect::MergeTableCells {
+            table: order,
+            cells,
+        }])
+    }
+
+    /// Undoes the merge whose top-left cell is (`top`, `left`): what the
+    /// merged cell shows stays there; the cells the merge removed come back
+    /// with new empty stories `first`, `first.offset(1)`, … (row by row).
+    fn unmerge_cells(
+        &mut self,
+        table_id: Id,
+        top: Id,
+        left: Id,
+        first: Id,
+    ) -> Result<Vec<DocxEffect>, Rejection> {
+        let (table, order) = self.structural_table(table_id)?;
+        if table.locked {
+            return Err(reject("this table's structure is read-only"));
+        }
+        let merge = *table
+            .grid
+            .merges()
+            .iter()
+            .find(|m| m.top == top && m.left == left)
+            .ok_or_else(|| reject("no merged region starts at that cell"))?;
+        let positions = table.positions(&merge);
+        let freed: Vec<(Id, Id)> = positions.iter().copied().filter(|p| p.1 != left).collect();
+        let fresh = |k: usize| first.offset(k as u64);
+        if (0..freed.len()).any(|k| table.stories.contains_key(&StoryKey::Split(fresh(k)))) {
+            return Err(reject(format!("story id {first} is taken")));
+        }
+        let row = table.grid.row_index(top).expect("alive");
+        let column = table.grid.column_index(left).expect("alive");
+        let width = positions.iter().filter(|p| p.0 == top).count();
+        let table = self.tables.get_mut(&table_id).expect("checked");
+        table.grid.apply(&GridOp::Unmerge { top, left })?;
+        for (k, position) in freed.iter().enumerate() {
+            let key = StoryKey::Split(fresh(k));
+            table.stories.insert(key, Story::empty_paragraph());
+            table.layout.insert(*position, vec![key]);
+        }
+        if !freed.is_empty() {
+            self.observe([fresh(freed.len() - 1)]);
+        }
+        Ok(vec![DocxEffect::UnmergeTableCells {
+            table: order,
+            row,
+            column,
+            column_span: width,
+        }])
     }
 
     /// The visible atoms of `story` from `start` through `end`, in order —
@@ -1264,6 +1540,8 @@ impl Document for DocxModel {
             DocxOp::JoinParagraph { .. }
             | DocxOp::InsertTable { .. }
             | DocxOp::Table { .. }
+            | DocxOp::MergeCells { .. }
+            | DocxOp::UnmergeCells { .. }
             | DocxOp::DeleteTable { .. }
             | DocxOp::Format { .. }
             | DocxOp::AddComment { .. }
@@ -1295,6 +1573,17 @@ impl Document for DocxModel {
                 self.drop_comments_in_removed_cells();
                 Ok(effects)
             }
+            DocxOp::MergeCells {
+                table,
+                merge,
+                first,
+            } => self.merge_cells(*table, merge, *first),
+            DocxOp::UnmergeCells {
+                table,
+                top,
+                left,
+                first,
+            } => self.unmerge_cells(*table, *top, *left, *first),
             DocxOp::DeleteTable { table } => {
                 let effects = self.delete_table(*table)?;
                 self.drop_comments_in_removed_cells();
