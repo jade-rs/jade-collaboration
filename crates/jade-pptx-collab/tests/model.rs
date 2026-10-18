@@ -6,8 +6,8 @@
 use jade_collab_core::id::{Id, ReplicaId};
 use jade_collab_sync::{ApplyContext, Document, Lane};
 use jade_pptx_collab::{
-    Geometry, GeometryEdit, PptxEffect, PptxModel, PptxOp, ShapeKind, ShapeRef, SlideView,
-    StoryId, TextTarget,
+    Geometry, GeometryEdit, PptxEffect, PptxModel, PptxOp, ShapeKind, ShapeRef, SlideView, StoryId,
+    TextTarget,
 };
 use proptest::prelude::*;
 
@@ -468,10 +468,7 @@ fn slides_are_inserted_moved_and_deleted_by_id() {
             after: Some(id(1)),
         },
         PptxOp::DeleteSlide { slide: id(1) },
-        PptxOp::InsertSlide {
-            id: a,
-            after: None,
-        },
+        PptxOp::InsertSlide { id: a, after: None },
     ] {
         assert!(model.apply(&op, &at(1, 5, Some(6))).is_err(), "{op:?}");
     }
@@ -723,7 +720,10 @@ fn a_text_box_is_an_empty_editable_shape_on_top() {
         PptxOp::InsertTextBox {
             slide: slides[1].id,
             id: id(2),
-            geometry: Geometry { width: 0, ..geometry },
+            geometry: Geometry {
+                width: 0,
+                ..geometry
+            },
         },
         PptxOp::InsertTextBox {
             slide: id(77),
@@ -856,12 +856,11 @@ fn geometry_attributes_are_independent_registers() {
             &at(2, 0, Some(2)),
         )
         .unwrap();
-    let resized = Geometry {
-        width: 50,
-        ..moved
-    };
+    let resized = Geometry { width: 50, ..moved };
     assert_eq!(model.slides()[0].shapes[0].geometry, Some(resized));
-    assert!(matches!(&effect[..], [PptxEffect::SetTransform { geometry, .. }] if *geometry == resized));
+    assert!(
+        matches!(&effect[..], [PptxEffect::SetTransform { geometry, .. }] if *geometry == resized)
+    );
     // Nothing newer: no effect.
     let effect = model
         .apply(

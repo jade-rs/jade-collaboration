@@ -79,13 +79,22 @@ fn rejects_what_the_view_does_not_have() {
     let model = PptxModel::from_texts(&[&["日本"]]);
     let mut ids = |_| Id::new(1, ReplicaId(7));
     let cases = [
-        (insert(0, Target::Shape(2), 0, 0, "x"), IntentError::NoSuchSlide(0)),
-        (insert(2, Target::Shape(2), 0, 0, "x"), IntentError::NoSuchSlide(2)),
+        (
+            insert(0, Target::Shape(2), 0, 0, "x"),
+            IntentError::NoSuchSlide(0),
+        ),
+        (
+            insert(2, Target::Shape(2), 0, 0, "x"),
+            IntentError::NoSuchSlide(2),
+        ),
         (
             insert(1, Target::Shape(9), 0, 0, "x"),
             IntentError::NoSuchShape { slide: 1, shape: 9 },
         ),
-        (insert(1, Target::Shape(2), 1, 0, "x"), IntentError::NoSuchParagraph(1)),
+        (
+            insert(1, Target::Shape(2), 1, 0, "x"),
+            IntentError::NoSuchParagraph(1),
+        ),
         (
             insert(1, Target::Shape(2), 0, 1, "x"),
             IntentError::BadOffset {
@@ -257,17 +266,16 @@ fn text_boxes_geometry_and_deletion_by_shape_id() {
     .unwrap();
     let geometry = model.slides()[0].shapes.last().unwrap().geometry.unwrap();
     assert_eq!(
-        (geometry.x, geometry.y, geometry.width, geometry.height, geometry.rotation),
+        (
+            geometry.x,
+            geometry.y,
+            geometry.width,
+            geometry.height,
+            geometry.rotation
+        ),
         (5, 200, 300, 6, 5_400_000)
     );
-    run(
-        &mut model,
-        PptxIntent::DeleteShape {
-            slide: 1,
-            shape: 2,
-        },
-    )
-    .unwrap();
+    run(&mut model, PptxIntent::DeleteShape { slide: 1, shape: 2 }).unwrap();
     assert_eq!(texts(&model), [vec!["new\nbox"]]);
 }
 
@@ -317,7 +325,8 @@ fn intents_have_a_stable_wire_format() {
         r#"{"type":"insert_paragraph_break","slide":1,"target":{"shape":2},"paragraph":0,"offset":0}"#,
         r#"{"type":"replace_range","slide":1,"target":"notes","start_paragraph":0,"start_offset":0,"end_paragraph":0,"end_offset":0,"text":""}"#,
     ] {
-        let intent: PptxIntent = serde_json::from_str(json).unwrap_or_else(|e| panic!("{json}: {e}"));
+        let intent: PptxIntent =
+            serde_json::from_str(json).unwrap_or_else(|e| panic!("{json}: {e}"));
         let back = serde_json::to_string(&intent).unwrap();
         assert_eq!(serde_json::from_str::<PptxIntent>(&back).unwrap(), intent);
     }

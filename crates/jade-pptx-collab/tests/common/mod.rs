@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use jade_collab_core::id::Id;
 use jade_pptx_collab::intent::{resolve, PptxIntent, Target};
 use jade_pptx_collab::{
-    GeometryEdit, Geometry, JadePptx, PptxModel, PptxOp, ShapeRef, SlideView, StoryId,
+    Geometry, GeometryEdit, JadePptx, PptxModel, PptxOp, ShapeRef, SlideView, StoryId,
 };
 
 pub fn fixtures() -> PathBuf {

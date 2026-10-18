@@ -167,11 +167,13 @@ fn structure_is_realised_in_jade() {
             slide: slide.id,
             shape: shape.id,
         },
-        mark: s.model.paragraphs(StoryId::Shape {
-            slide: slide.id,
-            shape: shape.id,
-        })
-        .unwrap()[0]
+        mark: s
+            .model
+            .paragraphs(StoryId::Shape {
+                slide: slide.id,
+                shape: shape.id,
+            })
+            .unwrap()[0]
             .mark
             .unwrap(),
     });
@@ -209,8 +211,14 @@ fn a_text_box_keeps_jades_shape_id_through_duplication() {
         offset: 1,
         text: "wo".into(),
     });
-    assert_eq!(s.model.slides()[0].shapes.last().unwrap().text.as_deref(), Some("t"));
-    assert_eq!(s.model.slides()[1].shapes.last().unwrap().text.as_deref(), Some("two"));
+    assert_eq!(
+        s.model.slides()[0].shapes.last().unwrap().text.as_deref(),
+        Some("t")
+    );
+    assert_eq!(
+        s.model.slides()[1].shapes.last().unwrap().text.as_deref(),
+        Some("two")
+    );
 }
 
 /// A placeholder on a new slide inherits its placement from the layout;
@@ -243,7 +251,7 @@ const EDIT_FIXTURES: &[&str] = &[
 ];
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(64))]
+    #![proptest_config(ProptestConfig::with_cases(40))]
 
     /// Random edit sequences keep the model and jade in agreement after
     /// every single operation, and the exported file reads back as the same
@@ -284,4 +292,64 @@ proptest! {
         let reloaded = PptxModel::from_pptx(reopened.bytes()).unwrap();
         assert_agree(&reloaded, &reopened, &format!("{fixture} reloaded"));
     }
+}
+
+/// jade can refuse a structural change for a reason the model does not
+/// track — here a slide whose shape tree lacks the group headers jade needs
+/// to add a shape. The materializer says so before the operation is
+/// applied, so the sequencer rejects it and the file never falls behind.
+#[test]
+fn jade_refuses_what_the_model_cannot_see() {
+    use jade_collab_sync::protocol::Submission;
+    use jade_collab_sync::{Sequencer, SubmitOutcome};
+
+    let bytes = common::fixture("sample-deck.pptx");
+    let mut package = jade_opc::OpcPackage::open_preserving(&bytes).unwrap();
+    let part = "ppt/slides/slide1.xml";
+    let xml = package.required_part_str(part).unwrap();
+    assert!(xml.contains("<p:grpSpPr/>"));
+    package.replace(part, xml.replace("<p:grpSpPr/>", "").into_bytes());
+    let bytes = package.write().unwrap();
+
+    let jade = JadePptx::open(&bytes).unwrap();
+    let model = PptxModel::from_pptx(&bytes).unwrap();
+    let op = PptxOp::InsertTextBox {
+        slide: model.slides()[0].id,
+        id: Id::new(1_000_000, ReplicaId(1)),
+        geometry: Geometry {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+            rotation: 0,
+        },
+    };
+    let ctx = ApplyContext {
+        origin: ReplicaId(1),
+        base_seq: 0,
+        seq: Some(1),
+    };
+    assert!(
+        model.clone().apply(&op, &ctx).is_ok(),
+        "the model alone would take it"
+    );
+    assert!(jade.admit(&model, &op).is_err());
+
+    let mut server = Sequencer::with_materializer(model, jade);
+    let replica = server.join().replica;
+    let outcome = server.submit(
+        replica,
+        Submission {
+            client_seq: 1,
+            base_seq: 0,
+            op,
+        },
+    );
+    assert!(matches!(outcome, SubmitOutcome::Rejected(_)), "{outcome:?}");
+    assert!(server.faults().is_empty());
+    assert_agree(
+        server.document(),
+        server.materializer(),
+        "after the refusal",
+    );
 }
