@@ -101,17 +101,17 @@ fn notes_are_created_typed_and_deleted_in_jade() {
     assert!(!number.is_empty(), "the server numbered the note");
     assert_eq!(layout(&model, 0), format!("He[{number}]llo\u{c}"));
 
-    // A second note at the same caret lands before the first, in jade and
-    // in the model.
-    edit(&mut model, &mut jade, insert_footnote(0, 2, ""));
-    let second = model.paragraphs()[1].story;
+    // Not at the same caret again (see `a_note_cannot_share_an_offset`),
+    // but a little further on; notes are listed in reference order.
+    edit(&mut model, &mut jade, insert_footnote(0, 4, ""));
+    let second = model.paragraphs()[2].story;
     let second_number = model.note_id(second).unwrap().to_string();
     assert_eq!(
         layout(&model, 0),
-        format!("He[{second_number}][{number}]llo\u{c}")
+        format!("He[{number}]ll[{second_number}]o\u{c}")
     );
-    assert_eq!(model.paragraphs()[1].text, "\t");
-    assert_eq!(model.paragraphs()[2].text, "\tfirst");
+    assert_eq!(model.paragraphs()[1].text, "\tfirst");
+    assert_eq!(model.paragraphs()[2].text, "\t");
 
     // An endnote at the paragraph's start; endnotes are listed last.
     edit(
@@ -135,12 +135,12 @@ fn notes_are_created_typed_and_deleted_in_jade() {
         &mut model,
         &mut jade,
         IntentOp::InsertText {
-            paragraph: 1,
+            paragraph: 2,
             offset: 1,
             text: "second".into(),
         },
     );
-    assert_eq!(model.paragraphs()[1].text, "\tsecond");
+    assert_eq!(model.paragraphs()[2].text, "\tsecond");
     let (again, _) = reloaded(&jade);
     assert_eq!(layouts(&again), layouts(&model));
 
@@ -154,20 +154,28 @@ fn notes_are_created_typed_and_deleted_in_jade() {
     );
     assert_eq!(layout(&model, 0).matches('[').count(), 2);
     assert!(!model.paragraph_texts().contains(&"\tfirst".to_string()));
-    let endnote = model.note_id(model.paragraphs()[last - 1].story).unwrap();
+    let endnote = model
+        .note_id(model.paragraphs()[last - 1].story)
+        .unwrap()
+        .to_string();
     edit(
         &mut model,
         &mut jade,
         IntentOp::DeleteEndnote {
-            endnote_id: endnote.to_string(),
+            endnote_id: endnote,
         },
     );
-    assert_eq!(layout(&model, 0), format!("He[{second_number}]llo\u{c}"));
+    assert_eq!(layout(&model, 0), format!("Hell[{second_number}]o\u{c}"));
     let (again, _) = reloaded(&jade);
     assert_eq!(layouts(&again), layouts(&model));
 
     // jade reuses a freed number; the model follows it.
-    edit(&mut model, &mut jade, insert_footnote(1, 5, "again"));
+    let world = model
+        .paragraph_texts()
+        .iter()
+        .position(|t| t == "World")
+        .unwrap();
+    edit(&mut model, &mut jade, insert_footnote(world, 5, "again"));
     let (again, _) = reloaded(&jade);
     assert_eq!(layouts(&again), layouts(&model));
 }
@@ -191,14 +199,19 @@ fn a_note_goes_in_a_table_cell() {
 #[test]
 fn notes_are_created_next_to_existing_ones() {
     let (mut model, mut jade) = open("footnote-table-textbox-order.docx");
-    // "Host" ¹ [text box] " after box" ²: a new note at offset 4 lands
-    // before both anchors there, as jade puts it.
+    // "Host" ¹ [text box] " after box" ²: a new note just before the
+    // anchors. Its paragraph follows the host's text box, then the notes
+    // come in reference order.
     let host = 9;
-    edit(&mut model, &mut jade, insert_footnote(host, 4, "new"));
-    let number = model.note_id(model.paragraphs()[host + 1].story).unwrap();
+    edit(&mut model, &mut jade, insert_footnote(host, 3, "new"));
+    assert_eq!(model.paragraphs()[host + 2].text, "\tnew");
+    let number = model
+        .note_id(model.paragraphs()[host + 2].story)
+        .unwrap()
+        .to_string();
     assert_eq!(
         layout(&model, host),
-        format!("Host[{number}][5][box] after box[3]")
+        format!("Hos[{number}]t[5][box] after box[3]")
     );
     edit(
         &mut model,
@@ -209,7 +222,7 @@ fn notes_are_created_next_to_existing_ones() {
     );
     assert_eq!(
         layout(&model, host),
-        format!("Host[{number}][box] after box[3]")
+        format!("Hos[{number}]t[box] after box[3]")
     );
     let (again, _) = reloaded(&jade);
     assert_eq!(layouts(&again), layouts(&model));
@@ -400,13 +413,31 @@ fn note_commands_project_into_intents() {
     );
 }
 
-/// At a paragraph's start a new note goes before the anchors there (jade
-/// splits there and puts the reference first); a caret after text names the
-/// character before it.
+/// jade puts a new reference before the text boxes and references already
+/// at its offset, and can type only before or after all of them. Text typed
+/// concurrently at the same caret would land between the new reference and
+/// the old ones whenever its id sorts after the new one's — an order jade
+/// cannot write — so a note cannot go where another anchor already sits,
+/// at a paragraph's start included.
 #[test]
-fn a_note_at_a_paragraph_start_goes_before_its_anchors() {
+fn a_note_cannot_share_an_offset_with_another_anchor() {
     let (mut model, mut jade) = open("footnote.docx");
-    // "Hello" ¹ — split before the reference, so it starts a paragraph.
+    // "Hello" ¹, the reference at offset 5.
+    let refused = |model: &DocxModel, intent: IntentOp| {
+        let mut next = model.max_lamport() + 1;
+        let ops = resolve(model, &intent, &mut |n| {
+            let id = Id::new(next, ReplicaId(1));
+            next += n;
+            id
+        })
+        .expect("the intent resolves");
+        let mut trial = model.clone();
+        assert!(
+            ops.iter().any(|op| trial.apply(op, &ctx()).is_err()),
+            "{intent:?} was accepted"
+        );
+    };
+    refused(&model, insert_footnote(0, 5, "x"));
     edit(
         &mut model,
         &mut jade,
@@ -417,19 +448,52 @@ fn a_note_at_a_paragraph_start_goes_before_its_anchors() {
         },
     );
     assert_eq!(layout(&model, 1), "[1]");
-    edit(
-        &mut model,
-        &mut jade,
+    refused(
+        &model,
         IntentOp::InsertEndnote {
             paragraph: 1,
             offset: 0,
             text: "e".into(),
         },
     );
-    let number = model
-        .note_id(model.paragraphs().last().unwrap().story)
-        .unwrap();
-    assert_eq!(layout(&model, 1), format!("[{number}][1]"));
+    // Right before the character before the reference is fine.
+    edit(&mut model, &mut jade, insert_footnote(0, 4, "x"));
     let (again, _) = reloaded(&jade);
     assert_eq!(layouts(&again), layouts(&model));
+}
+
+/// Typing at a caret where a note is added concurrently lands on one side of
+/// the new reference or the other, by id — both of which jade can write.
+#[test]
+fn typing_where_a_note_is_added_concurrently_lands_beside_it() {
+    for typed_first in [false, true] {
+        for (lamport, replica) in [(10_000, 2), (1, 2)] {
+            let (mut model, mut jade) = open("jade-core/hello.docx");
+            let p = model.paragraphs();
+            let d = *p[1].chars.last().unwrap();
+            let note = DocxOp::InsertNote {
+                kind: NoteKind::Footnote,
+                story: StoryId::Body,
+                parent: Some(d),
+                id: Id::new(5_000, ReplicaId(1)),
+                text: "n".into(),
+            };
+            let typed = DocxOp::InsertText {
+                story: StoryId::Body,
+                parent: Some(d),
+                first: Id::new(model.max_lamport() + lamport, ReplicaId(replica)),
+                text: "!".into(),
+            };
+            let ops = if typed_first {
+                [typed, note]
+            } else {
+                [note, typed]
+            };
+            for op in ops {
+                commit(&mut model, &mut jade, op);
+            }
+            let (again, _) = reloaded(&jade);
+            assert_eq!(layouts(&again), layouts(&model));
+        }
+    }
 }
