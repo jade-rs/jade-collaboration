@@ -45,5 +45,7 @@ fn read_document_names_note_and_text_box_paragraphs() {
             { "offset": 14, "kind": "footnote", "note": "3" },
         ])
     );
-    assert!(paragraphs[0].get("anchors").is_none());
+    // "Cell C" places nothing.
+    assert_eq!(paragraphs[6]["text"], json!("Cell C"));
+    assert!(paragraphs[6].get("anchors").is_none());
 }

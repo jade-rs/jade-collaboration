@@ -3,11 +3,18 @@
 //!
 //! This is the collaborative subset of jade's headless commands that the
 //! jade-core prototype (`CollaborativeOperation`) carried, with the same wire
-//! format. Paragraph indices are model ordinals — jade's body paragraphs,
-//! table cells included, notes and text boxes excluded — and offsets are
-//! UTF-8 byte offsets on character boundaries. Resolving pins the caret to
-//! the character before it, so the edit keeps its meaning however long it
-//! takes to reach the server.
+//! format. Paragraph indices are model ordinals ([`DocxModel::paragraphs`]):
+//! jade's paragraph surfaces without equations and note separators — the
+//! body's paragraphs with table cells row by row, each text box's paragraphs
+//! right after the body paragraph that anchors it, each footnote's right
+//! after the body paragraph that first references it, then the other
+//! footnotes (by `w:id`) and the endnotes (by first reference from the body
+//! or a text box, then by `w:id`). Offsets are UTF-8 byte offsets on
+//! character boundaries. Resolving pins the caret to the character before
+//! it, so the edit keeps its meaning however long it takes to reach the
+//! server. Text boxes and note references take no text: a caret at their
+//! offset is before them, as jade types there, except at a paragraph's
+//! start, where typing goes after them, as in jade.
 //!
 //! Formatting and comments are named the same way: a range becomes the ids
 //! of its first and last character, so text edited concurrently moves with
@@ -135,7 +142,7 @@ pub enum IntentError {
     BadOffset { paragraph: usize, offset: usize },
     #[error("the range starts after it ends")]
     InvertedRange,
-    #[error("the range spans more than one story (body, table cell)")]
+    #[error("the range spans more than one story (body, table cell, note, text box)")]
     CrossStory,
     #[error("the range holds no text")]
     EmptyRange,
@@ -149,6 +156,8 @@ pub enum IntentError {
     NoSuchTable(usize),
     #[error("cell ({row}, {column}) is outside the table or starts no merge")]
     NoSuchCell { row: usize, column: usize },
+    #[error("paragraph {0} is in a text box, whose paragraphs cannot be split or joined")]
+    FixedParagraphs(usize),
 }
 
 /// A headless command with no collaborative intent form.
@@ -418,11 +427,15 @@ pub fn lane_for_command(command: &HeadlessCommand) -> Lane {
 }
 
 /// A caret: the story it is in, the atom before it (`None`: story start) and
-/// its index among the story's visible atoms.
+/// its index among the story's visible atoms (text boxes and note
+/// references not counted).
 struct Caret {
     story: StoryId,
     parent: Option<Id>,
     index: usize,
+    /// Where typed text goes: after `parent`, or at a paragraph's start
+    /// after the anchors there (jade types after them).
+    typing: Option<Id>,
 }
 
 /// Visible atoms of `story` in order: each paragraph's characters, then its
@@ -457,10 +470,16 @@ fn caret(paragraphs: &[Paragraph], paragraph: usize, offset: usize) -> Result<Ca
     } else {
         preceding.last().and_then(|q| q.mark)
     };
+    let leading = p.anchors.iter().rev().find(|a| a.offset == 0);
+    let typing = match leading {
+        Some(anchor) if chars_before == 0 => Some(anchor.id),
+        _ => parent,
+    };
     Ok(Caret {
         story: p.story,
         parent,
         index,
+        typing,
     })
 }
 
@@ -501,7 +520,7 @@ pub fn resolve(
             }
             Ok(vec![DocxOp::InsertText {
                 story: at.story,
-                parent: at.parent,
+                parent: at.typing,
                 first: ids(text.chars().count() as u64),
                 text: text.clone(),
             }])
@@ -512,6 +531,9 @@ pub fn resolve(
             count,
         } => {
             let at = caret(&paragraphs, *paragraph, *offset)?;
+            if matches!(at.story, StoryId::TextBox { .. }) {
+                return Err(IntentError::FixedParagraphs(*paragraph));
+            }
             let mut parent = at.parent;
             Ok((0..*count)
                 .map(|_| {
@@ -560,7 +582,7 @@ pub fn resolve(
             if !text.is_empty() {
                 ops.push(DocxOp::InsertText {
                     story: start.story,
-                    parent: start.parent,
+                    parent: start.typing,
                     first: ids(text.chars().count() as u64),
                     text: text.clone(),
                 });

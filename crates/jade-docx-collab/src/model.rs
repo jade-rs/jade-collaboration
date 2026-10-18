@@ -1,13 +1,17 @@
 //! The collaborative DOCX model.
 //!
-//! A *story* — the body or one table cell — is an RGA of characters and
-//! paragraph marks; a paragraph is the run of characters ending at a visible
-//! mark, and a story's last paragraph has no mark (Word's final paragraph
-//! mark cannot be deleted). Tables are placed *after* a mark (or at the start
-//! or end of their story), so a concurrent split can never put a table inside
-//! a paragraph. Walking the model in order gives the same paragraphs, in the
-//! same order, as jade's body paragraph surfaces — which is how a model
-//! position becomes a jade paragraph index.
+//! A *story* — the body, one table cell, one footnote or endnote, one text
+//! box — is an RGA of characters and paragraph marks; a paragraph is the run
+//! of characters ending at a visible mark, and a story's last paragraph has
+//! no mark (Word's final paragraph mark cannot be deleted). Tables are placed
+//! *after* a mark (or at the start or end of their story), so a concurrent
+//! split can never put a table inside a paragraph. A note reference or a
+//! text box is a zero-width *anchor* atom in its host paragraph's RGA: text
+//! deletion never removes it, and splits and joins move it with the text
+//! around it, as jade moves the run. Walking the model in order gives the
+//! same paragraphs, in the same order, as jade's paragraph surfaces (minus
+//! equations and note separators), each with jade's story position — which
+//! is how a model position becomes a jade paragraph.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -15,6 +19,7 @@ use jade_collab_core::grid::{Grid, GridOp, Merge};
 use jade_collab_core::id::{Id, ReplicaId};
 use jade_collab_core::rga::Rga;
 use jade_collab_sync::{ApplyContext, Document, Lane, Rejection};
+pub use jade_docx_document_core::word_document::ParagraphStory;
 use serde::{Deserialize, Serialize};
 
 /// Which story an operation edits.
@@ -32,6 +37,18 @@ pub enum StoryId {
     /// A story an unmerge created for a cell it freed.
     Split {
         table: Id,
+        id: Id,
+    },
+    /// A footnote's text, by the id the model gave the note on load.
+    Footnote {
+        id: Id,
+    },
+    /// An endnote's text, by the id the model gave the note on load.
+    Endnote {
+        id: Id,
+    },
+    /// A text box's text, by the id the model gave the box on load.
+    TextBox {
         id: Id,
     },
 }
@@ -53,6 +70,35 @@ pub enum Anchor {
 pub enum Atom {
     Char(char),
     Mark,
+    /// A zero-width run placing another story: a note reference or a text
+    /// box. Text deletion never removes it.
+    Anchor(Placement),
+}
+
+/// What an anchor places.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
+pub enum Placement {
+    Footnote(Id),
+    Endnote(Id),
+    TextBox(Id),
+}
+
+impl Placement {
+    pub fn story(self) -> StoryId {
+        match self {
+            Self::Footnote(id) => StoryId::Footnote { id },
+            Self::Endnote(id) => StoryId::Endnote { id },
+            Self::TextBox(id) => StoryId::TextBox { id },
+        }
+    }
+}
+
+/// A footnote or endnote: its `w:id` and its text.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Note {
+    pub(crate) file_id: String,
+    pub(crate) story: Story,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,7 +106,8 @@ pub(crate) struct Story {
     pub(crate) flow: Rga<Atom>,
     pub(crate) blocks: Vec<Placed>,
     /// False for a story jade shows no paragraph for (a cell holding only a
-    /// table); such a story is read-only.
+    /// table, an empty text box, a text box inside a text box); such a story
+    /// is read-only.
     pub(crate) has_paragraph: bool,
 }
 
@@ -190,6 +237,12 @@ pub struct DocxModel {
     pub(crate) body: Story,
     #[serde(with = "pairs")]
     pub(crate) tables: BTreeMap<Id, Table>,
+    #[serde(default, with = "pairs")]
+    pub(crate) footnotes: BTreeMap<Id, Note>,
+    #[serde(default, with = "pairs")]
+    pub(crate) endnotes: BTreeMap<Id, Note>,
+    #[serde(default, with = "pairs")]
+    pub(crate) text_boxes: BTreeMap<Id, Story>,
     /// Every comment ever made or loaded, deleted ones included, so later
     /// operations find it by its id.
     #[serde(default, with = "pairs")]
@@ -429,6 +482,40 @@ pub struct Paragraph {
     pub text: String,
     /// The visible characters, in order (one per `char` of `text`).
     pub chars: Vec<Id>,
+    /// Where jade finds it.
+    pub at: ParagraphStory,
+    /// Its text boxes and note references, in order.
+    pub anchors: Vec<AnchorView>,
+}
+
+/// A text box or note reference in a paragraph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AnchorView {
+    /// The anchor atom.
+    pub id: Id,
+    /// UTF-8 bytes of the paragraph's text before it.
+    pub offset: usize,
+    /// The story it places.
+    pub story: StoryId,
+}
+
+impl Paragraph {
+    fn new(story: StoryId) -> Self {
+        Self {
+            story,
+            mark: None,
+            text: String::new(),
+            chars: Vec::new(),
+            at: ParagraphStory::Body { index: 0 },
+            anchors: Vec::new(),
+        }
+    }
+
+    /// How many anchors come before a character at byte `offset` (or, past
+    /// the text, before the paragraph's end).
+    fn anchors_before(&self, offset: usize) -> usize {
+        self.anchors.iter().filter(|a| a.offset <= offset).count()
+    }
 }
 
 /// A top-level table as the model walks it.
@@ -454,16 +541,18 @@ pub enum DocxOp {
         first: Id,
         text: String,
     },
-    /// Convergent. Deletes characters (never marks); idempotent.
+    /// Convergent. Deletes characters (never marks or anchors); idempotent.
     DeleteText { story: StoryId, ids: Vec<Id> },
-    /// Convergent. Inserts a paragraph mark after `parent`.
+    /// Convergent. Inserts a paragraph mark after `parent`. Refused in a
+    /// text box, whose paragraphs are fixed.
     SplitParagraph {
         story: StoryId,
         parent: Option<Id>,
         id: Id,
     },
     /// Sequenced. Deletes `mark`, joining its paragraph with the next one.
-    /// Refused while a table follows the paragraph.
+    /// Refused while a table, or a text box or footnote the paragraph
+    /// places, follows the paragraph, and in a text box.
     JoinParagraph { story: StoryId, mark: Id },
     /// Sequenced. A new empty table in the body.
     InsertTable {
@@ -523,35 +612,46 @@ pub enum DocxOp {
     DeleteComment { comment: Id },
 }
 
-/// An operation's consequence in jade terms: paragraph ordinals in model walk
-/// order, UTF-8 byte offsets in model text, and tables by their pre-order
-/// index in the body's table structure. The materializer maps these to jade
-/// paragraph surfaces and table order. Emitted in the order to apply.
+/// An operation's consequence in jade terms: paragraphs by jade's story
+/// position ([`ParagraphStory`], resolved to a paragraph surface when it is
+/// applied), UTF-8 byte offsets in model text, and tables by their pre-order
+/// index in the body's table structure. `anchors` says how many of the
+/// paragraph's text boxes and note references come before the position —
+/// what an offset alone cannot say, since they take no text. Emitted in the
+/// order to apply.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DocxEffect {
     InsertText {
-        paragraph: usize,
+        paragraph: ParagraphStory,
         offset: usize,
         text: String,
+        #[serde(default)]
+        anchors: usize,
     },
+    /// No anchor lies inside the range; `anchors` come before it.
     DeleteRange {
-        paragraph: usize,
+        paragraph: ParagraphStory,
         start: usize,
         end: usize,
+        #[serde(default)]
+        anchors: usize,
     },
     SplitParagraph {
-        paragraph: usize,
+        paragraph: ParagraphStory,
         offset: usize,
+        #[serde(default)]
+        anchors: usize,
     },
-    /// Join `paragraph` (whose text is `offset` bytes long) with the next.
+    /// Join `paragraph` (whose text is `offset` bytes long) with the next
+    /// paragraph of its story.
     JoinParagraph {
-        paragraph: usize,
+        paragraph: ParagraphStory,
         offset: usize,
     },
     /// A table after `paragraph`, or above it when `above`.
     InsertTable {
-        paragraph: usize,
+        paragraph: ParagraphStory,
         above: bool,
         rows: usize,
         columns: usize,
@@ -590,23 +690,23 @@ pub enum DocxEffect {
     },
     /// A character change on `start..end` of one paragraph.
     FormatText {
-        paragraph: usize,
+        paragraph: ParagraphStory,
         start: usize,
         end: usize,
         change: FormatChange,
     },
     /// A paragraph change on one paragraph.
     FormatParagraph {
-        paragraph: usize,
+        paragraph: ParagraphStory,
         change: FormatChange,
     },
     /// A new comment `comment` from (`start_paragraph`, `start`) to
     /// (`end_paragraph`, `end`).
     AddComment {
         comment: Id,
-        start_paragraph: usize,
+        start_paragraph: ParagraphStory,
         start: usize,
-        end_paragraph: usize,
+        end_paragraph: ParagraphStory,
         end: usize,
         content: CommentContent,
     },
@@ -629,12 +729,51 @@ pub enum DocxEffect {
 struct Walk {
     paragraphs: Vec<Paragraph>,
     tables: Vec<TableView>,
-    /// Every visible table, nested ones included, in pre-order.
+    /// Every visible table of the body, nested ones included, in pre-order.
     all_tables: Vec<Id>,
+    /// The next body paragraph's index.
+    body: usize,
+    footnotes_listed: BTreeSet<Id>,
+    /// Endnotes in order of first reference from the body or a text box.
+    endnotes_referenced: Vec<Id>,
+}
+
+/// The story whose paragraphs share one numbering in jade's story
+/// positions: the body (table cells included), a text box (by its host body
+/// paragraph and its index among the host's text boxes) or a note.
+#[derive(Clone, Copy, Debug)]
+enum Root {
+    Body,
+    TextBox { host: usize, index: usize },
+    Footnote(Id),
+    Endnote(Id),
+}
+
+/// Where a visible atom is.
+#[derive(Clone, Copy, Debug)]
+struct Located {
+    ordinal: usize,
+    /// UTF-8 bytes of its paragraph before it (a mark: the paragraph's length).
+    offset: usize,
+    /// Its own length (0 for a mark).
+    len: usize,
+    /// Anchors of its paragraph before it.
+    anchors: usize,
 }
 
 fn reject(message: impl Into<String>) -> Rejection {
     Rejection::new(message)
+}
+
+/// jade does not write a text box's new or removed paragraphs to the file
+/// (it keeps them in memory only), so a text box's paragraphs are fixed.
+fn fixed_paragraphs(story: StoryId) -> Result<(), Rejection> {
+    match story {
+        StoryId::TextBox { .. } => Err(reject(
+            "a text box's paragraphs cannot be split or joined: jade does not write them to the file",
+        )),
+        _ => Ok(()),
+    }
 }
 
 impl DocxModel {
@@ -667,6 +806,9 @@ impl DocxModel {
                 has_paragraph: true,
             },
             tables: BTreeMap::new(),
+            footnotes: BTreeMap::new(),
+            endnotes: BTreeMap::new(),
+            text_boxes: BTreeMap::new(),
             comments: BTreeMap::new(),
             max_lamport: next - 1,
         }
@@ -674,44 +816,156 @@ impl DocxModel {
 
     fn walk(&self) -> Walk {
         let mut out = Walk::default();
-        self.walk_story(StoryId::Body, &self.body, &mut out);
+        self.walk_story(Root::Body, StoryId::Body, &self.body, &mut out, &mut 0);
+        // Footnotes no body paragraph referenced, then endnotes in order of
+        // first reference, then the others — by w:id, as jade lists them.
+        let by_file_id = |notes: &BTreeMap<Id, Note>, skip: &dyn Fn(&Id) -> bool| {
+            let mut rest: Vec<(&str, Id)> = notes
+                .iter()
+                .filter(|(id, _)| !skip(id))
+                .map(|(id, note)| (note.file_id.as_str(), *id))
+                .collect();
+            rest.sort();
+            rest.into_iter().map(|(_, id)| id).collect::<Vec<Id>>()
+        };
+        for id in by_file_id(&self.footnotes, &|id| out.footnotes_listed.contains(id)) {
+            let story = &self.footnotes[&id].story;
+            self.walk_story(
+                Root::Footnote(id),
+                StoryId::Footnote { id },
+                story,
+                &mut out,
+                &mut 0,
+            );
+        }
+        let mut endnotes = std::mem::take(&mut out.endnotes_referenced);
+        endnotes.extend(by_file_id(&self.endnotes, &|id| endnotes.contains(id)));
+        for id in endnotes {
+            if let Some(note) = self.endnotes.get(&id) {
+                self.walk_story(
+                    Root::Endnote(id),
+                    StoryId::Endnote { id },
+                    &note.story,
+                    &mut out,
+                    &mut 0,
+                );
+            }
+        }
         out
     }
 
-    fn walk_story(&self, id: StoryId, story: &Story, out: &mut Walk) {
-        self.walk_blocks(id, story, Anchor::Start, out);
-        let mut current = Paragraph {
-            story: id,
-            mark: None,
-            text: String::new(),
-            chars: Vec::new(),
-        };
+    /// Walks one story of `root`; `counter` numbers the root's paragraphs
+    /// (the body uses `out.body`).
+    fn walk_story(
+        &self,
+        root: Root,
+        id: StoryId,
+        story: &Story,
+        out: &mut Walk,
+        counter: &mut usize,
+    ) {
+        self.walk_blocks(root, id, story, Anchor::Start, out, counter);
+        let mut current = Paragraph::new(id);
         for node in story.flow.nodes().iter().filter(|n| !n.deleted) {
             match node.value {
                 Atom::Char(c) => {
                     current.text.push(c);
                     current.chars.push(node.id);
                 }
+                Atom::Anchor(placement) => current.anchors.push(AnchorView {
+                    id: node.id,
+                    offset: current.text.len(),
+                    story: placement.story(),
+                }),
                 Atom::Mark => {
                     current.mark = Some(node.id);
-                    let next = Paragraph {
-                        story: id,
-                        mark: None,
-                        text: String::new(),
-                        chars: Vec::new(),
-                    };
-                    out.paragraphs.push(std::mem::replace(&mut current, next));
-                    self.walk_blocks(id, story, Anchor::After(node.id), out);
+                    let next = Paragraph::new(id);
+                    self.emit(root, std::mem::replace(&mut current, next), out, counter);
+                    self.walk_blocks(root, id, story, Anchor::After(node.id), out, counter);
                 }
             }
         }
         if story.has_paragraph {
-            out.paragraphs.push(current);
+            self.emit(root, current, out, counter);
         }
-        self.walk_blocks(id, story, Anchor::End, out);
+        self.walk_blocks(root, id, story, Anchor::End, out, counter);
     }
 
-    fn walk_blocks(&self, id: StoryId, story: &Story, anchor: Anchor, out: &mut Walk) {
+    /// Lists `paragraph`, then — as jade does after a body paragraph — the
+    /// text boxes it anchors and the footnotes it references first.
+    fn emit(&self, root: Root, mut paragraph: Paragraph, out: &mut Walk, counter: &mut usize) {
+        let mut next = || {
+            *counter += 1;
+            *counter - 1
+        };
+        paragraph.at = match root {
+            Root::Body => {
+                out.body += 1;
+                ParagraphStory::Body {
+                    index: out.body - 1,
+                }
+            }
+            Root::TextBox { host, index } => ParagraphStory::TextBox {
+                host,
+                text_box: index,
+                paragraph: next(),
+            },
+            Root::Footnote(id) => ParagraphStory::Footnote {
+                note_id: self.footnotes[&id].file_id.clone(),
+                paragraph: next(),
+            },
+            Root::Endnote(id) => ParagraphStory::Endnote {
+                note_id: self.endnotes[&id].file_id.clone(),
+                paragraph: next(),
+            },
+        };
+        let host = match paragraph.at {
+            ParagraphStory::Body { index } => Some(index),
+            _ => None,
+        };
+        let anchors = paragraph.anchors.clone();
+        out.paragraphs.push(paragraph);
+        if matches!(root, Root::Body | Root::TextBox { .. }) {
+            for anchor in &anchors {
+                if let StoryId::Endnote { id } = anchor.story {
+                    if !out.endnotes_referenced.contains(&id) {
+                        out.endnotes_referenced.push(id);
+                    }
+                }
+            }
+        }
+        let Some(host) = host else { return };
+        let boxes = anchors.iter().filter_map(|a| match a.story {
+            StoryId::TextBox { id } => Some(id),
+            _ => None,
+        });
+        for (index, id) in boxes.enumerate() {
+            if let Some(story) = self.text_boxes.get(&id) {
+                let root = Root::TextBox { host, index };
+                self.walk_story(root, StoryId::TextBox { id }, story, out, &mut 0);
+            }
+        }
+        for anchor in &anchors {
+            if let StoryId::Footnote { id } = anchor.story {
+                if out.footnotes_listed.insert(id) {
+                    if let Some(note) = self.footnotes.get(&id) {
+                        let root = Root::Footnote(id);
+                        self.walk_story(root, anchor.story, &note.story, out, &mut 0);
+                    }
+                }
+            }
+        }
+    }
+
+    fn walk_blocks(
+        &self,
+        root: Root,
+        id: StoryId,
+        story: &Story,
+        anchor: Anchor,
+        out: &mut Walk,
+        counter: &mut usize,
+    ) {
         for placed in story.blocks.iter().filter(|p| p.anchor == anchor) {
             let Block::Table(table_id) = placed.block else {
                 continue;
@@ -722,7 +976,9 @@ impl DocxModel {
             }
             let rows = table.grid.rows();
             let columns = table.grid.columns();
-            out.all_tables.push(table_id);
+            if matches!(root, Root::Body) {
+                out.all_tables.push(table_id);
+            }
             if id == StoryId::Body {
                 out.tables.push(TableView {
                     id: table_id,
@@ -735,14 +991,20 @@ impl DocxModel {
             for &row in &rows {
                 for &column in &columns {
                     for key in table.layout.get(&(row, column)).into_iter().flatten() {
-                        self.walk_story(story_id(table_id, *key), &table.stories[key], out);
+                        let cell = story_id(table_id, *key);
+                        self.walk_story(root, cell, &table.stories[key], out, counter);
                     }
                 }
             }
         }
     }
 
-    /// Every visible paragraph, in jade's body paragraph-surface order.
+    /// Every visible paragraph in jade's paragraph-surface order (equations
+    /// and note separators left out): the body's, a table's cells row by
+    /// row, a text box's right after the paragraph that anchors it, a
+    /// footnote's right after the body paragraph that first references it,
+    /// then the other footnotes and the endnotes (by first reference, then
+    /// by `w:id`). Intent paragraph indices count in this order.
     pub fn paragraphs(&self) -> Vec<Paragraph> {
         self.walk().paragraphs
     }
@@ -767,14 +1029,30 @@ impl DocxModel {
             StoryId::Split { table, id } => {
                 self.tables.get(&table)?.stories.get(&StoryKey::Split(id))
             }
+            StoryId::Footnote { id } => self.footnotes.get(&id).map(|n| &n.story),
+            StoryId::Endnote { id } => self.endnotes.get(&id).map(|n| &n.story),
+            StoryId::TextBox { id } => self.text_boxes.get(&id),
         }
+    }
+
+    /// The `w:id` of a footnote's or endnote's story.
+    pub fn note_id(&self, story: StoryId) -> Option<&str> {
+        match story {
+            StoryId::Footnote { id } => self.footnotes.get(&id),
+            StoryId::Endnote { id } => self.endnotes.get(&id),
+            _ => None,
+        }
+        .map(|note| note.file_id.as_str())
     }
 
     /// The table cell position (table, row, column) whose `w:tc` shows
     /// `story`: its own, or the merged cell it is shown in.
     pub fn cell_of(&self, story: StoryId) -> Option<(Id, Id, Id)> {
         let (table, key) = match story {
-            StoryId::Body => return None,
+            StoryId::Body
+            | StoryId::Footnote { .. }
+            | StoryId::Endnote { .. }
+            | StoryId::TextBox { .. } => return None,
             StoryId::Cell { table, row, column } => (table, StoryKey::Cell(row, column)),
             StoryId::Split { table, id } => (table, StoryKey::Split(id)),
         };
@@ -799,6 +1077,9 @@ impl DocxModel {
                 .get_mut(&table)?
                 .stories
                 .get_mut(&StoryKey::Split(id)),
+            StoryId::Footnote { id } => self.footnotes.get_mut(&id).map(|n| &mut n.story),
+            StoryId::Endnote { id } => self.endnotes.get_mut(&id).map(|n| &mut n.story),
+            StoryId::TextBox { id } => self.text_boxes.get_mut(&id),
         }
     }
 
@@ -812,35 +1093,53 @@ impl DocxModel {
         Ok(story)
     }
 
-    /// (ordinal, byte offset, byte length) of each requested visible atom; a
-    /// mark reports the offset of its paragraph's end.
-    fn locate(&self, ids: &BTreeSet<Id>) -> BTreeMap<Id, (usize, usize, usize)> {
+    /// Where each requested visible atom is; a mark reports its paragraph's
+    /// end.
+    fn locate(&self, ids: &BTreeSet<Id>) -> BTreeMap<Id, Located> {
         let mut found = BTreeMap::new();
         for (ordinal, paragraph) in self.paragraphs().into_iter().enumerate() {
             let mut offset = 0;
             for (c, id) in paragraph.text.chars().zip(&paragraph.chars) {
                 if ids.contains(id) {
-                    found.insert(*id, (ordinal, offset, c.len_utf8()));
+                    let anchors = paragraph.anchors_before(offset);
+                    let len = c.len_utf8();
+                    found.insert(
+                        *id,
+                        Located {
+                            ordinal,
+                            offset,
+                            len,
+                            anchors,
+                        },
+                    );
                 }
                 offset += c.len_utf8();
             }
             if let Some(mark) = paragraph.mark.filter(|m| ids.contains(m)) {
-                found.insert(mark, (ordinal, offset, 0));
+                let anchors = paragraph.anchors.len();
+                found.insert(
+                    mark,
+                    Located {
+                        ordinal,
+                        offset,
+                        len: 0,
+                        anchors,
+                    },
+                );
             }
         }
         found
     }
 
-    fn locate_one(&self, id: Id) -> Option<(usize, usize)> {
-        self.locate(&BTreeSet::from([id]))
-            .get(&id)
-            .map(|&(p, offset, _)| (p, offset))
+    fn locate_one(&self, id: Id) -> Option<Located> {
+        self.locate(&BTreeSet::from([id])).get(&id).copied()
     }
 
-    /// The table's index among all visible tables, nested ones included, in
-    /// document pre-order — the order of the body's table structure. The
-    /// materializer maps it to jade's `table_order_index` (which also counts
-    /// tables inside text boxes).
+    /// jade's story position of the visible paragraph at `ordinal`.
+    fn at(&self, ordinal: usize) -> ParagraphStory {
+        self.paragraphs()[ordinal].at.clone()
+    }
+
     /// The ordinal of the visible paragraph `mark` ends.
     pub(crate) fn paragraph_ending_with(&self, story: StoryId, mark: Id) -> Option<usize> {
         self.paragraphs()
@@ -848,6 +1147,10 @@ impl DocxModel {
             .position(|p| p.story == story && p.mark == Some(mark))
     }
 
+    /// The table's index among all visible tables of the body, nested ones
+    /// included, in document pre-order — the order of the body's table
+    /// structure. The materializer maps it to jade's `table_order_index`
+    /// (which also counts tables inside text boxes).
     fn table_order(&self, table: Id) -> Option<usize> {
         self.walk().all_tables.iter().position(|t| *t == table)
     }
@@ -878,10 +1181,11 @@ impl DocxModel {
         self.observe([first.offset(count - 1)]);
         Ok(self
             .locate_one(first)
-            .map(|(paragraph, offset)| DocxEffect::InsertText {
-                paragraph,
-                offset,
+            .map(|at| DocxEffect::InsertText {
+                paragraph: self.at(at.ordinal),
+                offset: at.offset,
                 text: text.to_string(),
+                anchors: at.anchors,
             })
             .into_iter()
             .collect())
@@ -895,6 +1199,11 @@ impl DocxModel {
                 Some(node) if node.value == Atom::Mark => {
                     return Err(reject("paragraph marks are joined, not deleted"))
                 }
+                Some(node) if matches!(node.value, Atom::Anchor(_)) => {
+                    return Err(reject(
+                        "text boxes and note references are not deleted as text",
+                    ))
+                }
                 Some(_) => {}
             }
         }
@@ -903,27 +1212,30 @@ impl DocxModel {
         for id in ids {
             flow.delete(*id)?;
         }
-        // Merge adjacent characters into ranges; apply from the end so earlier
-        // offsets stay valid.
-        let mut spans: Vec<(usize, usize, usize)> = positions
+        // Merge adjacent characters into ranges — never across an anchor, so
+        // jade gets no range holding a text box's or a reference's run — and
+        // apply from the end so earlier offsets stay valid.
+        let mut spans: Vec<(usize, usize, usize, usize)> = positions
             .values()
-            .map(|&(p, offset, len)| (p, offset, offset + len))
+            .map(|at| (at.ordinal, at.offset, at.offset + at.len, at.anchors))
             .collect();
         spans.sort();
-        let mut ranges: Vec<(usize, usize, usize)> = Vec::new();
-        for (p, start, end) in spans {
+        let mut ranges: Vec<(usize, usize, usize, usize)> = Vec::new();
+        for (p, start, end, anchors) in spans {
             match ranges.last_mut() {
-                Some(last) if last.0 == p && last.2 == start => last.2 = end,
-                _ => ranges.push((p, start, end)),
+                Some(last) if last.0 == p && last.2 == start && last.3 == anchors => last.2 = end,
+                _ => ranges.push((p, start, end, anchors)),
             }
         }
+        let paragraphs = self.paragraphs();
         Ok(ranges
             .into_iter()
             .rev()
-            .map(|(paragraph, start, end)| DocxEffect::DeleteRange {
-                paragraph,
+            .map(|(p, start, end, anchors)| DocxEffect::DeleteRange {
+                paragraph: paragraphs[p].at.clone(),
                 start,
                 end,
+                anchors,
             })
             .collect())
     }
@@ -935,6 +1247,7 @@ impl DocxModel {
         id: Id,
     ) -> Result<Vec<DocxEffect>, Rejection> {
         self.editable_story(story)?;
+        fixed_paragraphs(story)?;
         self.story_mut(story)
             .expect("checked")
             .flow
@@ -942,12 +1255,17 @@ impl DocxModel {
         self.observe([id]);
         Ok(self
             .locate_one(id)
-            .map(|(paragraph, offset)| DocxEffect::SplitParagraph { paragraph, offset })
+            .map(|at| DocxEffect::SplitParagraph {
+                paragraph: self.at(at.ordinal),
+                offset: at.offset,
+                anchors: at.anchors,
+            })
             .into_iter()
             .collect())
     }
 
     fn join(&mut self, story_id: StoryId, mark: Id) -> Result<Vec<DocxEffect>, Rejection> {
+        fixed_paragraphs(story_id)?;
         let story = self.editable_story(story_id)?;
         match story.flow.get(mark) {
             Some(node) if node.value == Atom::Mark && !node.deleted => {}
@@ -968,9 +1286,24 @@ impl DocxModel {
                 "a table separates the paragraphs; they cannot be joined",
             ));
         }
-        let effect = self
-            .locate_one(mark)
-            .map(|(paragraph, offset)| DocxEffect::JoinParagraph { paragraph, offset });
+        let paragraphs = self.paragraphs();
+        let ordinal = paragraphs
+            .iter()
+            .position(|p| p.story == story_id && p.mark == Some(mark));
+        // jade lists the text boxes a paragraph anchors and the footnotes it
+        // references first between it and the next one, and cannot join
+        // across them.
+        if let Some(p) = ordinal {
+            if paragraphs.get(p + 1).map(|q| q.story) != Some(story_id) {
+                return Err(reject(
+                    "a text box or a note sits between the paragraphs; they cannot be joined",
+                ));
+            }
+        }
+        let effect = ordinal.map(|p| DocxEffect::JoinParagraph {
+            paragraph: paragraphs[p].at.clone(),
+            offset: paragraphs[p].text.len(),
+        });
         self.story_mut(story_id)
             .expect("checked")
             .flow
@@ -1000,10 +1333,10 @@ impl DocxModel {
             Anchor::Start => {
                 let first = paragraphs
                     .iter()
-                    .position(|p| p.story == StoryId::Body)
+                    .find(|p| p.story == StoryId::Body)
                     .ok_or_else(|| reject("the body has no paragraph"))?;
                 DocxEffect::InsertTable {
-                    paragraph: first,
+                    paragraph: first.at.clone(),
                     above: true,
                     rows: rows.len(),
                     columns: columns.len(),
@@ -1012,14 +1345,14 @@ impl DocxModel {
             Anchor::After(mark) => {
                 let paragraph = paragraphs
                     .iter()
-                    .position(|p| p.story == StoryId::Body && p.mark == Some(mark))
+                    .find(|p| p.story == StoryId::Body && p.mark == Some(mark))
                     .ok_or_else(|| {
                         reject(format!(
                             "{mark} is not a visible paragraph mark in the body"
                         ))
                     })?;
                 DocxEffect::InsertTable {
-                    paragraph,
+                    paragraph: paragraph.at.clone(),
                     above: false,
                     rows: rows.len(),
                     columns: columns.len(),
@@ -1325,12 +1658,13 @@ impl DocxModel {
         change.validate().map_err(reject)?;
         let atoms = self.range_atoms(story, start, end)?;
         let located = self.locate(&atoms.iter().copied().collect());
+        let paragraphs = self.paragraphs();
         if change.is_paragraph_level() {
-            let touched: BTreeSet<usize> = located.values().map(|&(p, _, _)| p).collect();
+            let touched: BTreeSet<usize> = located.values().map(|at| at.ordinal).collect();
             return Ok(touched
                 .into_iter()
-                .map(|paragraph| DocxEffect::FormatParagraph {
-                    paragraph,
+                .map(|p| DocxEffect::FormatParagraph {
+                    paragraph: paragraphs[p].at.clone(),
                     change: change.clone(),
                 })
                 .collect());
@@ -1338,15 +1672,17 @@ impl DocxModel {
         // A range is contiguous, so its characters make one slice per
         // paragraph (marks report a zero-length position and are skipped).
         let mut slices: BTreeMap<usize, (usize, usize)> = BTreeMap::new();
-        for &(paragraph, offset, len) in located.values().filter(|l| l.2 > 0) {
-            let slice = slices.entry(paragraph).or_insert((offset, offset + len));
-            slice.0 = slice.0.min(offset);
-            slice.1 = slice.1.max(offset + len);
+        for at in located.values().filter(|at| at.len > 0) {
+            let slice = slices
+                .entry(at.ordinal)
+                .or_insert((at.offset, at.offset + at.len));
+            slice.0 = slice.0.min(at.offset);
+            slice.1 = slice.1.max(at.offset + at.len);
         }
         Ok(slices
             .into_iter()
-            .map(|(paragraph, (start, end))| DocxEffect::FormatText {
-                paragraph,
+            .map(|(p, (start, end))| DocxEffect::FormatText {
+                paragraph: paragraphs[p].at.clone(),
                 start,
                 end,
                 change: change.clone(),
@@ -1402,6 +1738,11 @@ impl DocxModel {
         content: &CommentContent,
     ) -> Result<Vec<DocxEffect>, Rejection> {
         self.new_comment(id, content)?;
+        if matches!(story, StoryId::Footnote { .. } | StoryId::Endnote { .. }) {
+            return Err(reject(
+                "jade cannot anchor a comment in a footnote or endnote",
+            ));
+        }
         let chars = self
             .range_chars(story, start, end)
             .ok_or_else(|| reject("the comment's range is not a range of its story"))?;
@@ -1409,8 +1750,9 @@ impl DocxModel {
             return Err(reject("the text to comment on was deleted"));
         };
         let located = self.locate(&BTreeSet::from([*first, *last]));
-        let (start_paragraph, start_offset, _) = located[first];
-        let (end_paragraph, end_offset, len) = located[last];
+        let (from, to) = (located[first], located[last]);
+        let (start_paragraph, start_offset) = (self.at(from.ordinal), from.offset);
+        let (end_paragraph, end_offset, len) = (self.at(to.ordinal), to.offset, to.len);
         self.comments.insert(
             id,
             Comment {

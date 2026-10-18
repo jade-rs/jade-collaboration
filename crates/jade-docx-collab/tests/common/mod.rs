@@ -435,14 +435,14 @@ fn around_anchor(
                 .take(2)
                 .copied()
                 .collect();
-            (!chars.is_empty()).then(|| DocxOp::DeleteText {
+            (!chars.is_empty()).then_some(DocxOp::DeleteText {
                 story: paragraph.story,
                 ids: chars,
             })
         }
         28 => {
             let chars = paragraph.chars[..before].to_vec();
-            (!chars.is_empty()).then(|| DocxOp::DeleteText {
+            (!chars.is_empty()).then_some(DocxOp::DeleteText {
                 story: paragraph.story,
                 ids: chars,
             })

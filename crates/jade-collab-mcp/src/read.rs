@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use jade_collab_core::id::Id;
-use jade_docx_collab::{DocxModel, StoryId};
+use jade_docx_collab::{DocxModel, Paragraph, ParagraphStory, StoryId};
 use jade_pptx_collab::PptxModel;
 use jade_xlsx_collab::XlsxModel;
 use serde_json::{json, Value};
@@ -20,9 +20,20 @@ fn page(total: usize, start: usize, limit: usize) -> (std::ops::Range<usize>, Op
 }
 
 /// What `read_document` reports for a docx view, without `seq`/`pending`:
-/// paragraphs `start..start + limit` and every top-level table.
+/// paragraphs `start..start + limit` — body, table cells, text boxes,
+/// footnotes and endnotes, in the order edits index them — and every
+/// top-level table.
 pub fn read_docx(model: &DocxModel, start: usize, limit: usize) -> Value {
     let paragraphs = model.paragraphs();
+    // A text box names its host by body paragraph; an agent needs the index.
+    let body_paragraphs: HashMap<usize, usize> = paragraphs
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, p)| match p.at {
+            ParagraphStory::Body { index } => Some((index, ordinal)),
+            _ => None,
+        })
+        .collect();
     let tables = model.tables();
     // Cell stories name their table, row and column by id; an agent needs
     // the positions. Nested tables are not listed, so their cells have none.
@@ -36,9 +47,28 @@ pub fn read_docx(model: &DocxModel, start: usize, limit: usize) -> Value {
         .collect();
     // A cell's story is listed at the cell that shows it — after a merge,
     // the merged cell.
-    let story = |story: StoryId| match model.cell_of(story) {
-        None => json!({ "kind": "body" }),
-        Some((table, row, column)) => {
+    let story = |paragraph: &Paragraph| match (&paragraph.at, model.cell_of(paragraph.story)) {
+        (ParagraphStory::Footnote { note_id, paragraph }, _) => {
+            json!({ "kind": "footnote", "note": note_id, "paragraph": paragraph })
+        }
+        (ParagraphStory::Endnote { note_id, paragraph }, _) => {
+            json!({ "kind": "endnote", "note": note_id, "paragraph": paragraph })
+        }
+        (
+            ParagraphStory::TextBox {
+                host,
+                text_box,
+                paragraph,
+            },
+            _,
+        ) => json!({
+            "kind": "text_box",
+            "anchor_paragraph": body_paragraphs.get(host),
+            "text_box": text_box,
+            "paragraph": paragraph,
+        }),
+        (_, None) => json!({ "kind": "body" }),
+        (_, Some((table, row, column))) => {
             let at = positions.get(&table).and_then(|(index, rows, columns)| {
                 Some((*index, *rows.get(&row)?, *columns.get(&column)?))
             });
@@ -59,7 +89,13 @@ pub fn read_docx(model: &DocxModel, start: usize, limit: usize) -> Value {
         "paragraphs": paragraphs[range.clone()]
             .iter()
             .zip(range)
-            .map(|(p, index)| json!({ "index": index, "text": p.text, "story": story(p.story) }))
+            .map(|(p, index)| {
+                let mut entry = json!({ "index": index, "text": p.text, "story": story(p) });
+                if !p.anchors.is_empty() {
+                    entry["anchors"] = anchors(model, p);
+                }
+                entry
+            })
             .collect::<Vec<_>>(),
         "tables": tables
             .iter()
@@ -75,6 +111,32 @@ pub fn read_docx(model: &DocxModel, start: usize, limit: usize) -> Value {
             }))
             .collect::<Vec<_>>(),
     })
+}
+
+/// Where a paragraph's text boxes and note references sit (UTF-8 byte
+/// offsets): text boxes numbered in order, notes by their `w:id`.
+fn anchors(model: &DocxModel, paragraph: &Paragraph) -> Value {
+    let mut text_boxes = 0;
+    paragraph
+        .anchors
+        .iter()
+        .map(|anchor| match anchor.story {
+            StoryId::Footnote { .. } => json!({
+                "offset": anchor.offset,
+                "kind": "footnote",
+                "note": model.note_id(anchor.story),
+            }),
+            StoryId::Endnote { .. } => json!({
+                "offset": anchor.offset,
+                "kind": "endnote",
+                "note": model.note_id(anchor.story),
+            }),
+            _ => {
+                text_boxes += 1;
+                json!({ "offset": anchor.offset, "kind": "text_box", "text_box": text_boxes - 1 })
+            }
+        })
+        .collect()
 }
 
 /// What `read_document` reports for an xlsx view, without `seq`/`pending`:

@@ -16,9 +16,12 @@ ws:// URLs; `join_document` returns a `session_id`; `read_document` shows your c
 `apply_edits` submits edits and waits for the server's verdict on each; `wait_for_changes` \
 blocks until someone else's edit arrives; `leave_document` ends the session.
 
-Addressing: docx `paragraph` is a zero-based index over the body's paragraphs, table cells \
-included in document order (notes and text boxes excluded); `offset` is a UTF-8 byte offset on a \
-character boundary. xlsx cells use A1 references, 1-based rows and column letters. Indices shift \
+Addressing: docx `paragraph` is a zero-based index over every paragraph `read_document` lists, \
+in its order: the body's paragraphs with table cells row by row, each text box's paragraphs right \
+after the paragraph that anchors it, each footnote's after the paragraph that first references it, \
+then the other footnotes and the endnotes; each paragraph says which story it belongs to. `offset` \
+is a UTF-8 byte offset on a character boundary; text boxes and note references take no text \
+(a paragraph lists where they sit), a text box's paragraphs cannot be split or joined. xlsx cells use A1 references, 1-based rows and column letters. Indices shift \
 as the document changes, so read before editing; the edits of one call are resolved in order, \
 each against the view the previous ones left.
 
@@ -181,7 +184,7 @@ fn edits() -> Value {
                     "offset": offset(),
                     "text": string("Text to insert (no paragraph breaks; use insert_paragraph_break)."),
                 }), &["paragraph", "offset", "text"]),
-                edit("replace_range", "docx: replace a range inside one story (the body or one table cell) with `text`; crossing paragraph ends joins them.", json!({
+                edit("replace_range", "docx: replace a range inside one story (the body, one table cell, note or text box) with `text`; crossing paragraph ends joins them.", json!({
                     "start_paragraph": integer("Paragraph where the range starts."),
                     "start_offset": integer("Byte offset where the range starts."),
                     "end_paragraph": integer("Paragraph where the range ends."),
@@ -464,7 +467,7 @@ fn tools() -> Vec<Tool> {
         Tool {
             name: "read_document",
             title: "Read a document",
-            description: "Your current view, a page at a time. docx: paragraphs (index, text, which story — body or a table cell) and the top-level tables; xlsx: every sheet's size and its non-blank cells in A1 form, paged over all sheets in order; pptx: slides (numbered from 1) with their shapes' numbers, text and geometry and the speaker notes. Your own unanswered edits are included.",
+            description: "Your current view, a page at a time. docx: paragraphs (index, text, which story — body, a table cell, a text box, a footnote or an endnote — and where its text boxes and note references sit) and the top-level tables; xlsx: every sheet's size and its non-blank cells in A1 form, paged over all sheets in order; pptx: slides (numbered from 1) with their shapes' numbers, text and geometry and the speaker notes. Your own unanswered edits are included.",
             input: object("Arguments.", json!({
                 "session_id": session_id(),
                 "start": integer("First paragraph (docx), cell (xlsx) or slide (pptx, zero-based) to list; default 0."),
