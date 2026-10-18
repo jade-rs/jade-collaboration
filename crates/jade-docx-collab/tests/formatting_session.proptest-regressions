@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc fe8096f0a8a16e53fc6cdbfb7caccb0c169a3ef9485469b2252610f10004159f # shrinks to fixture = "table-cell-spacing.docx", steps = [Format { client: 0, choice: 99589003522328792 }]
+cc af8b27b6fd6cc3c8b87be5e6006eb157c1adb0f5af94bd18c99159adea0062fc # shrinks to fixture = "jade-core/hello.docx", steps = [Type { client: 0, choice: 11606583666465965630 }]

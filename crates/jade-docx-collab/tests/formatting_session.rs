@@ -10,9 +10,7 @@ mod common;
 
 use std::collections::BTreeMap;
 
-use common::{
-    assert_formatting_agrees, char_styles, formatted_char_styles, generate, open, shows,
-};
+use common::{assert_formatting_agrees, char_styles, formatted_char_styles, generate, open, shows};
 use jade_collab_core::id::Id;
 use jade_collab_sync::sim::Simulation;
 use jade_collab_sync::{ApplyContext, Document};
@@ -122,16 +120,39 @@ proptest! {
         // The file shows the model's formatting.
         assert_formatting_agrees(server.document(), server.materializer(), "after the session");
 
-        // The sequenced clears land on exactly the characters in their range
-        // at their log position: replaying the log, a character the file
-        // formatted bold that no clear reached and no mark covers is still
-        // bold.
+        // Sequenced formatting lands on exactly the characters in its range
+        // at its log position (a paragraph change on their whole
+        // paragraphs): replaying the log, a character of the file that no
+        // sequenced format reached and no mark covers keeps its bold.
         let mut replay = model;
         let mut cleared: BTreeMap<Id, ()> = BTreeMap::new();
         for committed in server.log() {
-            if let DocxOp::Format { story, start, end, change: FormatChange::ClearFormatting } = &committed.op {
-                for c in replay.range_chars(*story, *start, *end).unwrap_or_default() {
+            if let DocxOp::Format { story, start, end, change } = &committed.op {
+                let chars = replay.range_chars(*story, *start, *end).unwrap_or_default();
+                if change.is_paragraph_level() {
+                    for p in replay.paragraphs() {
+                        let touched = p.chars.iter().any(|c| chars.contains(c))
+                            || p.mark.is_some_and(|m| m == *start || m == *end);
+                        if touched {
+                            for c in p.chars {
+                                cleared.insert(c, ());
+                            }
+                        }
+                    }
+                }
+                for c in chars {
                     cleared.insert(c, ());
+                }
+            }
+            // A join gives the second paragraph the first one's style.
+            if let DocxOp::JoinParagraph { story, mark } = &committed.op {
+                let paragraphs = replay.paragraphs();
+                if let Some(at) = paragraphs.iter().position(|p| p.story == *story && p.mark == Some(*mark)) {
+                    for p in &paragraphs[at..(at + 2).min(paragraphs.len())] {
+                        for c in &p.chars {
+                            cleared.insert(*c, ());
+                        }
+                    }
                 }
             }
             let ctx = ApplyContext {

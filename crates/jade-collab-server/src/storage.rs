@@ -3,7 +3,8 @@
 //!
 //! ```text
 //! <dir>/<name>/snapshot-<n>.json   {"format": "docx", "checkpoint": <Checkpoint>, "tail": [<Committed>…]}
-//! <dir>/<name>/snapshot-<n>.docx   the file jade exported at the checkpoint
+//! <dir>/<name>/snapshot-<n>.docx   the file jade exported at the checkpoint (for docx, without
+//!                                   the marks, which the model in the .json holds)
 //! <dir>/<name>/log-<n>.jsonl       one journal `Record` per line, after it
 //! ```
 //!

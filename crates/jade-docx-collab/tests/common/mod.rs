@@ -740,16 +740,7 @@ pub fn shows(change: &FormatChange, style: &CharStyle) -> bool {
     }
 }
 
-pub const MARK_KEYS: [MarkKey; 8] = [
-    MarkKey::Bold,
-    MarkKey::Italic,
-    MarkKey::Underline,
-    MarkKey::Strike,
-    MarkKey::FontSize,
-    MarkKey::FontFamily,
-    MarkKey::FontColor,
-    MarkKey::Highlight,
-];
+pub const MARK_KEYS: [MarkKey; 8] = MarkKey::ALL;
 
 /// What `style` reports for one attribute.
 pub fn attribute(style: &CharStyle, key: MarkKey) -> String {

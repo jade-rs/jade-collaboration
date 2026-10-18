@@ -16,6 +16,15 @@ use crate::model::{DocxEffect, DocxModel, DocxOp, FormatChange};
 
 /// The server's jade document. Not `Send` (jade shares parsed parts through
 /// `Rc`), so a server keeps one per document on its own thread.
+///
+/// It holds the *base* document: the file, every text and structural edit,
+/// and the sequenced formatting, in log order — but none of the model's
+/// marks. The marks are realised on a copy when the file is written
+/// ([`JadeDocx::formatted`], [`JadeDocx::export`]), as explicit values on
+/// exactly the characters they cover. So jade's typing rules only ever see
+/// the base formatting: text typed next to a mark gets the mark's
+/// formatting when the mark's expand rule covers it, and the formatting
+/// around it otherwise — never jade's guess from the mark's run.
 pub struct JadeDocx {
     word: WordDocument,
     /// jade's `w:id` of each comment made in the session. jade numbers new
@@ -51,8 +60,34 @@ impl JadeDocx {
         &self.word
     }
 
-    pub fn export(&self) -> Result<Vec<u8>, DocxExportError> {
+    /// The file with the model's formatting: what users download.
+    pub fn export(&self, model: &DocxModel) -> Result<Vec<u8>, String> {
+        self.formatted(model)?
+            .export_docx()
+            .map_err(|e| e.to_string())
+    }
+
+    /// The base file, without the model's marks: what a checkpoint stores
+    /// next to the model, which holds the marks.
+    pub fn export_base(&self) -> Result<Vec<u8>, DocxExportError> {
         self.word.export_docx()
+    }
+
+    /// A copy of the document showing the model's formatting: each run of
+    /// characters a mark sets gets that value explicitly; everything else
+    /// keeps jade's own formatting.
+    pub fn formatted(&self, model: &DocxModel) -> Result<WordDocument, String> {
+        let formatting = model.formatting();
+        let mut copy = JadeDocx {
+            word: self.word.clone(),
+            comments: BTreeMap::new(),
+        };
+        for format in formatting {
+            let surface = copy.surface(&format.paragraph)?;
+            let command = copy.format_command(surface, format.start, format.end, format.change)?;
+            copy.run(command)?;
+        }
+        Ok(copy.word)
     }
 
     /// jade's paragraph surfaces the model lists, in order: every one but

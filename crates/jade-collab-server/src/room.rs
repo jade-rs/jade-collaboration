@@ -73,7 +73,11 @@ trait Hosted: 'static {
     fn load(bytes: &[u8], model: &Self::Doc) -> Result<Self::Mat, String>;
     /// The real document and the model derived from it.
     fn open(bytes: &[u8]) -> Result<(Self::Doc, Self::Mat), String>;
-    fn export(materializer: &Self::Mat) -> Result<Vec<u8>, String>;
+    /// The file as users get it.
+    fn export(document: &Self::Doc, materializer: &Self::Mat) -> Result<Vec<u8>, String>;
+    /// The file a checkpoint stores next to the model, which `load` reads
+    /// back.
+    fn checkpoint_file(materializer: &Self::Mat) -> Result<Vec<u8>, String>;
 }
 
 struct Docx;
@@ -94,8 +98,13 @@ impl Hosted for Docx {
         Ok((model, jade))
     }
 
-    fn export(materializer: &JadeDocx) -> Result<Vec<u8>, String> {
-        materializer.export().map_err(|e| e.to_string())
+    fn export(model: &DocxModel, materializer: &JadeDocx) -> Result<Vec<u8>, String> {
+        materializer.export(model)
+    }
+
+    /// The base file: the model's marks are in the checkpoint's model.
+    fn checkpoint_file(materializer: &JadeDocx) -> Result<Vec<u8>, String> {
+        materializer.export_base().map_err(|e| e.to_string())
     }
 }
 
@@ -118,7 +127,11 @@ impl Hosted for Xlsx {
         Ok((model, jade))
     }
 
-    fn export(materializer: &JadeXlsx) -> Result<Vec<u8>, String> {
+    fn export(_: &XlsxModel, materializer: &JadeXlsx) -> Result<Vec<u8>, String> {
+        materializer.export()
+    }
+
+    fn checkpoint_file(materializer: &JadeXlsx) -> Result<Vec<u8>, String> {
         materializer.export()
     }
 }
@@ -143,7 +156,11 @@ impl Hosted for Pptx {
         Ok((model, jade))
     }
 
-    fn export(materializer: &JadePptx) -> Result<Vec<u8>, String> {
+    fn export(_: &PptxModel, materializer: &JadePptx) -> Result<Vec<u8>, String> {
+        materializer.export()
+    }
+
+    fn checkpoint_file(materializer: &JadePptx) -> Result<Vec<u8>, String> {
         materializer.export()
     }
 }
@@ -240,7 +257,7 @@ impl<H: Hosted> Hosting<H> {
             } => {
                 let (document, materializer) = H::open(&bytes)?;
                 let sequencer = Sequencer::with_materializer(document, materializer);
-                let file = H::export(sequencer.materializer())?;
+                let file = H::checkpoint_file(sequencer.materializer())?;
                 let store =
                     DocumentStore::create(dir, H::FORMAT, options, &sequencer.checkpoint(), &file)?;
                 Hosting {
@@ -276,7 +293,7 @@ impl<H: Hosted> Hosting<H> {
         if store.append(&record)? {
             // A file that cannot be exported now is checkpointed later; the
             // journal keeps everything until then.
-            match H::export(self.sequencer.materializer()) {
+            match H::checkpoint_file(self.sequencer.materializer()) {
                 Ok(file) => {
                     let keep = store.keep_tail();
                     let log = self.sequencer.log();
@@ -433,7 +450,10 @@ impl<H: Hosted> Hosting<H> {
                     }
                 }
                 Command::Export { reply } => {
-                    let _ = reply.send(H::export(self.sequencer.materializer()));
+                    let _ = reply.send(H::export(
+                        self.sequencer.document(),
+                        self.sequencer.materializer(),
+                    ));
                 }
                 Command::Seq { reply } => {
                     let _ = reply.send(self.sequencer.seq());

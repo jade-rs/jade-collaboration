@@ -16,14 +16,21 @@
 //! offset is before them, as jade types there, except at a paragraph's
 //! start, where typing goes after them, as in jade.
 //!
-//! Formatting and comments are named the same way: a range becomes the ids
-//! of its first and last character, so text edited concurrently moves with
-//! it. Comments are named by the model's id (`lamport@rN`, as
+//! Formatting and comments are named the same way, so text edited
+//! concurrently moves with them. Character formatting (bold, italic,
+//! underline, strike, font size and family, colour, highlight) becomes a
+//! convergent [`DocxOp::Mark`] per story, anchored before the range's first
+//! character and before the atom after its last one (the attributes expand
+//! at their end, as in Word); clearing becomes a mark that unsets them plus
+//! the sequenced clear of the file's own formatting; paragraph formatting
+//! and comments name the ids of the range's first and last atoms and are
+//! sequenced. Comments are named by the model's id (`lamport@rN`, as
 //! [`DocxModel::comments`] lists them) or, for a comment that came with the
 //! file, by jade's `w:id`.
 
 use jade_collab_core::grid::Merge;
 use jade_collab_core::id::Id;
+use jade_collab_core::marks::Expand;
 use jade_collab_sync::Lane;
 use jade_docx_headless_api::{HeadlessCommand, HeadlessDeleteDirection};
 use serde::{Deserialize, Serialize};
@@ -411,17 +418,27 @@ fn format(start: (usize, usize), end: (usize, usize), change: FormatChange) -> I
     }
 }
 
-/// The lane a headless command needs. Plain text edits commute; everything
-/// else — formatting, structure, comments, revisions, page setup — rewrites
-/// state other edits depend on and goes through the sequencer. (Formatting
-/// and comments are sequenced so jade applies them in one order: two
-/// concurrent formats of overlapping ranges must end the same everywhere.)
+/// The lane a headless command needs. Plain text edits and simple character
+/// formatting (a mark: concurrent marks resolve to the newest per attribute
+/// on every replica) commute; everything else — clearing the file's
+/// formatting, paragraph formatting, structure, comments, revisions, page
+/// setup — rewrites state other edits depend on and goes through the
+/// sequencer.
 pub fn lane_for_command(command: &HeadlessCommand) -> Lane {
     match command {
         HeadlessCommand::InsertText { .. }
         | HeadlessCommand::ReplaceRange { .. }
         | HeadlessCommand::DeleteText { .. }
-        | HeadlessCommand::InsertParagraphBreak { .. } => Lane::Convergent,
+        | HeadlessCommand::InsertParagraphBreak { .. }
+        | HeadlessCommand::ApplyBold { .. }
+        | HeadlessCommand::SetBold { .. }
+        | HeadlessCommand::ApplyItalic { .. }
+        | HeadlessCommand::ApplyUnderline { .. }
+        | HeadlessCommand::ApplyStrike { .. }
+        | HeadlessCommand::SetFontSize { .. }
+        | HeadlessCommand::SetFontFamily { .. }
+        | HeadlessCommand::SetFontColor { .. }
+        | HeadlessCommand::SetHighlightColor { .. } => Lane::Convergent,
         _ => Lane::Sequenced,
     }
 }
@@ -602,32 +619,63 @@ pub fn resolve(
             if (*start_paragraph, *start_offset) > (*end_paragraph, *end_offset) {
                 return Err(IntentError::InvertedRange);
             }
-            // Each paragraph's slice of the range: characters, and the mark
-            // when the range runs past it.
-            let slices = (*start_paragraph..=*end_paragraph).map(|n| {
-                let p = &paragraphs[n];
-                let from = if n == *start_paragraph {
-                    chars_before(p, *start_offset)
-                } else {
-                    0
-                };
-                let to = if n == *end_paragraph {
-                    chars_before(p, *end_offset)
-                } else {
-                    p.chars.len()
-                };
-                let mark = p.mark.filter(|_| n < *end_paragraph);
-                (p.story, p.chars[from..to].iter().copied().chain(mark))
-            });
-            Ok(per_story(slices)
-                .into_iter()
-                .map(|(story, first, last)| DocxOp::Format {
-                    story,
-                    start: first,
-                    end: last,
-                    change: change.clone(),
+            // Each paragraph's slice of the range: its characters, and its
+            // mark when the range runs past it.
+            let slices: Vec<(StoryId, &[Id], Option<Id>)> = (*start_paragraph..=*end_paragraph)
+                .map(|n| {
+                    let p = &paragraphs[n];
+                    let from = if n == *start_paragraph {
+                        chars_before(p, *start_offset)
+                    } else {
+                        0
+                    };
+                    let to = if n == *end_paragraph {
+                        chars_before(p, *end_offset)
+                    } else {
+                        p.chars.len()
+                    };
+                    (
+                        p.story,
+                        &p.chars[from..to],
+                        p.mark.filter(|_| n < *end_paragraph),
+                    )
                 })
-                .collect())
+                .collect();
+            let mut ops = Vec::new();
+            if change.mark_key().is_some() || *change == FormatChange::ClearFormatting {
+                // A mark per story, over its first through last character.
+                let expand = change.mark_key().map_or(Expand::End, |key| key.expand());
+                let chars = slices
+                    .iter()
+                    .map(|(story, chars, _)| (*story, chars.iter().copied()));
+                for (story, first, last) in per_story(chars) {
+                    let (start, end) = view
+                        .mark_anchors(story, first, last, expand)
+                        .expect("a view's characters are in their story, in order");
+                    ops.push(DocxOp::Mark {
+                        story,
+                        id: ids(1),
+                        start,
+                        end,
+                        change: change.clone(),
+                    });
+                }
+            }
+            if change.mark_key().is_none() {
+                // Clearing the file's formatting, or paragraph formatting.
+                let atoms = slices
+                    .iter()
+                    .map(|(story, chars, mark)| (*story, chars.iter().copied().chain(*mark)));
+                ops.extend(per_story(atoms).into_iter().map(|(story, first, last)| {
+                    DocxOp::Format {
+                        story,
+                        start: first,
+                        end: last,
+                        change: change.clone(),
+                    }
+                }));
+            }
+            Ok(ops)
         }
         IntentOp::FormatParagraphs {
             start_paragraph,

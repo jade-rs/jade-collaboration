@@ -298,15 +298,12 @@ proptest! {
         // notes and text boxes where the model has them, and the formatting
         // the model gives each character.
         let reloaded = JadeDocx::load(&jade.export(&model).unwrap()).unwrap();
+        // (jade fills in the fonts styles give when it reads a file, so only
+        // what the marks set is compared.)
         let written = char_styles_in(&model, reloaded.word());
-        let formatted = formatted_char_styles(&model, &jade);
-        for (c, style) in &written {
-            for key in common::MARK_KEYS {
-                prop_assert_eq!(
-                    common::attribute(style, key),
-                    common::attribute(&formatted[c], key),
-                    "{:?} of {} in the written file", key, c
-                );
+        for (c, changes) in model.character_formats() {
+            for change in changes {
+                prop_assert!(shows(&change, &written[&c]), "{} lost {:?} in the written file", c, change);
             }
         }
         let reloaded_model = DocxModel::from_word_document(reloaded.word()).unwrap();
@@ -878,7 +875,12 @@ fn text_typed_at_a_marks_edges_follows_the_expand_rules_in_the_file() {
         offset,
         text: text.into(),
     };
-    commit_intent(&mut model, &mut jade, format(0, 3, FormatChange::Bold { value: true }), 1);
+    commit_intent(
+        &mut model,
+        &mut jade,
+        format(0, 3, FormatChange::Bold { value: true }),
+        1,
+    );
     commit_intent(&mut model, &mut jade, type_at(0, "x"), 2);
     commit_intent(&mut model, &mut jade, type_at(4, "y"), 2);
     commit_intent(&mut model, &mut jade, type_at(7, "z"), 2);
@@ -890,7 +892,12 @@ fn text_typed_at_a_marks_edges_follows_the_expand_rules_in_the_file() {
 
     // A newer "not bold" over part of it, and a clear that also takes the
     // file's own formatting off.
-    commit_intent(&mut model, &mut jade, format(2, 3, FormatChange::Bold { value: false }), 3);
+    commit_intent(
+        &mut model,
+        &mut jade,
+        format(2, 3, FormatChange::Bold { value: false }),
+        3,
+    );
     assert_eq!(written(&model, &jade, bold), "Wry");
     commit_intent(
         &mut model,
@@ -898,7 +905,12 @@ fn text_typed_at_a_marks_edges_follows_the_expand_rules_in_the_file() {
         format(1, 8, FormatChange::FontSize { half_points: 40 }),
         3,
     );
-    commit_intent(&mut model, &mut jade, format(0, 3, FormatChange::ClearFormatting), 4);
+    commit_intent(
+        &mut model,
+        &mut jade,
+        format(0, 3, FormatChange::ClearFormatting),
+        4,
+    );
     assert_eq!(written(&model, &jade, bold), "ry");
     assert_eq!(
         written(&model, &jade, |s| s.style.font_size == Some(20.0)),

@@ -407,10 +407,7 @@ fn marks_are_validated_alike_everywhere() {
     assert_eq!(model, before);
     let ok = mark(Boundary::Before(c[0]), Boundary::End, bold());
     apply(&mut model, &ok);
-    assert!(
-        model.apply(&ok, &ctx()).is_err(),
-        "a mark id is used once"
-    );
+    assert!(model.apply(&ok, &ctx()).is_err(), "a mark id is used once");
     // The mark's id moves the model's clock past it.
     assert!(model.max_lamport() >= 100);
 }
@@ -463,7 +460,8 @@ fn edit(view: &DocxModel, choice: u64, replica: u64) -> Vec<DocxOp> {
     let pick = |n: usize, salt: u32| ((choice >> salt) as usize) % n.max(1);
     let p = pick(paragraphs.len(), 8);
     let q = (p + pick(2, 12)).min(paragraphs.len() - 1);
-    let boundaries = |t: &str| -> Vec<usize> { t.char_indices().map(|(i, _)| i).chain([t.len()]).collect() };
+    let boundaries =
+        |t: &str| -> Vec<usize> { t.char_indices().map(|(i, _)| i).chain([t.len()]).collect() };
     let (bp, bq) = (boundaries(&paragraphs[p]), boundaries(&paragraphs[q]));
     let (so, eo) = (bp[pick(bp.len(), 16)], bq[pick(bq.len(), 24)]);
     let op = match choice % 6 {

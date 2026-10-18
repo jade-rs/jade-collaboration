@@ -206,7 +206,7 @@ fn edits() -> Value {
                     "offset": offset(),
                     "count": integer("Breaks to insert; default 1."),
                 }), &["paragraph", "offset"]),
-                edit("format", "docx: change character or paragraph formatting of a range inside one story.", json!({
+                edit("format", "docx: change character or paragraph formatting of a range (a range crossing a table formats every story it crosses). Bold, italic, underline, strike, font size and family, colour and highlight apply at once and never conflict: concurrent changes of one attribute settle on the newest everywhere, and text typed at the end of the range takes the formatting, text typed before it does not. `clear_formatting` (keeps the highlight) and paragraph changes go through the server and can be rejected.", json!({
                     "start_paragraph": integer("Paragraph where the range starts."),
                     "start_offset": integer("Byte offset where the range starts."),
                     "end_paragraph": integer("Paragraph where the range ends."),
