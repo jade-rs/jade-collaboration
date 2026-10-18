@@ -7,6 +7,9 @@ use jade_docx_collab::{DocxModel, StoryId};
 use jade_xlsx_collab::XlsxModel;
 use serde_json::{json, Value};
 
+/// A line's position among a table's rows or columns, by id.
+type Lines = HashMap<Id, usize>;
+
 /// The page `start..start + limit` of `total` items, and where the next
 /// one starts (`None`: this was the last).
 fn page(total: usize, start: usize, limit: usize) -> (std::ops::Range<usize>, Option<usize>) {
@@ -22,7 +25,7 @@ pub fn read_docx(model: &DocxModel, start: usize, limit: usize) -> Value {
     let tables = model.tables();
     // Cell stories name their table, row and column by id; an agent needs
     // the positions. Nested tables are not listed, so their cells have none.
-    let positions: HashMap<Id, (usize, HashMap<Id, usize>, HashMap<Id, usize>)> = tables
+    let positions: HashMap<Id, (usize, Lines, Lines)> = tables
         .iter()
         .enumerate()
         .map(|(index, table)| {
