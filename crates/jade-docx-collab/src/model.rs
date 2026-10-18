@@ -92,7 +92,234 @@ pub struct DocxModel {
     pub(crate) body: Story,
     #[serde(with = "pairs")]
     pub(crate) tables: BTreeMap<Id, Table>,
+    /// Every comment ever made or loaded, deleted ones included, so later
+    /// operations find it by its id.
+    #[serde(default, with = "pairs")]
+    pub(crate) comments: BTreeMap<Id, Comment>,
     pub(crate) max_lamport: u64,
+}
+
+/// A comment's text and who wrote it, as jade's comment commands take them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommentContent {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initials: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date: Option<String>,
+}
+
+impl CommentContent {
+    /// Text with no author, initials or date.
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            author: None,
+            initials: None,
+            date: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Comment {
+    /// The thread's root; `None` for a root.
+    pub(crate) parent: Option<Id>,
+    /// What a comment made in the session was anchored to; `None` for a reply
+    /// (it shares its root's anchor) and for a comment loaded from the file.
+    pub(crate) anchor: Option<(StoryId, Id, Id)>,
+    pub(crate) content: CommentContent,
+    pub(crate) resolved: bool,
+    pub(crate) deleted: bool,
+    /// jade's `w:id` for a comment loaded from the file.
+    pub(crate) file_id: Option<String>,
+}
+
+/// A live comment as the model knows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommentView {
+    pub id: Id,
+    /// The root of its thread; `None` for a root.
+    pub parent: Option<Id>,
+    /// jade's `w:id` when the comment came with the file. jade numbers the
+    /// comments made in the session itself; the model names them by `id`.
+    pub file_id: Option<String>,
+    /// (story, first, last character) for a root made in the session.
+    pub anchor: Option<(StoryId, Id, Id)>,
+    pub content: CommentContent,
+    pub resolved: bool,
+}
+
+/// Horizontal paragraph alignment, as Word's ribbon offers it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParagraphAlignment {
+    Left,
+    Center,
+    Right,
+    #[serde(alias = "both")]
+    Justify,
+    Distribute,
+}
+
+impl ParagraphAlignment {
+    /// The value jade's `set_paragraph_alignment` takes and its paragraph
+    /// query reports.
+    pub fn as_jade(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Center => "center",
+            Self::Right => "right",
+            Self::Justify => "justify",
+            Self::Distribute => "distribute",
+        }
+    }
+
+    /// Parses jade's alignment names (`both` is `justify`), ignoring case.
+    pub fn from_jade(value: &str) -> Option<Self> {
+        Some(match value.trim().to_ascii_lowercase().as_str() {
+            "left" => Self::Left,
+            "center" => Self::Center,
+            "right" => Self::Right,
+            "justify" | "both" => Self::Justify,
+            "distribute" => Self::Distribute,
+            _ => return None,
+        })
+    }
+}
+
+/// What a `Format` operation does to its range. Character changes apply to
+/// the range's visible characters; paragraph changes ([`Self::is_paragraph_level`])
+/// to every paragraph holding a visible character or mark of it. The model
+/// only validates the value — jade does the formatting.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FormatChange {
+    Bold {
+        value: bool,
+    },
+    Italic {
+        value: bool,
+    },
+    Underline {
+        value: bool,
+        /// OOXML `w:u@w:val` (`double`, `wave`, …); `None` is single.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        style: Option<String>,
+    },
+    Strike {
+        value: bool,
+        /// Word's double strikethrough (`w:dstrike`).
+        #[serde(default)]
+        double: bool,
+    },
+    /// In half points, as Word stores sizes (`21` is 10.5pt).
+    FontSize {
+        half_points: u32,
+    },
+    FontFamily {
+        family: String,
+    },
+    /// `#RRGGBB`.
+    FontColor {
+        color: String,
+    },
+    /// One of Word's named highlight colors (`yellow`, `darkBlue`, … `none`).
+    Highlight {
+        color: String,
+    },
+    /// Word's Ctrl+Space: direct character formatting off.
+    ClearFormatting,
+    Alignment {
+        alignment: ParagraphAlignment,
+    },
+    /// `None` returns to the document's default paragraph style.
+    ParagraphStyle {
+        #[serde(default)]
+        style_id: Option<String>,
+    },
+}
+
+/// Word's limits: 1pt to 1638pt.
+const FONT_HALF_POINTS: std::ops::RangeInclusive<u32> = 2..=3276;
+
+/// `ST_HighlightColor`.
+const HIGHLIGHT_COLORS: &[&str] = &[
+    "black",
+    "blue",
+    "cyan",
+    "green",
+    "magenta",
+    "red",
+    "yellow",
+    "white",
+    "darkBlue",
+    "darkCyan",
+    "darkGreen",
+    "darkMagenta",
+    "darkRed",
+    "darkYellow",
+    "darkGray",
+    "lightGray",
+    "none",
+];
+
+/// `ST_Underline`.
+const UNDERLINE_STYLES: &[&str] = &[
+    "single",
+    "words",
+    "double",
+    "thick",
+    "dotted",
+    "dottedHeavy",
+    "dash",
+    "dashedHeavy",
+    "dashLong",
+    "dashLongHeavy",
+    "dotDash",
+    "dashDotHeavy",
+    "dotDotDash",
+    "dashDotDotHeavy",
+    "wave",
+    "wavyHeavy",
+    "wavyDouble",
+    "none",
+];
+
+impl FormatChange {
+    /// Whether the change applies to whole paragraphs.
+    pub fn is_paragraph_level(&self) -> bool {
+        matches!(self, Self::Alignment { .. } | Self::ParagraphStyle { .. })
+    }
+
+    /// Refuses values jade would write into the file verbatim but Word
+    /// cannot read.
+    pub fn validate(&self) -> Result<(), String> {
+        let ok = match self {
+            Self::Underline {
+                style: Some(style), ..
+            } => UNDERLINE_STYLES.contains(&style.as_str()),
+            Self::FontSize { half_points } => FONT_HALF_POINTS.contains(half_points),
+            Self::FontFamily { family } => !family.trim().is_empty(),
+            Self::FontColor { color } => {
+                color.len() == 7
+                    && color.starts_with('#')
+                    && color[1..].chars().all(|c| c.is_ascii_hexdigit())
+            }
+            Self::Highlight { color } => HIGHLIGHT_COLORS.contains(&color.as_str()),
+            Self::ParagraphStyle {
+                style_id: Some(style),
+            } => !style.trim().is_empty(),
+            _ => true,
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(format!("{self:?} is not a valid formatting change"))
+        }
+    }
 }
 
 /// One paragraph as the model walks it.
@@ -148,6 +375,37 @@ pub enum DocxOp {
     Table { table: Id, op: GridOp },
     /// Sequenced.
     DeleteTable { table: Id },
+    /// Sequenced. Formats the atoms from `start` through `end` (characters,
+    /// or paragraph marks to reach an empty paragraph) of one story. The
+    /// range is resolved when the operation is applied: characters deleted
+    /// before it shrink the range, characters inserted inside it are
+    /// covered, and with nothing visible left it does nothing.
+    Format {
+        story: StoryId,
+        start: Id,
+        end: Id,
+        change: FormatChange,
+    },
+    /// Sequenced. A comment on the visible characters from `start` through
+    /// `end`; refused when none are left.
+    AddComment {
+        story: StoryId,
+        start: Id,
+        end: Id,
+        id: Id,
+        content: CommentContent,
+    },
+    /// Sequenced. Answers `comment`'s thread (a reply to a reply answers the
+    /// root, as Word keeps threads flat).
+    ReplyToComment {
+        comment: Id,
+        id: Id,
+        content: CommentContent,
+    },
+    /// Sequenced.
+    ResolveComment { comment: Id, resolved: bool },
+    /// Sequenced. Deleting a root deletes its replies.
+    DeleteComment { comment: Id },
 }
 
 /// An operation's consequence in jade terms: paragraph ordinals in model walk
@@ -204,6 +462,41 @@ pub enum DocxEffect {
     DeleteTable {
         table: usize,
     },
+    /// A character change on `start..end` of one paragraph.
+    FormatText {
+        paragraph: usize,
+        start: usize,
+        end: usize,
+        change: FormatChange,
+    },
+    /// A paragraph change on one paragraph.
+    FormatParagraph {
+        paragraph: usize,
+        change: FormatChange,
+    },
+    /// A new comment `comment` from (`start_paragraph`, `start`) to
+    /// (`end_paragraph`, `end`).
+    AddComment {
+        comment: Id,
+        start_paragraph: usize,
+        start: usize,
+        end_paragraph: usize,
+        end: usize,
+        content: CommentContent,
+    },
+    /// Comments are named by model id; the materializer knows jade's.
+    ReplyToComment {
+        comment: Id,
+        reply: Id,
+        content: CommentContent,
+    },
+    ResolveComment {
+        comment: Id,
+        resolved: bool,
+    },
+    DeleteComment {
+        comment: Id,
+    },
 }
 
 #[derive(Default)]
@@ -248,6 +541,7 @@ impl DocxModel {
                 has_paragraph: true,
             },
             tables: BTreeMap::new(),
+            comments: BTreeMap::new(),
             max_lamport: next - 1,
         }
     }
@@ -706,6 +1000,251 @@ impl DocxModel {
         Ok(vec![effect])
     }
 
+    /// The visible atoms of `story` from `start` through `end`, in order —
+    /// whatever was inserted between them, minus whatever was deleted.
+    fn range_atoms(&self, story: StoryId, start: Id, end: Id) -> Result<Vec<Id>, Rejection> {
+        let flow = &self.editable_story(story)?.flow;
+        let position = |id: Id| {
+            flow.position(id)
+                .ok_or_else(|| reject(format!("{id} is not in story {story:?}")))
+        };
+        let (first, last) = (position(start)?, position(end)?);
+        if first > last {
+            return Err(reject("the range starts after it ends"));
+        }
+        let ids: BTreeSet<Id> = flow.nodes()[first..=last]
+            .iter()
+            .filter(|n| !n.deleted)
+            .map(|n| n.id)
+            .collect();
+        // Only atoms of visible paragraphs (not of a deleted table's cells).
+        let located = self.locate(&ids);
+        Ok(flow.nodes()[first..=last]
+            .iter()
+            .map(|n| n.id)
+            .filter(|id| located.contains_key(id))
+            .collect())
+    }
+
+    /// The visible characters of `story` from `start` through `end`, in
+    /// document order; `None` when the ids do not name a range of the story.
+    pub fn range_chars(&self, story: StoryId, start: Id, end: Id) -> Option<Vec<Id>> {
+        let flow = &self.story(story)?.flow;
+        let atoms = self.range_atoms(story, start, end).ok()?;
+        Some(
+            atoms
+                .into_iter()
+                .filter(|id| flow.get(*id).is_some_and(|n| n.value != Atom::Mark))
+                .collect(),
+        )
+    }
+
+    fn format(
+        &mut self,
+        story: StoryId,
+        start: Id,
+        end: Id,
+        change: &FormatChange,
+    ) -> Result<Vec<DocxEffect>, Rejection> {
+        change.validate().map_err(reject)?;
+        let atoms = self.range_atoms(story, start, end)?;
+        let located = self.locate(&atoms.iter().copied().collect());
+        if change.is_paragraph_level() {
+            let touched: BTreeSet<usize> = located.values().map(|&(p, _, _)| p).collect();
+            return Ok(touched
+                .into_iter()
+                .map(|paragraph| DocxEffect::FormatParagraph {
+                    paragraph,
+                    change: change.clone(),
+                })
+                .collect());
+        }
+        // A range is contiguous, so its characters make one slice per
+        // paragraph (marks report a zero-length position and are skipped).
+        let mut slices: BTreeMap<usize, (usize, usize)> = BTreeMap::new();
+        for &(paragraph, offset, len) in located.values().filter(|l| l.2 > 0) {
+            let slice = slices.entry(paragraph).or_insert((offset, offset + len));
+            slice.0 = slice.0.min(offset);
+            slice.1 = slice.1.max(offset + len);
+        }
+        Ok(slices
+            .into_iter()
+            .map(|(paragraph, (start, end))| DocxEffect::FormatText {
+                paragraph,
+                start,
+                end,
+                change: change.clone(),
+            })
+            .collect())
+    }
+
+    /// Every live comment, oldest id first.
+    pub fn comments(&self) -> Vec<CommentView> {
+        self.comments
+            .iter()
+            .filter(|(_, c)| !c.deleted)
+            .map(|(id, c)| CommentView {
+                id: *id,
+                parent: c.parent,
+                file_id: c.file_id.clone(),
+                anchor: c.anchor,
+                content: c.content.clone(),
+                resolved: c.resolved,
+            })
+            .collect()
+    }
+
+    /// jade's `w:id` of a comment that came with the file.
+    pub fn comment_file_id(&self, id: Id) -> Option<&str> {
+        self.comments.get(&id)?.file_id.as_deref()
+    }
+
+    fn live_comment(&self, id: Id) -> Result<&Comment, Rejection> {
+        match self.comments.get(&id) {
+            Some(comment) if !comment.deleted => Ok(comment),
+            Some(_) => Err(reject(format!("comment {id} was deleted"))),
+            None => Err(reject(format!("comment {id} does not exist"))),
+        }
+    }
+
+    fn new_comment(&self, id: Id, content: &CommentContent) -> Result<(), Rejection> {
+        if content.text.trim().is_empty() {
+            return Err(reject("a comment needs text"));
+        }
+        if self.comments.contains_key(&id) {
+            return Err(reject(format!("comment {id} already exists")));
+        }
+        Ok(())
+    }
+
+    fn add_comment(
+        &mut self,
+        story: StoryId,
+        start: Id,
+        end: Id,
+        id: Id,
+        content: &CommentContent,
+    ) -> Result<Vec<DocxEffect>, Rejection> {
+        self.new_comment(id, content)?;
+        let chars = self
+            .range_chars(story, start, end)
+            .ok_or_else(|| reject("the comment's range is not a range of its story"))?;
+        let (Some(first), Some(last)) = (chars.first(), chars.last()) else {
+            return Err(reject("the text to comment on was deleted"));
+        };
+        let located = self.locate(&BTreeSet::from([*first, *last]));
+        let (start_paragraph, start_offset, _) = located[first];
+        let (end_paragraph, end_offset, len) = located[last];
+        self.comments.insert(
+            id,
+            Comment {
+                parent: None,
+                anchor: Some((story, start, end)),
+                content: content.clone(),
+                resolved: false,
+                deleted: false,
+                file_id: None,
+            },
+        );
+        self.observe([id]);
+        Ok(vec![DocxEffect::AddComment {
+            comment: id,
+            start_paragraph,
+            start: start_offset,
+            end_paragraph,
+            end: end_offset + len,
+            content: content.clone(),
+        }])
+    }
+
+    fn reply_to_comment(
+        &mut self,
+        comment: Id,
+        id: Id,
+        content: &CommentContent,
+    ) -> Result<Vec<DocxEffect>, Rejection> {
+        self.live_comment(comment)?;
+        // Loaded files may nest replies; Word answers the thread's root.
+        let mut root = comment;
+        for _ in 0..self.comments.len() {
+            match self.comments[&root].parent {
+                Some(parent) => root = parent,
+                None => break,
+            }
+        }
+        self.live_comment(root)?;
+        self.new_comment(id, content)?;
+        self.comments.insert(
+            id,
+            Comment {
+                parent: Some(root),
+                anchor: None,
+                content: content.clone(),
+                resolved: false,
+                deleted: false,
+                file_id: None,
+            },
+        );
+        self.observe([id]);
+        Ok(vec![DocxEffect::ReplyToComment {
+            comment: root,
+            reply: id,
+            content: content.clone(),
+        }])
+    }
+
+    fn resolve_comment(
+        &mut self,
+        comment: Id,
+        resolved: bool,
+    ) -> Result<Vec<DocxEffect>, Rejection> {
+        self.live_comment(comment)?;
+        self.comments.get_mut(&comment).expect("checked").resolved = resolved;
+        Ok(vec![DocxEffect::ResolveComment { comment, resolved }])
+    }
+
+    fn delete_comment(&mut self, comment: Id) -> Result<Vec<DocxEffect>, Rejection> {
+        self.live_comment(comment)?;
+        self.delete_thread(comment);
+        Ok(vec![DocxEffect::DeleteComment { comment }])
+    }
+
+    /// Deletes `comment` and every reply under it, at any depth (as jade).
+    fn delete_thread(&mut self, comment: Id) {
+        let mut doomed = BTreeSet::from([comment]);
+        loop {
+            let before = doomed.len();
+            for (id, entry) in &self.comments {
+                if entry.parent.is_some_and(|p| doomed.contains(&p)) {
+                    doomed.insert(*id);
+                }
+            }
+            if doomed.len() == before {
+                break;
+            }
+        }
+        for id in doomed {
+            self.comments.get_mut(&id).expect("listed").deleted = true;
+        }
+    }
+
+    /// jade removes the comments anchored in table cells it deletes; so does
+    /// the model, after any operation that removes cells.
+    fn drop_comments_in_removed_cells(&mut self) {
+        let visible: BTreeSet<StoryId> = self.paragraphs().iter().map(|p| p.story).collect();
+        let orphaned: Vec<Id> = self
+            .comments
+            .iter()
+            .filter(|(_, c)| !c.deleted)
+            .filter_map(|(id, c)| c.anchor.map(|(story, _, _)| (id, story)))
+            .filter(|(_, story)| !visible.contains(story))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in orphaned {
+            self.delete_thread(id);
+        }
+    }
+
     fn delete_table(&mut self, table: Id) -> Result<Vec<DocxEffect>, Rejection> {
         let (_, order) = self.structural_table(table)?;
         self.tables.get_mut(&table).expect("checked").deleted = true;
@@ -725,7 +1264,12 @@ impl Document for DocxModel {
             DocxOp::JoinParagraph { .. }
             | DocxOp::InsertTable { .. }
             | DocxOp::Table { .. }
-            | DocxOp::DeleteTable { .. } => Lane::Sequenced,
+            | DocxOp::DeleteTable { .. }
+            | DocxOp::Format { .. }
+            | DocxOp::AddComment { .. }
+            | DocxOp::ReplyToComment { .. }
+            | DocxOp::ResolveComment { .. }
+            | DocxOp::DeleteComment { .. } => Lane::Sequenced,
         }
     }
 
@@ -746,8 +1290,38 @@ impl Document for DocxModel {
                 rows,
                 columns,
             } => self.insert_table(*anchor, *id, rows, columns),
-            DocxOp::Table { table, op } => self.table_op(*table, op),
-            DocxOp::DeleteTable { table } => self.delete_table(*table),
+            DocxOp::Table { table, op } => {
+                let effects = self.table_op(*table, op)?;
+                self.drop_comments_in_removed_cells();
+                Ok(effects)
+            }
+            DocxOp::DeleteTable { table } => {
+                let effects = self.delete_table(*table)?;
+                self.drop_comments_in_removed_cells();
+                Ok(effects)
+            }
+            DocxOp::Format {
+                story,
+                start,
+                end,
+                change,
+            } => self.format(*story, *start, *end, change),
+            DocxOp::AddComment {
+                story,
+                start,
+                end,
+                id,
+                content,
+            } => self.add_comment(*story, *start, *end, *id, content),
+            DocxOp::ReplyToComment {
+                comment,
+                id,
+                content,
+            } => self.reply_to_comment(*comment, *id, content),
+            DocxOp::ResolveComment { comment, resolved } => {
+                self.resolve_comment(*comment, *resolved)
+            }
+            DocxOp::DeleteComment { comment } => self.delete_comment(*comment),
         }
     }
 

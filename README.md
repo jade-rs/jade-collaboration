@@ -60,6 +60,9 @@ Then, from any number of shells (or agents):
 jade-collab show ws://127.0.0.1:8787/documents/contract.docx/ws
 jade-collab apply ws://127.0.0.1:8787/documents/contract.docx/ws \
   '{"type":"insert_text","paragraph":0,"offset":0,"text":"DRAFT: "}'
+jade-collab apply ws://127.0.0.1:8787/documents/contract.docx/ws \
+  '[{"type":"format","start_paragraph":0,"start_offset":0,"end_paragraph":0,"end_offset":6,"change":{"kind":"bold","value":true}},
+    {"type":"add_comment","start_paragraph":0,"end_paragraph":0,"text":"Remove before signing"}]'
 jade-collab apply ws://127.0.0.1:8787/documents/budget.xlsx/ws \
   '{"type":"set_cell","sheet":"Sheet1","reference":"B2","value":{"kind":"number","value":42}}'
 ```

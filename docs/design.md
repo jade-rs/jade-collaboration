@@ -138,6 +138,42 @@ Merge regions are rectangles named by their corner row/column identifiers. The
 grid's validity predicate (all regions alive, well-formed and pairwise
 non-overlapping) is checked by the sequencer for every structural operation.
 
+### Formatting and comments (`jade-docx-collab`)
+
+Formatting travels the sequenced lane as `Format { story, start, end,
+change }`: `start` and `end` are atom ids (characters, or a paragraph mark to
+reach an empty paragraph) of one story, inclusive, and `change` is one
+`FormatChange` — bold, italic, underline, strike, font size (half points),
+font family, font color, highlight, clear formatting, paragraph alignment and
+paragraph style. The range is resolved **when the operation is applied, in
+log order**: the visible atoms between the two ids in the story's RGA order.
+Characters deleted before it commits shrink it, characters inserted inside
+it before it commits are covered, and a range with nothing visible left does
+nothing. A character change becomes one jade command per paragraph slice; a
+paragraph change one per paragraph holding a visible atom of the range.
+
+The model **does not store formatting**: it only validates the value (values
+jade would write verbatim but Word cannot read, such as a hex highlight, are
+refused) and reports where jade must format. jade does the formatting, so
+Word's own rules — text typed next to bold text is bold, clearing keeps the
+highlight, a paragraph style re-cascades run properties — are jade's, never
+re-implemented. The convergent lane stays formatting-free; a Peritext-style
+mark CRDT would be needed to format optimistically without the sequencer.
+
+Comments are sequenced too. `AddComment` anchors to the visible characters of
+an id range (refused when none are left); `ReplyToComment`, `ResolveComment`
+and `DeleteComment` name a comment by its model id. The model keeps a comment
+table (thread root, resolved, deleted, and jade's `w:id` for comments loaded
+from the file); like Word and jade, threads are flat (a reply to a reply
+answers the root) and deleting a root deletes its replies. jade numbers the
+comments made in the session itself, reusing freed numbers, so the
+materializer records the number each new comment got instead of predicting
+it.
+
+`admit` preflights formatting and comment operations on a clone of the jade
+document and refuses what jade cannot do — for instance a reply whose root's
+text was deleted (jade re-anchors replies on the root's text).
+
 ### Spreadsheets (`jade-xlsx-collab`)
 
 Sheets have row and column identifier lists (sequenced lane) and cells are
@@ -264,29 +300,32 @@ Tests are written first. Three layers:
 
 Working: the two-lane protocol over WebSockets; docx text, paragraph
 split/join, table insertion/deletion and row/column structure on simple
-tables, text in any table cell; xlsx values, formulas (with rebasing),
-row/column structure, notes, and cell formatting (per-attribute LWW, A1
-ranges); index/A1-addressed intent APIs for people and agents;
-the `jade-collab` CLI; resume after a disconnect; an MCP server
-(`jade-collab-mcp`) through which agents join, read, edit and watch
-documents as replicas without a shell.
+tables, text in any table cell; docx formatting (character and paragraph)
+and comments (add, reply, resolve, delete; also comments loaded from the
+file) as sequenced operations on id ranges resolved in log order (§4); xlsx
+values, formulas (with rebasing), row/column structure, notes, and cell
+formatting (per-attribute LWW, A1 ranges); index/A1-addressed intent APIs
+for people and agents; the `jade-collab` CLI; resume after a disconnect; an
+MCP server (`jade-collab-mcp`) through which agents join, read, edit and
+watch documents as replicas without a shell.
 
 Not yet:
 
-* docx formatting (bold, styles, …) — planned as sequenced operations
-  addressed by character ids, then a Peritext-style mark CRDT for the
-  convergent lane. (xlsx cell formatting and notes are done.)
+* Optimistic formatting on the convergent lane (a Peritext-style mark CRDT);
+  formatting a story's last paragraph while it is empty (it has no atom to
+  name it by); editing comment text; comments in notes and headers.
 * xlsx borders, whole-row/column formats, conditional formats and threaded
   comments; note authors are not modelled (jade records `jade`).
 * docx merged cells and structure of merged/ragged/nested tables (their
   text is editable; the model already validates merges in `Grid`), text
-  boxes, notes, comments, tracked changes.
+  boxes, notes, tracked changes.
 * Creating or removing xlsx merges (the file's merges are loaded and
   follow structural changes), sheets added/renamed, Excel table structure.
 * Persistence of the log (today: export on demand, `--save` on exit),
   snapshots and log compaction, authentication and authorization, presence.
 * Performance: RGA lookups are linear and paragraph positions are recomputed
-  by walking the model on each operation; jade's xlsx editor rereads the
-  workbook on every write. Fine for the first milestone, not for large
+  by walking the model on each operation; formatting and comment operations
+  are preflighted on a copy of the jade document; jade's xlsx editor rereads
+  the workbook on every write. Fine for the first milestone, not for large
   documents.
 * `.pptx`.

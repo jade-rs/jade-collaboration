@@ -35,7 +35,9 @@ enum Cli {
     },
     /// Apply edits — one JSON object or an array — and wait for the server.
     /// docx: {"type":"insert_text","paragraph":0,"offset":0,"text":"…"},
-    /// delete_text, replace_range, insert_paragraph_break.
+    /// delete_text, replace_range, insert_paragraph_break,
+    /// format ({"type":"format",…,"change":{"kind":"bold","value":true}}), format_paragraphs,
+    /// add_comment, reply_to_comment / resolve_comment / delete_comment ("comment_id" from show).
     /// xlsx: {"type":"set_cell","sheet":"S","reference":"B2","value":{"kind":"number","value":1}},
     /// insert_row, delete_row, insert_column, delete_column.
     Apply { url: String, edits: String },
@@ -65,6 +67,17 @@ fn docx_json(model: &DocxModel) -> Value {
             .collect::<Vec<_>>(),
         "tables": model.tables().iter()
             .map(|t| json!({ "rows": t.rows.len(), "columns": t.columns.len(), "locked": t.locked }))
+            .collect::<Vec<_>>(),
+        // `id` is what reply_to_comment / resolve_comment / delete_comment take.
+        "comments": model.comments().iter()
+            .map(|c| json!({
+                "id": c.id.to_string(),
+                "file_id": c.file_id,
+                "parent": c.parent.map(|p| p.to_string()),
+                "author": c.content.author,
+                "text": c.content.text,
+                "resolved": c.resolved,
+            }))
             .collect::<Vec<_>>(),
     })
 }

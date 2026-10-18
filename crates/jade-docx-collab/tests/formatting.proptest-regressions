@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d28b00afa87bb0c28992423de622b0f25e2c1c9be901c2e8b75f7b5c074a968c # shrinks to texts = ["本 "], a = Index(9223372036854775808), b = Index(0), deleted = [Index(0)]
+cc 04989239172a030a0a0e7c0f0815220f8bfc8b65901ff20f09d2c2a1551622af # shrinks to texts = ["  a", " aaaaa"], a = Index(6148914691236517206), b = Index(0), deleted = []

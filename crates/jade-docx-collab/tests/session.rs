@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{generate, open};
+use common::{assert_comments_agree, generate, jade_comments, open};
 use jade_collab_sync::sim::Simulation;
 use jade_docx_collab::JadeDocx;
 use proptest::prelude::*;
@@ -32,7 +32,11 @@ proptest! {
 
     #[test]
     fn concurrent_sessions_converge_and_the_file_matches(
-        fixture in prop::sample::select(vec!["jade-core/hello.docx", "table-cell-spacing.docx"]),
+        fixture in prop::sample::select(vec![
+            "jade-core/hello.docx",
+            "table-cell-spacing.docx",
+            "comment.docx",
+        ]),
         steps in steps(),
     ) {
         let (model, jade) = open(fixture);
@@ -64,7 +68,9 @@ proptest! {
             prop_assert_eq!(sim.client(client).view(), server.document());
         }
         prop_assert_eq!(server.materializer().body_paragraph_texts(), server.document().paragraph_texts());
+        assert_comments_agree(server.document(), server.materializer(), "after the session");
         let reloaded = JadeDocx::load(&server.materializer().export().unwrap()).unwrap();
         prop_assert_eq!(reloaded.body_paragraph_texts(), server.document().paragraph_texts());
+        prop_assert_eq!(jade_comments(&reloaded).len(), server.document().comments().len());
     }
 }

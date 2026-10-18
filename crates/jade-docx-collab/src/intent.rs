@@ -8,13 +8,21 @@
 //! UTF-8 byte offsets on character boundaries. Resolving pins the caret to
 //! the character before it, so the edit keeps its meaning however long it
 //! takes to reach the server.
+//!
+//! Formatting and comments are named the same way: a range becomes the ids
+//! of its first and last character, so text edited concurrently moves with
+//! it. Comments are named by the model's id (`lamport@rN`, as
+//! [`DocxModel::comments`] lists them) or, for a comment that came with the
+//! file, by jade's `w:id`.
 
 use jade_collab_core::id::Id;
 use jade_collab_sync::Lane;
 use jade_docx_headless_api::{HeadlessCommand, HeadlessDeleteDirection};
 use serde::{Deserialize, Serialize};
 
-use crate::model::{DocxModel, DocxOp, Paragraph, StoryId};
+use crate::model::{
+    CommentContent, DocxModel, DocxOp, FormatChange, Paragraph, ParagraphAlignment, StoryId,
+};
 
 fn one() -> usize {
     1
@@ -51,6 +59,56 @@ pub enum IntentOp {
         #[serde(default = "one")]
         count: usize,
     },
+    /// Formats the text between two carets. A range that crosses a table
+    /// formats every story it crosses; a paragraph change formats the
+    /// paragraphs the range touches.
+    Format {
+        start_paragraph: usize,
+        start_offset: usize,
+        end_paragraph: usize,
+        end_offset: usize,
+        change: FormatChange,
+    },
+    /// Formats whole paragraphs `start_paragraph..=end_paragraph`.
+    FormatParagraphs {
+        start_paragraph: usize,
+        end_paragraph: usize,
+        change: FormatChange,
+    },
+    /// Like jade's `add_comment`: omitted offsets mean the start of the first
+    /// paragraph and the end of the last. Both ends must be in one story.
+    AddComment {
+        start_paragraph: usize,
+        #[serde(default)]
+        start_offset: Option<usize>,
+        end_paragraph: usize,
+        #[serde(default)]
+        end_offset: Option<usize>,
+        text: String,
+        #[serde(default)]
+        author: Option<String>,
+        #[serde(default)]
+        initials: Option<String>,
+        #[serde(default)]
+        date: Option<String>,
+    },
+    ReplyToComment {
+        comment_id: String,
+        text: String,
+        #[serde(default)]
+        author: Option<String>,
+        #[serde(default)]
+        initials: Option<String>,
+        #[serde(default)]
+        date: Option<String>,
+    },
+    ResolveComment {
+        comment_id: String,
+        resolved: bool,
+    },
+    DeleteComment {
+        comment_id: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -63,6 +121,14 @@ pub enum IntentError {
     InvertedRange,
     #[error("the range spans more than one story (body, table cell)")]
     CrossStory,
+    #[error("the range holds no text")]
+    EmptyRange,
+    #[error("paragraph {0} is empty and ends its story: there is nothing to name it by")]
+    EmptyParagraph(usize),
+    #[error("{0}")]
+    InvalidFormat(String),
+    #[error("no comment {0:?}")]
+    NoSuchComment(String),
 }
 
 /// A headless command with no collaborative intent form.
@@ -120,6 +186,184 @@ impl TryFrom<HeadlessCommand> for IntentOp {
                 offset,
                 count,
             }),
+            HeadlessCommand::ApplyBold {
+                start_paragraph,
+                start_offset,
+                end_paragraph,
+                end_offset,
+                enabled: value,
+            }
+            | HeadlessCommand::SetBold {
+                start_paragraph,
+                start_offset,
+                end_paragraph,
+                end_offset,
+                value,
+            } => Ok(format(
+                (start_paragraph, start_offset),
+                (end_paragraph, end_offset),
+                FormatChange::Bold { value },
+            )),
+            HeadlessCommand::ApplyItalic {
+                start_paragraph,
+                start_offset,
+                end_paragraph,
+                end_offset,
+                enabled,
+            } => Ok(format(
+                (start_paragraph, start_offset),
+                (end_paragraph, end_offset),
+                FormatChange::Italic { value: enabled },
+            )),
+            HeadlessCommand::ApplyUnderline {
+                start_paragraph,
+                start_offset,
+                end_paragraph,
+                end_offset,
+                kind,
+                enabled,
+            } => Ok(format(
+                (start_paragraph, start_offset),
+                (end_paragraph, end_offset),
+                FormatChange::Underline {
+                    value: enabled,
+                    style: kind,
+                },
+            )),
+            HeadlessCommand::ApplyStrike {
+                start_paragraph,
+                start_offset,
+                end_paragraph,
+                end_offset,
+                double,
+                enabled,
+            } => Ok(format(
+                (start_paragraph, start_offset),
+                (end_paragraph, end_offset),
+                FormatChange::Strike {
+                    value: enabled,
+                    double,
+                },
+            )),
+            HeadlessCommand::SetFontSize {
+                start_paragraph,
+                start_offset,
+                end_paragraph,
+                end_offset,
+                font_size,
+            } if font_size.is_finite() && font_size > 0.0 => Ok(format(
+                (start_paragraph, start_offset),
+                (end_paragraph, end_offset),
+                // jade rounds to half points too.
+                FormatChange::FontSize {
+                    half_points: (font_size * 2.0).round().min(u32::MAX as f32) as u32,
+                },
+            )),
+            HeadlessCommand::SetFontFamily {
+                start_paragraph,
+                start_offset,
+                end_paragraph,
+                end_offset,
+                font_family,
+            } => Ok(format(
+                (start_paragraph, start_offset),
+                (end_paragraph, end_offset),
+                FormatChange::FontFamily {
+                    family: font_family,
+                },
+            )),
+            HeadlessCommand::SetFontColor {
+                start_paragraph,
+                start_offset,
+                end_paragraph,
+                end_offset,
+                color,
+            } => Ok(format(
+                (start_paragraph, start_offset),
+                (end_paragraph, end_offset),
+                FormatChange::FontColor { color },
+            )),
+            HeadlessCommand::SetHighlightColor {
+                start_paragraph,
+                start_offset,
+                end_paragraph,
+                end_offset,
+                color,
+            } => Ok(format(
+                (start_paragraph, start_offset),
+                (end_paragraph, end_offset),
+                FormatChange::Highlight { color },
+            )),
+            HeadlessCommand::ClearFormatting {
+                start_paragraph,
+                start_offset,
+                end_paragraph,
+                end_offset,
+            } => Ok(format(
+                (start_paragraph, start_offset),
+                (end_paragraph, end_offset),
+                FormatChange::ClearFormatting,
+            )),
+            HeadlessCommand::SetParagraphAlignment {
+                start_paragraph,
+                end_paragraph,
+                ref alignment,
+            } if ParagraphAlignment::from_jade(alignment).is_some() => Ok(Self::FormatParagraphs {
+                start_paragraph,
+                end_paragraph,
+                change: FormatChange::Alignment {
+                    alignment: ParagraphAlignment::from_jade(alignment).expect("checked"),
+                },
+            }),
+            HeadlessCommand::SetParagraphStyle {
+                start_paragraph,
+                end_paragraph,
+                style_id,
+            } => Ok(Self::FormatParagraphs {
+                start_paragraph,
+                end_paragraph,
+                change: FormatChange::ParagraphStyle { style_id },
+            }),
+            HeadlessCommand::AddComment {
+                start_paragraph,
+                start_offset,
+                end_paragraph,
+                end_offset,
+                text,
+                author,
+                initials,
+                date,
+            } => Ok(Self::AddComment {
+                start_paragraph,
+                start_offset,
+                end_paragraph,
+                end_offset,
+                text,
+                author,
+                initials,
+                date,
+            }),
+            HeadlessCommand::ReplyToComment {
+                comment_id,
+                text,
+                author,
+                initials,
+                date,
+            } => Ok(Self::ReplyToComment {
+                comment_id,
+                text,
+                author,
+                initials,
+                date,
+            }),
+            HeadlessCommand::ResolveComment {
+                comment_id,
+                resolved,
+            } => Ok(Self::ResolveComment {
+                comment_id,
+                resolved,
+            }),
+            HeadlessCommand::DeleteComment { comment_id } => Ok(Self::DeleteComment { comment_id }),
             other => Err(UnsupportedCommand {
                 command_name: other.name(),
                 lane,
@@ -128,9 +372,21 @@ impl TryFrom<HeadlessCommand> for IntentOp {
     }
 }
 
+fn format(start: (usize, usize), end: (usize, usize), change: FormatChange) -> IntentOp {
+    IntentOp::Format {
+        start_paragraph: start.0,
+        start_offset: start.1,
+        end_paragraph: end.0,
+        end_offset: end.1,
+        change,
+    }
+}
+
 /// The lane a headless command needs. Plain text edits commute; everything
 /// else — formatting, structure, comments, revisions, page setup — rewrites
-/// state other edits depend on and goes through the sequencer.
+/// state other edits depend on and goes through the sequencer. (Formatting
+/// and comments are sequenced so jade applies them in one order: two
+/// concurrent formats of overlapping ranges must end the same everywhere.)
 pub fn lane_for_command(command: &HeadlessCommand) -> Lane {
     match command {
         HeadlessCommand::InsertText { .. }
@@ -291,5 +547,190 @@ pub fn resolve(
             }
             Ok(ops)
         }
+        IntentOp::Format {
+            start_paragraph,
+            start_offset,
+            end_paragraph,
+            end_offset,
+            change,
+        } => {
+            change.validate().map_err(IntentError::InvalidFormat)?;
+            caret(&paragraphs, *start_paragraph, *start_offset)?;
+            caret(&paragraphs, *end_paragraph, *end_offset)?;
+            if (*start_paragraph, *start_offset) > (*end_paragraph, *end_offset) {
+                return Err(IntentError::InvertedRange);
+            }
+            // Each paragraph's slice of the range: characters, and the mark
+            // when the range runs past it.
+            let slices = (*start_paragraph..=*end_paragraph).map(|n| {
+                let p = &paragraphs[n];
+                let from = if n == *start_paragraph {
+                    chars_before(p, *start_offset)
+                } else {
+                    0
+                };
+                let to = if n == *end_paragraph {
+                    chars_before(p, *end_offset)
+                } else {
+                    p.chars.len()
+                };
+                let mark = p.mark.filter(|_| n < *end_paragraph);
+                (p.story, p.chars[from..to].iter().copied().chain(mark))
+            });
+            Ok(per_story(slices)
+                .into_iter()
+                .map(|(story, first, last)| DocxOp::Format {
+                    story,
+                    start: first,
+                    end: last,
+                    change: change.clone(),
+                })
+                .collect())
+        }
+        IntentOp::FormatParagraphs {
+            start_paragraph,
+            end_paragraph,
+            change,
+        } => {
+            change.validate().map_err(IntentError::InvalidFormat)?;
+            for n in [*start_paragraph, *end_paragraph] {
+                if n >= paragraphs.len() {
+                    return Err(IntentError::NoSuchParagraph(n));
+                }
+            }
+            if start_paragraph > end_paragraph {
+                return Err(IntentError::InvertedRange);
+            }
+            let mut slices = Vec::new();
+            for (n, p) in paragraphs
+                .iter()
+                .enumerate()
+                .take(end_paragraph + 1)
+                .skip(*start_paragraph)
+            {
+                if p.chars.is_empty() && p.mark.is_none() {
+                    return Err(IntentError::EmptyParagraph(n));
+                }
+                slices.push((p.story, p.chars.iter().copied().chain(p.mark)));
+            }
+            Ok(per_story(slices)
+                .into_iter()
+                .map(|(story, first, last)| DocxOp::Format {
+                    story,
+                    start: first,
+                    end: last,
+                    change: change.clone(),
+                })
+                .collect())
+        }
+        IntentOp::AddComment {
+            start_paragraph,
+            start_offset,
+            end_paragraph,
+            end_offset,
+            text,
+            author,
+            initials,
+            date,
+        } => {
+            let end_offset = match end_offset {
+                Some(offset) => *offset,
+                None => paragraphs
+                    .get(*end_paragraph)
+                    .ok_or(IntentError::NoSuchParagraph(*end_paragraph))?
+                    .text
+                    .len(),
+            };
+            let start = caret(&paragraphs, *start_paragraph, start_offset.unwrap_or(0))?;
+            let end = caret(&paragraphs, *end_paragraph, end_offset)?;
+            if start.story != end.story {
+                return Err(IntentError::CrossStory);
+            }
+            if start.index > end.index {
+                return Err(IntentError::InvertedRange);
+            }
+            let chars: Vec<Id> = story_atoms(&paragraphs, start.story)[start.index..end.index]
+                .iter()
+                .filter_map(|a| a.ok())
+                .collect();
+            let (Some(first), Some(last)) = (chars.first(), chars.last()) else {
+                return Err(IntentError::EmptyRange);
+            };
+            Ok(vec![DocxOp::AddComment {
+                story: start.story,
+                start: *first,
+                end: *last,
+                id: ids(1),
+                content: CommentContent {
+                    text: text.clone(),
+                    author: author.clone(),
+                    initials: initials.clone(),
+                    date: date.clone(),
+                },
+            }])
+        }
+        IntentOp::ReplyToComment {
+            comment_id,
+            text,
+            author,
+            initials,
+            date,
+        } => Ok(vec![DocxOp::ReplyToComment {
+            comment: comment(view, comment_id)?,
+            id: ids(1),
+            content: CommentContent {
+                text: text.clone(),
+                author: author.clone(),
+                initials: initials.clone(),
+                date: date.clone(),
+            },
+        }]),
+        IntentOp::ResolveComment {
+            comment_id,
+            resolved,
+        } => Ok(vec![DocxOp::ResolveComment {
+            comment: comment(view, comment_id)?,
+            resolved: *resolved,
+        }]),
+        IntentOp::DeleteComment { comment_id } => Ok(vec![DocxOp::DeleteComment {
+            comment: comment(view, comment_id)?,
+        }]),
     }
+}
+
+fn chars_before(p: &Paragraph, offset: usize) -> usize {
+    p.text[..offset].chars().count()
+}
+
+/// The first and last atom of each story among `slices`, in the order the
+/// stories first appear; stories with no atom in range are left out.
+fn per_story<I: IntoIterator<Item = Id>>(
+    slices: impl IntoIterator<Item = (StoryId, I)>,
+) -> Vec<(StoryId, Id, Id)> {
+    let mut out: Vec<(StoryId, Id, Id)> = Vec::new();
+    for (story, atoms) in slices {
+        for atom in atoms {
+            match out.iter_mut().find(|(s, _, _)| *s == story) {
+                Some(entry) => entry.2 = atom,
+                None => out.push((story, atom, atom)),
+            }
+        }
+    }
+    out
+}
+
+/// A live comment named by its model id (`lamport@rN`) or its `w:id` in the
+/// file.
+fn comment(view: &DocxModel, key: &str) -> Result<Id, IntentError> {
+    let parsed = key.split_once('@').and_then(|(lamport, replica)| {
+        Some(Id::new(
+            lamport.parse().ok()?,
+            jade_collab_core::id::ReplicaId(replica.strip_prefix('r')?.parse().ok()?),
+        ))
+    });
+    view.comments()
+        .into_iter()
+        .find(|c| Some(c.id) == parsed || c.file_id.as_deref() == Some(key))
+        .map(|c| c.id)
+        .ok_or_else(|| IntentError::NoSuchComment(key.to_string()))
 }
