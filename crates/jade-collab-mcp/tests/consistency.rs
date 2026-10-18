@@ -1,14 +1,21 @@
 //! Random sequences of tool calls — valid, invalid and malformed — never
 //! break the server, and every session it holds reads what a replica
-//! outside MCP reads once both have caught up.
+//! outside MCP reads once both have caught up. Each `apply_edits` is also
+//! replayed on that replica's model, one edit at a time against the state
+//! the previous ones left: the statuses and the resulting document must
+//! match.
 
 mod common;
 
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
-use common::{Agent, Hosted, DOCX, XLSX};
+use common::{statuses, Agent, Hosted, DOCX, XLSX};
+use jade_collab_core::id::{Id, ReplicaId};
 use jade_collab_mcp::{read_docx, read_xlsx};
-use jade_docx_collab::DocxModel;
+use jade_collab_server::Client;
+use jade_collab_sync::{ApplyContext, Document};
+use jade_docx_collab::{Anchor, DocxModel, DocxOp, StoryId};
 use jade_xlsx_collab::XlsxModel;
 use proptest::prelude::*;
 use serde_json::{json, Value};
@@ -37,9 +44,11 @@ enum Step {
         start: u64,
         limit: u64,
     },
+    /// Each edit comes in a docx and an xlsx form; the session's format
+    /// picks one, except where `foreign` sends the other format's.
     Apply {
         session: usize,
-        edits: Vec<Value>,
+        edits: Vec<(Value, Value, bool)>,
     },
     Wait {
         session: usize,
@@ -54,15 +63,21 @@ fn text() -> impl Strategy<Value = String> {
     prop::sample::select(vec!["", "a", "日本", "x y", "\u{1F600}", "\n"]).prop_map(String::from)
 }
 
+/// Most paragraphs are short or empty, so offsets favour the start.
+fn offset() -> impl Strategy<Value = usize> {
+    prop_oneof![2 => Just(0usize), 1 => 0..7usize]
+}
+
 fn docx_edit() -> impl Strategy<Value = Value> {
+    let paragraph = || 0..8usize;
     prop_oneof![
-        (0..5usize, 0..8usize, text()).prop_map(|(p, o, t)| json!({ "type": "insert_text", "paragraph": p, "offset": o, "text": t })),
-        (0..5usize, 0..8usize, any::<bool>(), 0..4usize).prop_map(|(p, o, forward, n)| json!({
+        (paragraph(), offset(), text()).prop_map(|(p, o, t)| json!({ "type": "insert_text", "paragraph": p, "offset": o, "text": t })),
+        (paragraph(), offset(), any::<bool>(), 0..4usize).prop_map(|(p, o, forward, n)| json!({
             "type": "delete_text", "paragraph": p, "offset": o,
             "direction": if forward { "forward" } else { "backward" }, "count": n
         })),
-        (0..5usize, 0..8usize, 0..3usize).prop_map(|(p, o, n)| json!({ "type": "insert_paragraph_break", "paragraph": p, "offset": o, "count": n })),
-        (0..4usize, 0..6usize, 0..4usize, 0..6usize, text()).prop_map(|(sp, so, ep, eo, t)| json!({
+        (paragraph(), offset(), 0..3usize).prop_map(|(p, o, n)| json!({ "type": "insert_paragraph_break", "paragraph": p, "offset": o, "count": n })),
+        (paragraph(), offset(), paragraph(), offset(), text()).prop_map(|(sp, so, ep, eo, t)| json!({
             "type": "replace_range", "start_paragraph": sp, "start_offset": so,
             "end_paragraph": ep, "end_offset": eo, "text": t
         })),
@@ -92,13 +107,13 @@ fn xlsx_edit() -> impl Strategy<Value = Value> {
     ]
 }
 
-fn edit() -> impl Strategy<Value = Value> {
-    prop_oneof![
-        4 => docx_edit(),
-        4 => xlsx_edit(),
-        1 => Just(json!({ "type": "explode" })),
-        1 => Just(json!("insert_text")),
-    ]
+fn edit() -> impl Strategy<Value = (Value, Value, bool)> {
+    let junk = prop::sample::select(vec![json!({ "type": "explode" }), json!("insert_text")]);
+    (
+        prop_oneof![9 => docx_edit(), 1 => junk.clone()],
+        prop_oneof![9 => xlsx_edit(), 1 => junk],
+        prop::bool::weighted(0.1),
+    )
 }
 
 fn step() -> impl Strategy<Value = Step> {
@@ -107,7 +122,7 @@ fn step() -> impl Strategy<Value = Step> {
         2 => any::<bool>().prop_map(|xlsx| Step::Join { xlsx }),
         1 => session.clone().prop_map(|session| Step::Leave { session }),
         2 => (session.clone(), 0..20u64, 1..20u64).prop_map(|(session, start, limit)| Step::Read { session, start, limit }),
-        6 => (session.clone(), prop::collection::vec(edit(), 0..4)).prop_map(|(session, edits)| Step::Apply { session, edits }),
+        6 => (session.clone(), prop::collection::vec(edit(), 0..5)).prop_map(|(session, edits)| Step::Apply { session, edits }),
         1 => (session, 0..10u64).prop_map(|(session, after)| Step::Wait { session, after }),
         1 => prop::sample::select(vec![
             json!({ "name": "read_document", "arguments": { "session_id": "nope" } }),
@@ -128,6 +143,70 @@ fn step() -> impl Strategy<Value = Step> {
     ]
 }
 
+/// Applies `edits` to `model` the way the tool promises to: each resolved
+/// against the state the previous ones left, an edit whose operation is
+/// refused stopping there. Returns the statuses.
+fn replay<D: Document>(
+    model: &mut D,
+    edits: &[Value],
+    seq: u64,
+    resolve: impl Fn(&D, Value, &mut dyn FnMut(u64) -> Id) -> Result<Vec<D::Op>, String>,
+) -> Vec<String> {
+    // Fresh ids are newer than anything in the document, as a replica's are.
+    let mut next = model.max_lamport() + 1;
+    let mut committed = seq;
+    edits
+        .iter()
+        .map(|edit| {
+            let mut ids = |n: u64| {
+                let id = Id::new(next, ReplicaId(u64::MAX));
+                next += n;
+                id
+            };
+            let ops = match resolve(model, edit.clone(), &mut ids) {
+                Ok(ops) => ops,
+                Err(_) => return "invalid".to_string(),
+            };
+            for op in ops {
+                committed += 1;
+                let ctx = ApplyContext {
+                    origin: ReplicaId(u64::MAX),
+                    base_seq: seq,
+                    seq: Some(committed),
+                };
+                if model.apply(&op, &ctx).is_err() {
+                    return "rejected".to_string();
+                }
+            }
+            "applied".to_string()
+        })
+        .collect()
+}
+
+fn replay_docx(model: &mut DocxModel, edits: &[Value], seq: u64) -> Vec<String> {
+    replay(model, edits, seq, |view, edit, ids| {
+        let intent = serde_json::from_value(edit).map_err(|e| e.to_string())?;
+        jade_docx_collab::intent::resolve(view, &intent, ids).map_err(|e| e.to_string())
+    })
+}
+
+fn replay_xlsx(model: &mut XlsxModel, edits: &[Value], seq: u64) -> Vec<String> {
+    replay(model, edits, seq, |view, edit, ids| {
+        let intent = serde_json::from_value(edit).map_err(|e| e.to_string())?;
+        jade_xlsx_collab::intent::resolve(view, &intent, ids)
+            .map(|op| vec![op])
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// A read without the replica's position, to compare with a rendering.
+fn content(mut read: Value) -> Value {
+    let object = read.as_object_mut().unwrap();
+    object.remove("seq");
+    object.remove("pending");
+    read
+}
+
 /// A session the agent believes it holds.
 struct Joined {
     id: String,
@@ -137,6 +216,27 @@ struct Joined {
 async fn run(steps: Vec<Step>) {
     let hosted = Hosted::start().await;
     let mut agent = Agent::new();
+    let docx: Client<DocxModel> = hosted.direct(DOCX).await;
+    // A table after the first paragraph gives the edits cells to land in
+    // and paragraphs they cannot join.
+    let end = docx.view().paragraphs()[0].chars.last().copied();
+    let mark = docx.reserve(1);
+    docx.submit(DocxOp::SplitParagraph {
+        story: StoryId::Body,
+        parent: end,
+        id: mark,
+    })
+    .unwrap();
+    let first = docx.reserve(5);
+    docx.submit(DocxOp::InsertTable {
+        anchor: Anchor::After(mark),
+        id: first,
+        rows: vec![first.offset(1), first.offset(2)],
+        columns: vec![first.offset(3), first.offset(4)],
+    })
+    .unwrap();
+    docx.settle().await.unwrap();
+    let xlsx: Client<XlsxModel> = hosted.direct(XLSX).await;
     let mut sessions: Vec<Joined> = Vec::new();
     let pick = |sessions: &[Joined], i: usize| -> Option<String> {
         (!sessions.is_empty()).then(|| sessions[i % sessions.len()].id.clone())
@@ -176,23 +276,39 @@ async fn run(steps: Vec<Step>) {
                 }
             }
             Step::Apply { session, edits } => {
-                if let Some(id) = pick(&sessions, session) {
-                    let count = edits.len();
-                    let applied = agent.apply(&id, Value::Array(edits)).await;
-                    let results = applied["results"].as_array().unwrap();
-                    assert_eq!(results.len(), count);
-                    for result in results {
-                        let status = result["status"].as_str().unwrap();
-                        assert!(
-                            ["applied", "rejected", "invalid"].contains(&status),
-                            "{applied}"
-                        );
-                    }
+                if let Some(i) = (!sessions.is_empty()).then(|| session % sessions.len()) {
+                    let Joined { id, name } = &sessions[i];
+                    let edits: Vec<Value> = edits
+                        .into_iter()
+                        .map(|(d, x, foreign)| if (*name == DOCX) != foreign { d } else { x })
+                        .collect();
+                    // Bring the session and the independent replica to the
+                    // server's position; they must read the same.
+                    let seq = hosted.server.seq(name).await.unwrap();
+                    agent.catch_up(id, seq).await;
+                    let before = content(agent.read_all(id).await);
+                    let (expected, after) = if *name == DOCX {
+                        hosted.catch_up(DOCX, &docx).await;
+                        let mut model = docx.view();
+                        assert_eq!(before, read_docx(&model, 0, usize::MAX));
+                        let expected = replay_docx(&mut model, &edits, seq);
+                        (expected, read_docx(&model, 0, usize::MAX))
+                    } else {
+                        hosted.catch_up(XLSX, &xlsx).await;
+                        let mut model = xlsx.view();
+                        assert_eq!(before, read_xlsx(&model, 0, usize::MAX));
+                        let expected = replay_xlsx(&mut model, &edits, seq);
+                        (expected, read_xlsx(&model, 0, usize::MAX))
+                    };
+                    let applied = agent.apply(id, json!(edits)).await;
+                    assert_eq!(statuses(&applied), expected, "{applied}");
                     assert_eq!(applied["pending"], json!(0), "{applied}");
+                    assert_eq!(content(agent.read_all(id).await), after);
                 }
             }
             Step::Wait { session, after } => {
                 if let Some(id) = pick(&sessions, session) {
+                    let started = Instant::now();
                     let waited = agent
                         .tool(
                             "wait_for_changes",
@@ -201,6 +317,12 @@ async fn run(steps: Vec<Step>) {
                         .await;
                     let seq = waited["seq"].as_u64().unwrap();
                     assert_eq!(waited["changed"], json!(seq > after), "{waited}");
+                    if seq <= after {
+                        assert!(
+                            started.elapsed() >= Duration::from_millis(20),
+                            "returned early"
+                        );
+                    }
                 }
             }
             Step::Bad(params) => {
@@ -221,17 +343,11 @@ async fn run(steps: Vec<Step>) {
         agent.catch_up(&joined.id, seq).await;
         let read = agent.read_all(&joined.id).await;
         let mut expected = if joined.name == DOCX {
-            read_docx(
-                &hosted.direct::<DocxModel>(DOCX).await.view(),
-                0,
-                usize::MAX,
-            )
+            hosted.catch_up(DOCX, &docx).await;
+            read_docx(&docx.view(), 0, usize::MAX)
         } else {
-            read_xlsx(
-                &hosted.direct::<XlsxModel>(XLSX).await.view(),
-                0,
-                usize::MAX,
-            )
+            hosted.catch_up(XLSX, &xlsx).await;
+            read_xlsx(&xlsx.view(), 0, usize::MAX)
         };
         expected["seq"] = json!(seq);
         expected["pending"] = json!(0);

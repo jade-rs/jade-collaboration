@@ -358,6 +358,7 @@ async fn wait_for_changes_sees_other_replicas_edits() {
     let mut agent = Agent::new();
     let book = agent.join(&hosted.url(XLSX)).await;
 
+    let started = std::time::Instant::now();
     let quiet = agent
         .tool(
             "wait_for_changes",
@@ -365,6 +366,7 @@ async fn wait_for_changes_sees_other_replicas_edits() {
         )
         .await;
     assert_eq!(quiet, json!({ "changed": false, "seq": 0 }));
+    assert!(started.elapsed() >= std::time::Duration::from_millis(50));
 
     let person = hosted.direct::<XlsxModel>(XLSX).await;
     let (sheet, row, column) = person.view().locate("Operations", "F8").unwrap();
