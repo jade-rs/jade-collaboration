@@ -23,6 +23,8 @@ pub struct Sequencer<D: Document, M = NoMaterializer> {
     processed: BTreeMap<ReplicaId, u64>,
     next_replica: u64,
     faults: Vec<String>,
+    /// Operations derived since the last [`Sequencer::take_derived`].
+    derived: Vec<Committed<D::Op>>,
 }
 
 /// Everything a sequencer is at one log position, except the materializer
@@ -107,6 +109,7 @@ impl<D: Document, M: Materializer<D>> Sequencer<D, M> {
             processed: BTreeMap::new(),
             next_replica: ReplicaId::ORIGIN.0 + 1,
             faults: Vec::new(),
+            derived: Vec::new(),
         }
     }
 
@@ -121,6 +124,7 @@ impl<D: Document, M: Materializer<D>> Sequencer<D, M> {
             processed: checkpoint.processed,
             next_replica: checkpoint.next_replica,
             faults: checkpoint.faults,
+            derived: Vec::new(),
         }
     }
 
@@ -200,7 +204,8 @@ impl<D: Document, M: Materializer<D>> Sequencer<D, M> {
                 self.join();
             }
             Record::Committed(committed) => {
-                if !self.processed.contains_key(&committed.origin) {
+                let derived = committed.origin == ReplicaId::ORIGIN;
+                if !derived && !self.processed.contains_key(&committed.origin) {
                     return Err(SyncError::UnknownReplica(committed.origin));
                 }
                 if committed.seq != self.seq() + 1 {
@@ -221,8 +226,10 @@ impl<D: Document, M: Materializer<D>> Sequencer<D, M> {
                     }
                 })?;
                 self.materialize(effect, &ctx);
-                self.processed
-                    .insert(committed.origin, committed.client_seq);
+                if !derived {
+                    self.processed
+                        .insert(committed.origin, committed.client_seq);
+                }
                 self.log.push(committed);
             }
             Record::Rejected {
@@ -236,6 +243,43 @@ impl<D: Document, M: Materializer<D>> Sequencer<D, M> {
             }
         }
         Ok(())
+    }
+
+    /// Commits what the real document did on its own after `cause`, as
+    /// operations of [`ReplicaId::ORIGIN`]. A derived operation the model
+    /// refuses is a fault.
+    fn derive(&mut self, cause: &D::Op) {
+        for op in self.materializer.derived(&self.document, cause) {
+            let seq = self.seq() + 1;
+            let ctx = ApplyContext {
+                origin: ReplicaId::ORIGIN,
+                base_seq: seq - 1,
+                seq: Some(seq),
+            };
+            match self.document.apply(&op, &ctx) {
+                Ok(effect) => {
+                    self.materialize(effect, &ctx);
+                    let committed = Committed {
+                        seq,
+                        origin: ReplicaId::ORIGIN,
+                        client_seq: 0,
+                        base_seq: seq - 1,
+                        op,
+                    };
+                    self.log.push(committed.clone());
+                    self.derived.push(committed);
+                }
+                Err(reason) => self.faults.push(format!(
+                    "seq {seq}: derived {op:?} does not apply: {reason}"
+                )),
+            }
+        }
+    }
+
+    /// The operations derived since the last call, already in the log, for
+    /// the caller to journal and broadcast after the commit that caused them.
+    pub fn take_derived(&mut self) -> Vec<Committed<D::Op>> {
+        std::mem::take(&mut self.derived)
     }
 
     fn materialize(&mut self, effect: D::Effect, ctx: &ApplyContext) {
@@ -356,6 +400,7 @@ impl<D: Document, M: Materializer<D>> Sequencer<D, M> {
                     op: submission.op,
                 };
                 self.log.push(committed.clone());
+                self.derive(&committed.op);
                 SubmitOutcome::Committed(committed)
             }
             Err(reason) => SubmitOutcome::Rejected(Rejected {

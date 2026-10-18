@@ -168,6 +168,12 @@ impl<D: Document, M: Materializer<D>> Simulation<D, M> {
                 for queue in &mut self.down {
                     queue.push_back(message.clone());
                 }
+                for derived in self.server.take_derived() {
+                    self.journal.push(Record::Committed(derived.clone()));
+                    for queue in &mut self.down {
+                        queue.push_back(Downstream::Committed(derived.clone()));
+                    }
+                }
             }
             SubmitOutcome::Rejected(_) => {
                 self.stats.rejected[slot(lane)] += 1;

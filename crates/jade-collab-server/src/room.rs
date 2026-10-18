@@ -384,6 +384,13 @@ impl<H: Hosted> Hosting<H> {
                             let json =
                                 ServerMessage::Committed(committed_json(committed)).to_json();
                             subscribers.retain(|_, outbox| outbox.send(json.clone()).is_ok());
+                            // What jade did on its own, right after its cause.
+                            for derived in self.sequencer.take_derived() {
+                                self.journal(Record::Committed(derived.clone()))?;
+                                let json =
+                                    ServerMessage::Committed(committed_json(derived)).to_json();
+                                subscribers.retain(|_, outbox| outbox.send(json.clone()).is_ok());
+                            }
                         }
                         SubmitOutcome::Rejected(rejected) => {
                             if let Some(outbox) = subscribers.get(&replica) {

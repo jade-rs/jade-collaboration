@@ -107,6 +107,15 @@ pub trait Materializer<D: Document> {
         Ok(())
     }
 
+    /// What the real document did on its own after `cause` was committed
+    /// that the model cannot predict (a spreadsheet naming a new table
+    /// column, say), as operations the server commits right after `cause` on
+    /// behalf of [`ReplicaId::ORIGIN`]. Never called when a log is replayed:
+    /// derived operations are in the log.
+    fn derived(&mut self, _document: &D, _cause: &D::Op) -> Vec<D::Op> {
+        Vec::new()
+    }
+
     fn materialize(
         &mut self,
         document: &D,

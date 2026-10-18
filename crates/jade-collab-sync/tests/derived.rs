@@ -31,7 +31,10 @@ impl Materializer<ToyDoc> for Filler {
             ToyOp::Grid(GridOp::InsertRow { id, .. }) => vec![ToyOp::SetCell {
                 row: *id,
                 col: document.grid.all_columns()[0],
-                stamp: Id::new(jade_collab_sync::Document::max_lamport(document) + 1, ReplicaId::ORIGIN),
+                stamp: Id::new(
+                    jade_collab_sync::Document::max_lamport(document) + 1,
+                    ReplicaId::ORIGIN,
+                ),
                 value: 42,
             }],
             _ => Vec::new(),
@@ -78,7 +81,12 @@ fn a_journal_replays_derived_operations_without_deriving_them_again() {
     for (k, id) in [(1, 100), (2, 101)] {
         let outcome = server.submit(a, insert_row(k, id));
         journal.extend(outcome.record(a));
-        journal.extend(server.take_derived().into_iter().map(jade_collab_sync::Record::Committed));
+        journal.extend(
+            server
+                .take_derived()
+                .into_iter()
+                .map(jade_collab_sync::Record::Committed),
+        );
     }
     let mut replayed = Sequencer::restore(start, Filler::default());
     for record in journal {
@@ -86,7 +94,11 @@ fn a_journal_replays_derived_operations_without_deriving_them_again() {
     }
     assert_eq!(replayed.document(), server.document());
     assert_eq!(replayed.log(), server.log());
-    assert_eq!(replayed.materializer().asked, 0, "replay re-derives nothing");
+    assert_eq!(
+        replayed.materializer().asked,
+        0,
+        "replay re-derives nothing"
+    );
     assert!(replayed.take_derived().is_empty());
 }
 
@@ -118,12 +130,15 @@ proptest! {
         for client in 0..3 {
             prop_assert_eq!(sim.client(client).view(), sim.server().document());
         }
-        // Every inserted row got its derived value.
-        let doc = sim.server().document();
-        let first = doc.grid.all_columns()[0];
-        for row in doc.grid.all_rows() {
-            if row.replica != ReplicaId::ORIGIN {
-                prop_assert_eq!(doc.cell(row, first), Some(42));
+        // Every committed row insertion was followed by its derived write
+        // (later writes may overwrite the value: last writer wins).
+        let log = sim.server().log();
+        for (k, entry) in log.iter().enumerate() {
+            if let ToyOp::Grid(GridOp::InsertRow { id, .. }) = entry.op {
+                let next = &log[k + 1];
+                prop_assert_eq!(next.origin, ReplicaId::ORIGIN);
+                let fills = matches!(next.op, ToyOp::SetCell { row, value: 42, .. } if row == id);
+                prop_assert!(fills, "{:?} after inserting {:?}", next.op, id);
             }
         }
     }
