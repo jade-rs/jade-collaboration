@@ -96,3 +96,49 @@ fn serve_apply_and_show() {
         .unwrap();
     assert!(!output.status.success());
 }
+
+fn serve(args: &[&std::ffi::OsStr]) -> (Serve, String) {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let server = Serve(
+        bin()
+            .args(["serve", "--addr", &addr])
+            .args(args)
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while std::net::TcpStream::connect(&addr).is_err() {
+        assert!(Instant::now() < deadline, "server did not start");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    (server, addr)
+}
+
+#[test]
+fn serve_with_a_data_directory_survives_a_kill() {
+    let dir = std::env::temp_dir().join(format!("jade-collab-cli-data-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let core = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../jade-core");
+    let file = dir.join("hello.docx");
+    std::fs::copy(core.join("hello.docx"), &file).unwrap();
+    let data = dir.join("data");
+
+    let (server, addr) = serve(&["--data".as_ref(), data.as_os_str(), file.as_os_str()]);
+    let docx = format!("ws://{addr}/documents/hello.docx/ws");
+    run(&[
+        "apply",
+        &docx,
+        r#"{"type":"insert_text","paragraph":0,"offset":0,"text":"Durable: "}"#,
+    ]);
+    drop(server); // killed, never saved
+
+    // The stored document wins over the file it was first opened from.
+    let (_server, addr) = serve(&["--data".as_ref(), data.as_os_str(), file.as_os_str()]);
+    let docx = format!("ws://{addr}/documents/hello.docx/ws");
+    let shown = run(&["show", &docx]);
+    assert!(shown.contains("Durable: Hello"), "{shown}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
