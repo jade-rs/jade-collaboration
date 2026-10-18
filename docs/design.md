@@ -208,6 +208,7 @@ jade's parsed body.
 | `jade-docx-collab` | docx model + operations, loading from a jade `WordDocument`, materialization to `HeadlessCommand`s, index-addressed intent API (migrated from jade-core) |
 | `jade-xlsx-collab` | xlsx model + operations, loading from / materializing into a jade `HeadlessWorkbook` |
 | `jade-collab-server` | WebSocket server (one actor thread per document, since jade documents are `!Send`), WebSocket client, `jade-collab` CLI |
+| `jade-collab-mcp` | MCP server (JSON-RPC over stdio): agents join documents as replicas through `Client` and edit with the intent APIs |
 
 ## 7. Verification strategy
 
@@ -233,7 +234,9 @@ Working: the two-lane protocol over WebSockets; docx text, paragraph
 split/join, table insertion/deletion and row/column structure on simple
 tables, text in any table cell; xlsx values, formulas (with rebasing), and
 row/column structure; index/A1-addressed intent APIs for people and agents;
-the `jade-collab` CLI; resume after a disconnect.
+the `jade-collab` CLI; resume after a disconnect; an MCP server
+(`jade-collab-mcp`) through which agents join, read, edit and watch
+documents as replicas without a shell.
 
 Not yet:
 
@@ -243,7 +246,6 @@ Not yet:
   text is editable; the model already validates merges in `Grid`), text
   boxes, notes, comments, tracked changes.
 * xlsx merges, sheets added/renamed, Excel table structure.
-* An MCP server so agents join as replicas without a shell.
 * Persistence of the log (today: export on demand, `--save` on exit),
   snapshots and log compaction, authentication and authorization, presence.
 * Performance: RGA lookups are linear and paragraph positions are recomputed
