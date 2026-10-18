@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use jade_collab_core::grid::{Grid, Merge};
 use jade_collab_core::id::{Id, ReplicaId};
+use jade_collab_core::marks::MarkSet;
 use jade_collab_core::rga::Rga;
 use jade_docx_document_core::document::{BodyElement, Table as JadeTable};
 use jade_docx_document_core::headless_api::execute_headless_queries_on_document;
@@ -133,6 +134,7 @@ impl Loader {
             flow,
             blocks: placed,
             has_paragraph: last_paragraph.is_some(),
+            marks: MarkSet::new(),
         }
     }
 

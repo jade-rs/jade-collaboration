@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use jade_collab_core::grid::{Grid, GridOp, Merge};
 use jade_collab_core::id::{Id, ReplicaId};
+use jade_collab_core::marks::{self, Boundary, Expand, Mark, MarkSet};
 use jade_collab_core::rga::Rga;
 use jade_collab_sync::{ApplyContext, Document, Lane, Rejection};
 pub use jade_docx_document_core::word_document::ParagraphStory;
@@ -109,6 +110,9 @@ pub(crate) struct Story {
     /// table, an empty text box, a text box inside a text box); such a story
     /// is read-only.
     pub(crate) has_paragraph: bool,
+    /// Character formatting made in the session, anchored to `flow`'s atoms.
+    #[serde(default, skip_serializing_if = "MarkSet::is_empty")]
+    pub(crate) marks: MarkSet<MarkKey, FormatChange>,
 }
 
 impl Story {
@@ -117,6 +121,7 @@ impl Story {
             flow: Rga::new(),
             blocks: Vec::new(),
             has_paragraph: true,
+            marks: MarkSet::new(),
         }
     }
 }
@@ -393,6 +398,50 @@ pub enum FormatChange {
     },
 }
 
+/// A character attribute that travels the convergent lane as a mark: a
+/// simple run property whose value replaces the previous one. Concurrent
+/// marks of one attribute resolve to the newest; different attributes are
+/// independent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarkKey {
+    Bold,
+    Italic,
+    Underline,
+    Strike,
+    FontSize,
+    FontFamily,
+    FontColor,
+    Highlight,
+}
+
+impl MarkKey {
+    /// Every attribute, in order.
+    pub const ALL: [MarkKey; 8] = [
+        MarkKey::Bold,
+        MarkKey::Italic,
+        MarkKey::Underline,
+        MarkKey::Strike,
+        MarkKey::FontSize,
+        MarkKey::FontFamily,
+        MarkKey::FontColor,
+        MarkKey::Highlight,
+    ];
+
+    /// How a mark of this attribute grows: like Word, text typed at the end
+    /// of formatted text takes its formatting, so every one of them expands
+    /// at its end (and none at its start).
+    pub fn expand(self) -> Expand {
+        Expand::End
+    }
+
+    /// The attributes a clear unsets: all but the highlight, which Word's
+    /// Ctrl+Space (and jade's clear) leave in place.
+    pub fn cleared(self) -> bool {
+        self != MarkKey::Highlight
+    }
+}
+
 /// Word's limits: 1pt to 1638pt.
 const FONT_HALF_POINTS: std::ops::RangeInclusive<u32> = 2..=3276;
 
@@ -440,6 +489,24 @@ const UNDERLINE_STYLES: &[&str] = &[
 ];
 
 impl FormatChange {
+    /// The attribute a simple character change sets, which makes it a mark;
+    /// `None` for clearing and paragraph changes.
+    pub fn mark_key(&self) -> Option<MarkKey> {
+        Some(match self {
+            Self::Bold { .. } => MarkKey::Bold,
+            Self::Italic { .. } => MarkKey::Italic,
+            Self::Underline { .. } => MarkKey::Underline,
+            Self::Strike { .. } => MarkKey::Strike,
+            Self::FontSize { .. } => MarkKey::FontSize,
+            Self::FontFamily { .. } => MarkKey::FontFamily,
+            Self::FontColor { .. } => MarkKey::FontColor,
+            Self::Highlight { .. } => MarkKey::Highlight,
+            Self::ClearFormatting | Self::Alignment { .. } | Self::ParagraphStyle { .. } => {
+                return None
+            }
+        })
+    }
+
     /// Whether the change applies to whole paragraphs.
     pub fn is_paragraph_level(&self) -> bool {
         matches!(self, Self::Alignment { .. } | Self::ParagraphStyle { .. })
@@ -471,6 +538,17 @@ impl FormatChange {
             Err(format!("{self:?} is not a valid formatting change"))
         }
     }
+}
+
+/// A character change the file must show on `start..end` (UTF-8 bytes of
+/// the model's text) of one paragraph: what the marks give those
+/// characters.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextFormat {
+    pub paragraph: ParagraphStory,
+    pub start: usize,
+    pub end: usize,
+    pub change: FormatChange,
 }
 
 /// One paragraph as the model walks it.
@@ -579,6 +657,23 @@ pub enum DocxOp {
     },
     /// Sequenced.
     DeleteTable { table: Id },
+    /// Convergent. Character formatting as a mark (Peritext): `change` (a
+    /// simple attribute, [`FormatChange::mark_key`]) holds from `start` to
+    /// `end`, sides of atoms of `story` or its ends, and the newest mark of
+    /// an attribute wins on each character it covers. The intent API makes
+    /// the boundaries with the attribute's expand rule (before the first
+    /// character; before the atom after the last one, or the story's end).
+    /// [`FormatChange::ClearFormatting`] unsets every attribute but the
+    /// highlight instead, returning the characters to the formatting jade
+    /// has for them. The model refuses a mark whose anchors it does not have
+    /// or that covers nothing, as every replica does.
+    Mark {
+        story: StoryId,
+        id: Id,
+        start: Boundary,
+        end: Boundary,
+        change: FormatChange,
+    },
     /// Sequenced. Formats the atoms from `start` through `end` (characters,
     /// or paragraph marks to reach an empty paragraph) of one story. The
     /// range is resolved when the operation is applied: characters deleted
@@ -804,6 +899,7 @@ impl DocxModel {
                 flow,
                 blocks: Vec::new(),
                 has_paragraph: true,
+                marks: MarkSet::new(),
             },
             tables: BTreeMap::new(),
             footnotes: BTreeMap::new(),
@@ -1690,6 +1786,167 @@ impl DocxModel {
             .collect())
     }
 
+    /// Applies a mark: one entry per attribute it sets or unsets, all under
+    /// its id. The checks depend only on atoms that exist and never
+    /// reorder, so every replica decides alike wherever the mark lands in
+    /// the log.
+    fn mark(
+        &mut self,
+        story: StoryId,
+        id: Id,
+        start: Boundary,
+        end: Boundary,
+        change: &FormatChange,
+    ) -> Result<Vec<DocxEffect>, Rejection> {
+        let entries: Vec<(MarkKey, Option<FormatChange>)> = match change.mark_key() {
+            Some(key) => {
+                change.validate().map_err(reject)?;
+                vec![(key, Some(change.clone()))]
+            }
+            None if *change == FormatChange::ClearFormatting => MarkKey::ALL
+                .into_iter()
+                .filter(|key| key.cleared())
+                .map(|key| (key, None))
+                .collect(),
+            None => {
+                return Err(reject(format!(
+                    "{change:?} is not character formatting; it travels as Format"
+                )))
+            }
+        };
+        let target = self.editable_story(story)?;
+        if target.marks.iter().any(|m| m.id == id) {
+            return Err(reject(format!("mark {id} already exists")));
+        }
+        let marks: Vec<Mark<MarkKey, FormatChange>> = entries
+            .into_iter()
+            .map(|(key, value)| Mark::new(id, key, start, end, value))
+            .collect();
+        for mark in &marks {
+            MarkSet::validate(&target.flow, mark)?;
+        }
+        let set = &mut self.story_mut(story).expect("checked").marks;
+        for mark in marks {
+            set.insert(mark)?;
+        }
+        self.observe([id]);
+        // jade's own document keeps the base formatting; the materializer
+        // realises the marks on the file it writes.
+        Ok(Vec::new())
+    }
+
+    /// The boundaries of a mark over the atoms `first ..= last` of `story`
+    /// under `expand`, as the intent API makes them; `None` when either
+    /// atom is missing or they are out of order.
+    pub fn mark_anchors(
+        &self,
+        story: StoryId,
+        first: Id,
+        last: Id,
+        expand: Expand,
+    ) -> Option<(Boundary, Boundary)> {
+        marks::anchors(&self.story(story)?.flow, first, last, expand)
+    }
+
+    /// Every story the walk lists paragraphs of, with its id.
+    fn stories(&self) -> Vec<(StoryId, &Story)> {
+        let mut out = vec![(StoryId::Body, &self.body)];
+        for (table, entry) in &self.tables {
+            for (key, story) in &entry.stories {
+                out.push((story_id(*table, *key), story));
+            }
+        }
+        for (id, note) in &self.footnotes {
+            out.push((StoryId::Footnote { id: *id }, &note.story));
+        }
+        for (id, note) in &self.endnotes {
+            out.push((StoryId::Endnote { id: *id }, &note.story));
+        }
+        for (id, story) in &self.text_boxes {
+            out.push((StoryId::TextBox { id: *id }, story));
+        }
+        out
+    }
+
+    /// What the marks give each visible character: (character, attribute)
+    /// → the newest covering mark's value, `None` when that mark unsets it.
+    fn marked(&self) -> BTreeMap<(Id, MarkKey), Option<FormatChange>> {
+        let mut out = BTreeMap::new();
+        for (_, story) in self.stories() {
+            if story.marks.is_empty() {
+                continue;
+            }
+            let order = story.flow.ids();
+            for span in story.marks.effective(&story.flow) {
+                for index in span.range {
+                    if story.flow.is_visible(order[index]) {
+                        out.insert((order[index], span.key), span.value.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The formatting the marks set on each character of a visible
+    /// paragraph (attributes they unset, or never touched, are left out:
+    /// those keep the formatting jade has), in attribute order.
+    pub fn character_formats(&self) -> BTreeMap<Id, Vec<FormatChange>> {
+        let mut out: BTreeMap<Id, Vec<FormatChange>> = BTreeMap::new();
+        let marked = self.marked();
+        if marked.is_empty() {
+            return out;
+        }
+        for paragraph in self.paragraphs() {
+            for c in &paragraph.chars {
+                for key in MarkKey::ALL {
+                    if let Some(Some(change)) = marked.get(&(*c, key)) {
+                        out.entry(*c).or_default().push(change.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The character changes that make jade's document show the marks:
+    /// maximal runs of one value per paragraph and attribute, in paragraph
+    /// order (jade's story positions), then attribute, then offset.
+    pub fn formatting(&self) -> Vec<TextFormat> {
+        let marked = self.marked();
+        let mut out = Vec::new();
+        if marked.is_empty() {
+            return out;
+        }
+        for paragraph in self.paragraphs() {
+            for key in MarkKey::ALL {
+                let mut run: Option<TextFormat> = None;
+                let mut offset = 0;
+                for (ch, c) in paragraph.text.chars().zip(&paragraph.chars) {
+                    let next = offset + ch.len_utf8();
+                    match marked.get(&(*c, key)) {
+                        Some(Some(change)) => match &mut run {
+                            Some(r) if r.end == offset && r.change == *change => r.end = next,
+                            _ => {
+                                out.extend(run.take());
+                                run = Some(TextFormat {
+                                    paragraph: paragraph.at.clone(),
+                                    start: offset,
+                                    end: next,
+                                    change: change.clone(),
+                                });
+                            }
+                        },
+                        _ => out.extend(run.take()),
+                    }
+                    offset = next;
+                }
+                out.extend(run);
+            }
+        }
+        out
+    }
+
     /// Every live comment, oldest id first.
     pub fn comments(&self) -> Vec<CommentView> {
         self.comments
@@ -1878,7 +2135,8 @@ impl Document for DocxModel {
         match op {
             DocxOp::InsertText { .. }
             | DocxOp::DeleteText { .. }
-            | DocxOp::SplitParagraph { .. } => Lane::Convergent,
+            | DocxOp::SplitParagraph { .. }
+            | DocxOp::Mark { .. } => Lane::Convergent,
             DocxOp::JoinParagraph { .. }
             | DocxOp::InsertTable { .. }
             | DocxOp::Table { .. }
@@ -1931,6 +2189,13 @@ impl Document for DocxModel {
                 self.drop_comments_in_removed_cells();
                 Ok(effects)
             }
+            DocxOp::Mark {
+                story,
+                id,
+                start,
+                end,
+                change,
+            } => self.mark(*story, *id, *start, *end, change),
             DocxOp::Format {
                 story,
                 start,

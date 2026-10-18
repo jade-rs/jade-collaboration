@@ -213,7 +213,7 @@ fn unmerging_keeps_the_content_and_frees_new_empty_cells() {
         first: typed,
         text: "new".into(),
     });
-    let reloaded = JadeDocx::load(&s.jade.export().unwrap()).unwrap();
+    let reloaded = JadeDocx::load(&s.jade.export(&s.model).unwrap()).unwrap();
     assert_eq!(reloaded.body_paragraph_texts(), s.model.paragraph_texts());
 }
 

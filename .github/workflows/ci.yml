@@ -53,7 +53,7 @@ jobs:
         run: "! grep -rn 'sorry' lean/JadeCollab lean/JadeCollab.lean"
 
   lean-oracle:
-    # The Rust grid against the Lean model the invariant is proved for.
+    # The Rust grid and marks against the Lean models the proofs are about.
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -78,3 +78,8 @@ jobs:
         run: cargo test -p jade-collab-core --test lean_oracle --locked -- --ignored
         env:
           JADE_LEAN_ORACLE: ${{ github.workspace }}/lean/.lake/build/bin/grid-oracle
+
+      - name: Differential test of marks against the Lean model
+        run: cargo test -p jade-collab-core --test marks_oracle --locked -- --ignored
+        env:
+          JADE_LEAN_MARKS_ORACLE: ${{ github.workspace }}/lean/.lake/build/bin/marks-oracle

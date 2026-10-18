@@ -81,7 +81,8 @@ fn layout(model: &DocxModel, paragraph: usize) -> String {
 }
 
 fn reloaded(jade: &JadeDocx) -> (DocxModel, JadeDocx) {
-    let jade = JadeDocx::load(&jade.export().unwrap()).unwrap();
+    // These tests check text and anchors, which the base file holds.
+    let jade = JadeDocx::load(&jade.export_base().unwrap()).unwrap();
     let model = DocxModel::from_word_document(jade.word()).unwrap();
     assert_same_order(&model, &jade, "after reloading");
     (model, jade)
@@ -464,7 +465,7 @@ fn jade_drops_text_box_paragraph_breaks_on_export() {
     .unwrap();
     jade = JadeDocx::new(word);
     assert_eq!(jade.paragraph_texts(), ["Hello", "He", "llo", "World"]);
-    let reloaded = JadeDocx::load(&jade.export().unwrap()).unwrap();
+    let reloaded = JadeDocx::load(&jade.export_base().unwrap()).unwrap();
     assert_eq!(reloaded.paragraph_texts(), ["Hello", "Hello", "World"]);
 }
 

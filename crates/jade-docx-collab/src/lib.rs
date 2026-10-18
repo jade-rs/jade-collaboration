@@ -13,8 +13,10 @@ mod load;
 mod model;
 
 pub use jade::JadeDocx;
+pub use jade_collab_core::marks::{Boundary, Expand};
 pub use load::LoadError;
 pub use model::{
     Anchor, AnchorView, Atom, CommentContent, CommentView, DocxEffect, DocxModel, DocxOp,
-    FormatChange, Paragraph, ParagraphAlignment, ParagraphStory, Placement, StoryId, TableView,
+    FormatChange, MarkKey, Paragraph, ParagraphAlignment, ParagraphStory, Placement, StoryId,
+    TableView, TextFormat,
 };

@@ -4,6 +4,7 @@
 //! current view into identifier-addressed operations.
 
 use jade_collab_core::id::{Id, ReplicaId};
+use jade_collab_core::marks::Boundary;
 use jade_collab_sync::{ApplyContext, Document, Lane};
 use jade_docx_collab::intent::{
     lane_for_command, resolve, IntentError, IntentOp, UnsupportedCommand,
@@ -250,7 +251,18 @@ fn headless_commands_project_into_intents_or_name_their_lane() {
         end_offset: 1,
         value: true,
     };
-    assert_eq!(lane_for_command(&bold), Lane::Sequenced);
+    // Character formatting is a convergent mark; clearing also clears the
+    // file's formatting, which is sequenced.
+    assert_eq!(lane_for_command(&bold), Lane::Convergent);
+    assert_eq!(
+        lane_for_command(&HeadlessCommand::ClearFormatting {
+            start_paragraph: 0,
+            start_offset: 0,
+            end_paragraph: 0,
+            end_offset: 1,
+        }),
+        Lane::Sequenced
+    );
     assert_eq!(
         lane_for_command(&HeadlessCommand::InsertText {
             paragraph: 0,
@@ -283,12 +295,15 @@ fn format_resolves_to_the_characters_between_the_offsets() {
         &mut ids(),
     )
     .unwrap();
+    // A mark from before the first character to before the character after
+    // the last one: bold expands at its end.
     assert_eq!(
         ops,
-        vec![DocxOp::Format {
+        vec![DocxOp::Mark {
             story: StoryId::Body,
-            start: p[0].chars[1],
-            end: p[1].chars[1],
+            id: Id::new(1_000, ReplicaId(7)),
+            start: Boundary::Before(p[0].chars[1]),
+            end: Boundary::Before(p[1].chars[2]),
             change: bold(),
         }]
     );
@@ -364,24 +379,36 @@ fn format_across_a_table_formats_every_story_it_crosses() {
     )
     .unwrap();
     let p = model.paragraphs();
+    let ids: Vec<Id> = ops
+        .iter()
+        .map(|op| match op {
+            DocxOp::Mark { id, .. } => *id,
+            other => panic!("{other:?}"),
+        })
+        .collect();
     assert_eq!(
         ops,
         vec![
-            DocxOp::Format {
+            DocxOp::Mark {
                 story: StoryId::Body,
-                start: p[0].chars[3],
-                end: p[3].chars[1],
+                id: ids[0],
+                start: Boundary::Before(p[0].chars[3]),
+                end: Boundary::Before(p[3].chars[2]),
                 change: bold(),
             },
-            DocxOp::Format {
+            // The cell's text is the last of its story: the mark runs to
+            // the story's end.
+            DocxOp::Mark {
                 story: p[1].story,
-                start: p[1].chars[0],
-                end: p[1].chars[3],
+                id: ids[1],
+                start: Boundary::Before(p[1].chars[0]),
+                end: Boundary::End,
                 change: bold(),
             },
         ],
         "the empty cell has nothing to format"
     );
+    assert_ne!(ids[0], ids[1]);
 }
 
 #[test]
@@ -741,7 +768,13 @@ fn formatting_and_comment_commands_project_into_intents() {
         ),
     ];
     for (command, intent) in cases {
-        assert_eq!(lane_for_command(&command), Lane::Sequenced, "{command:?}");
+        // Simple character attributes are marks; clearing, paragraphs and
+        // comments are sequenced.
+        let lane = match &intent {
+            IntentOp::Format { change, .. } if change.mark_key().is_some() => Lane::Convergent,
+            _ => Lane::Sequenced,
+        };
+        assert_eq!(lane_for_command(&command), lane, "{command:?}");
         assert_eq!(IntentOp::try_from(command).unwrap(), intent);
     }
     // Values with no collaborative form stay unsupported, on their lane.
@@ -764,11 +797,12 @@ fn formatting_and_comment_commands_project_into_intents() {
         },
     ] {
         let name = command.name();
+        let lane = lane_for_command(&command);
         assert_eq!(
             IntentOp::try_from(command).unwrap_err(),
             UnsupportedCommand {
                 command_name: name,
-                lane: Lane::Sequenced
+                lane
             }
         );
     }
@@ -813,7 +847,7 @@ fn format_intents_have_a_wire_format() {
 proptest::proptest! {
     #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
 
-    /// Resolving a format intent and applying it reports exactly the bytes
+    /// Resolving a format intent and applying it formats exactly the bytes
     /// the intent named, in every paragraph it crosses.
     #[test]
     fn a_format_intent_formats_exactly_the_bytes_it_names(
@@ -835,22 +869,18 @@ proptest::proptest! {
         let ops = run(&mut model, IntentOp::Format {
             start_paragraph: sp, start_offset: so, end_paragraph: ep, end_offset: eo, change: bold(),
         }).unwrap();
-        let ctx = ApplyContext { origin: ReplicaId(7), base_seq: 0, seq: None };
-        let mut effects = Vec::new();
-        for op in &ops {
-            effects.extend(model.clone().apply(op, &ctx).unwrap());
-        }
+        proptest::prop_assert!(ops.iter().all(|op| DocxModel::lane(op) == Lane::Convergent));
         let texts = model.paragraph_texts();
-        let expected: Vec<jade_docx_collab::DocxEffect> = (sp..=ep)
+        let expected: Vec<jade_docx_collab::TextFormat> = (sp..=ep)
             .filter_map(|p| {
                 let start = if p == sp { so } else { 0 };
                 let end = if p == ep { eo } else { texts[p].len() };
-                (start < end).then_some(jade_docx_collab::DocxEffect::FormatText {
+                (start < end).then_some(jade_docx_collab::TextFormat {
                     paragraph: body(p), start, end, change: bold(),
                 })
             })
             .collect();
-        proptest::prop_assert_eq!(effects, expected);
+        proptest::prop_assert_eq!(model.formatting(), expected);
     }
 }
 

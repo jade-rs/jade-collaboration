@@ -8,11 +8,11 @@ use jade_collab_core::id::Id;
 use jade_collab_sync::{ApplyContext, Document, Lane, Materializer};
 use jade_docx_collab::intent::{resolve, IntentOp};
 use jade_docx_collab::{
-    Anchor, CommentContent, DocxEffect, DocxModel, DocxOp, FormatChange, JadeDocx,
+    Anchor, CommentContent, DocxEffect, DocxModel, DocxOp, FormatChange, JadeDocx, MarkKey,
     ParagraphAlignment, StoryId,
 };
 use jade_docx_document_core::headless_api::execute_headless_queries_on_document;
-use jade_docx_document_core::word_document::ParagraphAnchorKind;
+use jade_docx_document_core::word_document::{ParagraphAnchorKind, WordDocument};
 use jade_docx_headless_api::{
     HeadlessCommentSnapshot, HeadlessParagraphSnapshot, HeadlessQuery, HeadlessQueryRequest,
     HeadlessQueryResult, HeadlessRunStyle,
@@ -147,6 +147,7 @@ pub fn commit(model: &mut DocxModel, jade: &mut JadeDocx, op: DocxOp) -> Vec<Doc
         .unwrap_or_else(|e| panic!("{op:?}: {e}"));
     assert_stories_agree(model, jade, &format!("after {op:?}"));
     assert_comments_agree(model, jade, &format!("after {op:?}"));
+    assert_formatting_agrees(model, jade, &format!("after {op:?}"));
     effect
 }
 
@@ -561,9 +562,9 @@ pub struct CharStyle {
     pub highlight: Option<String>,
 }
 
-fn query(jade: &JadeDocx, query: HeadlessQuery) -> HeadlessQueryResult {
+fn query(word: &WordDocument, query: HeadlessQuery) -> HeadlessQueryResult {
     execute_headless_queries_on_document(
-        jade.word(),
+        word,
         &HeadlessQueryRequest {
             queries: vec![query],
         },
@@ -574,7 +575,11 @@ fn query(jade: &JadeDocx, query: HeadlessQuery) -> HeadlessQueryResult {
 }
 
 pub fn paragraph_snapshot(jade: &JadeDocx, surface: usize) -> HeadlessParagraphSnapshot {
-    match query(jade, HeadlessQuery::Paragraph { paragraph: surface }) {
+    snapshot_in(jade.word(), surface)
+}
+
+fn snapshot_in(word: &WordDocument, surface: usize) -> HeadlessParagraphSnapshot {
+    match query(word, HeadlessQuery::Paragraph { paragraph: surface }) {
         HeadlessQueryResult::Paragraph {
             value: Some(value), ..
         } => value,
@@ -582,13 +587,30 @@ pub fn paragraph_snapshot(jade: &JadeDocx, surface: usize) -> HeadlessParagraphS
     }
 }
 
-/// Every visible character of `model`, with what jade says about it.
+/// Every visible character of `model`, with what jade's own document (the
+/// base the model's marks are realised on) says about it.
 pub fn char_styles(model: &DocxModel, jade: &JadeDocx) -> BTreeMap<Id, CharStyle> {
+    char_styles_in(model, jade.word())
+}
+
+/// Every visible character of `model`, with what the file jade writes —
+/// its document with the model's marks realised — says about it.
+pub fn formatted_char_styles(model: &DocxModel, jade: &JadeDocx) -> BTreeMap<Id, CharStyle> {
+    let formatted = jade
+        .formatted(model)
+        .unwrap_or_else(|e| panic!("jade cannot realise the marks: {e}"));
+    char_styles_in(model, &formatted)
+}
+
+/// Every visible character of `model`, with what `word` says about it.
+pub fn char_styles_in(model: &DocxModel, word: &WordDocument) -> BTreeMap<Id, CharStyle> {
     let mut out = BTreeMap::new();
     for paragraph in model.paragraphs().iter() {
-        let surface = surface(jade, paragraph);
-        let snapshot = paragraph_snapshot(jade, surface);
-        let runs = &jade.word().paragraph(surface).expect("surface exists").runs;
+        let surface = word
+            .paragraph_story_surface(&paragraph.at)
+            .unwrap_or_else(|| panic!("jade has no paragraph {:?}", paragraph.at));
+        let snapshot = snapshot_in(word, surface);
+        let runs = &word.paragraph(surface).expect("surface exists").runs;
         let mut offset = 0;
         for (c, id) in paragraph.text.chars().zip(&paragraph.chars) {
             // jade's commands take rendered offsets (an inline text box counts
@@ -646,7 +668,7 @@ pub fn paragraph_formats(
 
 pub fn jade_comments(jade: &JadeDocx) -> Vec<HeadlessCommentSnapshot> {
     match query(
-        jade,
+        jade.word(),
         HeadlessQuery::Comments {
             start_comment: 0,
             max_comments: usize::MAX,
@@ -695,5 +717,69 @@ pub fn assert_comments_agree(model: &DocxModel, jade: &JadeDocx, context: &str) 
             comment.parent.map(jade_id),
             "thread of {key} {context}"
         );
+    }
+}
+
+/// Whether `style` shows `change` (for the properties jade's queries report).
+pub fn shows(change: &FormatChange, style: &CharStyle) -> bool {
+    let s = &style.style;
+    match change {
+        FormatChange::Bold { value } => s.bold.unwrap_or(false) == *value,
+        FormatChange::Italic { value } => s.italic.unwrap_or(false) == *value,
+        FormatChange::Underline { value, .. } => s.underline.unwrap_or(false) == *value,
+        // The query reports `w:strike` only, not `w:dstrike`.
+        FormatChange::Strike { value, double } => *double || s.strike.unwrap_or(false) == *value,
+        FormatChange::FontSize { half_points } => s.font_size == Some(*half_points as f32 / 2.0),
+        FormatChange::FontFamily { family } => s.font_family.as_deref() == Some(family.as_str()),
+        FormatChange::FontColor { color } => s.color.as_deref() == Some(color.as_str()),
+        FormatChange::Highlight { color } => style.highlight.as_deref() == Some(color.as_str()),
+        // Clearing restores whatever the style says; only "elsewhere nothing
+        // changed" is checked for it.
+        FormatChange::ClearFormatting => true,
+        FormatChange::Alignment { .. } | FormatChange::ParagraphStyle { .. } => true,
+    }
+}
+
+pub const MARK_KEYS: [MarkKey; 8] = MarkKey::ALL;
+
+/// What `style` reports for one attribute.
+pub fn attribute(style: &CharStyle, key: MarkKey) -> String {
+    let s = &style.style;
+    match key {
+        MarkKey::Bold => format!("{:?}", s.bold),
+        MarkKey::Italic => format!("{:?}", s.italic),
+        MarkKey::Underline => format!("{:?}", s.underline),
+        MarkKey::Strike => format!("{:?}", s.strike),
+        MarkKey::FontSize => format!("{:?}", s.font_size),
+        MarkKey::FontFamily => format!("{:?}", s.font_family),
+        MarkKey::FontColor => format!("{:?}", s.color),
+        MarkKey::Highlight => format!("{:?}", style.highlight),
+    }
+}
+
+/// The file the server writes shows the model's formatting: every
+/// character a mark sets shows that value, and every attribute no mark sets
+/// is what jade's own document has (the file's formatting, jade's rules for
+/// typed text, and sequenced formatting) — whatever jade's typing rules
+/// would have made of the marks around it.
+pub fn assert_formatting_agrees(model: &DocxModel, jade: &JadeDocx, context: &str) {
+    let base = char_styles(model, jade);
+    let formatted = formatted_char_styles(model, jade);
+    let overrides = model.character_formats();
+    for (c, style) in &formatted {
+        let set = overrides.get(c).map(Vec::as_slice).unwrap_or_default();
+        for key in MARK_KEYS {
+            match set.iter().find(|change| change.mark_key() == Some(key)) {
+                Some(change) => assert!(
+                    shows(change, style),
+                    "{c} does not show {change:?}: {style:?} {context}"
+                ),
+                None => assert_eq!(
+                    attribute(style, key),
+                    attribute(&base[c], key),
+                    "{key:?} of {c}, which no mark sets, is not jade's own {context}"
+                ),
+            }
+        }
     }
 }
