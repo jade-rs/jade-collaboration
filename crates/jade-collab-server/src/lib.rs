@@ -14,6 +14,7 @@
 
 mod auth;
 mod client;
+mod limits;
 mod room;
 mod server;
 mod storage;
@@ -21,6 +22,7 @@ pub mod wire;
 
 pub use auth::{DocumentRole, DocumentRule, Grant, Role, Tokens, TokensError};
 pub use client::{Client, ClientError, Presence};
+pub use limits::PresenceLimits;
 pub use server::{Server, ServerError};
 pub use storage::{Fsync, StorageOptions};
 pub use wire::Format;

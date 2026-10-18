@@ -1,6 +1,7 @@
 //! Presence: ephemeral per-replica state (cursors, selections, "typing…")
-//! relayed to the other replicas of a document, never logged, and never in
-//! the way of the operation stream.
+//! relayed to the other replicas of a document, never logged, never in the
+//! way of the operation stream, and limited in size and rate per
+//! connection.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -8,7 +9,7 @@ use std::time::Duration;
 
 use jade_collab_core::id::ReplicaId;
 use jade_collab_server::wire::{ClientMessage, ServerMessage};
-use jade_collab_server::{Client, Presence, Server, Tokens};
+use jade_collab_server::{Client, Presence, PresenceLimits, Server, Tokens};
 use jade_collab_sync::ReplicaEvent;
 use jade_docx_collab::{DocxModel, DocxOp, StoryId};
 use proptest::prelude::*;
@@ -76,6 +77,13 @@ fn presence_messages_on_the_wire() {
         })
         .unwrap(),
         json!({"type": "presence_left", "replica": 3})
+    );
+    assert_eq!(
+        serde_json::to_value(ServerMessage::PresenceRejected {
+            reason: "too big".into()
+        })
+        .unwrap(),
+        json!({"type": "presence_rejected", "reason": "too big"})
     );
 }
 
@@ -176,7 +184,7 @@ fn type_at_end(client: &Client<DocxModel>, text: &str) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_presence_flood_does_not_disturb_the_operation_stream() {
-    let (server, url) = start(Server::new()).await;
+    let (server, url) = start(Server::new().with_presence_limits(PresenceLimits::UNLIMITED)).await;
     let flooder: Client<DocxModel> = Client::connect(&url, None).await.unwrap();
     let a: Client<DocxModel> = Client::connect(&url, None).await.unwrap();
     let b: Client<DocxModel> = Client::connect(&url, None).await.unwrap();
@@ -233,6 +241,131 @@ async fn a_presence_flood_does_not_disturb_the_operation_stream() {
         state_of(m, flooder.id()).is_some_and(|s| s["cursor"] == json!(1999))
     })
     .await;
+}
+
+async fn settled(client: &Client<DocxModel>) {
+    tokio::time::timeout(Duration::from_secs(20), client.settle())
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[test]
+fn default_limits_allow_a_cursor_but_not_a_flood() {
+    let limits = PresenceLimits::default();
+    assert!(limits.max_bytes >= 1024, "{limits:?}");
+    assert!(limits.burst >= 16, "{limits:?}");
+    assert!(limits.per_second >= 10, "{limits:?}");
+    assert!(
+        limits.max_bytes < 1 << 20 && limits.per_second < 1000,
+        "{limits:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oversized_presence_is_dropped_and_its_sender_told() {
+    let limits = PresenceLimits {
+        max_bytes: 64,
+        ..PresenceLimits::UNLIMITED
+    };
+    let (_server, url) = start(Server::new().with_presence_limits(limits)).await;
+    let a: Client<DocxModel> = Client::connect(&url, None).await.unwrap();
+    let b: Client<DocxModel> = Client::connect(&url, None).await.unwrap();
+
+    // 64 bytes of JSON pass, 65 do not.
+    let fits = json!("x".repeat(62));
+    let over = json!("x".repeat(63));
+    assert_eq!(fits.to_string().len(), 64);
+    a.set_presence(over);
+    // Anything the connection sends after it is handled after it.
+    type_at_end(&a, "a");
+    settled(&a).await;
+    let rejected = a.take_presence_rejections();
+    assert_eq!(rejected.len(), 1, "{rejected:?}");
+    assert!(rejected[0].contains("64"), "{rejected:?}");
+
+    a.set_presence(fits.clone());
+    until(&b, |m| state_of(m, a.id()) == Some(&fits)).await;
+    type_at_end(&a, "b");
+    settled(&a).await;
+    assert!(a.take_presence_rejections().is_empty());
+    // b never saw the oversized one: the only presence it got was `fits`.
+    assert_eq!(b.presence().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn presence_over_the_rate_is_dropped_but_operations_never_are() {
+    // Three updates, and no more ever: the outcome does not depend on time.
+    let limits = PresenceLimits {
+        burst: 3,
+        per_second: 0,
+        ..PresenceLimits::UNLIMITED
+    };
+    let (server, url) = start(Server::new().with_presence_limits(limits)).await;
+    let a: Client<DocxModel> = Client::connect(&url, None).await.unwrap();
+    let b: Client<DocxModel> = Client::connect(&url, None).await.unwrap();
+    for i in 0..10 {
+        a.set_presence(json!({"cursor": i}));
+        type_at_end(&a, &format!("{i}"));
+    }
+    settled(&a).await;
+    assert_eq!(server.seq("hello.docx").await.unwrap(), 10);
+    let rejected = a.take_presence_rejections();
+    assert_eq!(rejected.len(), 7, "{rejected:?}");
+    assert!(
+        a.take_events()
+            .iter()
+            .all(|e| !matches!(e, ReplicaEvent::Rejected { .. })),
+        "no operation is rejected"
+    );
+    // b followed every operation, and the presence relayed in between: the
+    // last one let through.
+    tokio::time::timeout(Duration::from_secs(20), b.wait_for_seq(10))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(state_of(&b.presence(), a.id()), Some(&json!({"cursor": 2})));
+    assert_eq!(a.view(), b.view());
+
+    // The limit is per connection: a new one starts afresh.
+    let replica = a.disconnect().await;
+    let a = Client::resume(&url, replica, None).await.unwrap();
+    a.set_presence(json!({"cursor": "again"}));
+    until(&b, |m| {
+        state_of(m, a.id()) == Some(&json!({"cursor": "again"}))
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_default_server_limits_a_presence_flood_and_keeps_every_operation() {
+    let (server, url) = start(Server::new()).await;
+    let flooder: Client<DocxModel> = Client::connect(&url, None).await.unwrap();
+    let a: Client<DocxModel> = Client::connect(&url, None).await.unwrap();
+    for i in 0..500 {
+        flooder.set_presence(json!({"cursor": i}));
+        if i % 25 == 0 {
+            type_at_end(&flooder, "f");
+            type_at_end(&a, "a");
+        }
+    }
+    settled(&flooder).await;
+    settled(&a).await;
+    assert_eq!(server.seq("hello.docx").await.unwrap(), 40);
+    let rejected = flooder.take_presence_rejections();
+    assert!(rejected.len() > 300, "{} rejected", rejected.len());
+    // A huge state is refused whatever the rate.
+    flooder.set_presence(json!("x".repeat(PresenceLimits::default().max_bytes)));
+    type_at_end(&flooder, "f");
+    settled(&flooder).await;
+    let rejected = flooder.take_presence_rejections();
+    assert_eq!(rejected.len(), 1, "{rejected:?}");
+    assert!(rejected[0].contains("bytes"), "{rejected:?}");
+    tokio::time::timeout(Duration::from_secs(20), a.wait_for_seq(41))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(a.view(), flooder.view());
 }
 
 #[derive(Clone, Debug)]
