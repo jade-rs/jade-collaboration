@@ -591,3 +591,86 @@ fn formatting_is_realised_over_jades_base() {
     let reopened = JadePptx::open(&s.jade.export(&s.model).unwrap()).unwrap();
     assert_agree_with(&s.model, &s.jade, &reopened, "after export");
 }
+
+/// Pictures are inserted (sized from their pixels when the caller gives no
+/// size), moved, resized keeping their ratio, duplicated with their slide
+/// and deleted, all in jade; the file reads back as the same deck, and a
+/// restored server finds the file id jade gave the picture.
+#[test]
+fn pictures_are_realised_in_jade() {
+    use jade_pptx_collab::{Image, ShapeKind};
+    let mut s = Session::open("sample-deck.pptx");
+    s.intent(PptxIntent::InsertPicture {
+        slide: 1,
+        x: 914_400,
+        y: 457_200,
+        width: None,
+        height: None,
+        image: Image(common::PNG.to_vec()),
+    });
+    let picture = s.model.slides()[0].shapes.last().unwrap().clone();
+    assert_eq!(picture.kind, ShapeKind::Picture);
+    assert!(picture.aspect_locked);
+    let g = picture.geometry.unwrap();
+    assert_eq!((g.x, g.y, g.width, g.height), (914_400, 457_200, 9525, 9525));
+    // Moving and resizing by width: the height follows the ratio.
+    s.intent(PptxIntent::SetGeometry {
+        slide: 1,
+        shape: picture.number,
+        x: Some(10),
+        y: Some(20),
+        width: Some(952_500),
+        height: None,
+        rotation: Some(5_400_000),
+    });
+    let g = s.model.slides()[0].shapes.last().unwrap().geometry.unwrap();
+    assert_eq!(
+        (g.x, g.y, g.width, g.height, g.rotation),
+        (10, 20, 952_500, 952_500, 5_400_000)
+    );
+    s.intent(PptxIntent::DuplicateSlide { slide: 1 });
+    s.intent(PptxIntent::DeleteShape {
+        slide: 1,
+        shape: picture.number,
+    });
+    let reopened = JadePptx::open(&s.jade.export(&s.model).unwrap()).unwrap();
+    assert_agree_with(&s.model, &s.jade, &reopened, "after export");
+    let reloaded = PptxModel::from_pptx(reopened.bytes()).unwrap();
+    assert_eq!(
+        reloaded.slides()[1].shapes.last().unwrap().kind,
+        ShapeKind::Picture,
+        "the copy keeps its picture"
+    );
+    let model: PptxModel = serde_json::from_str(&serde_json::to_string(&s.model).unwrap()).unwrap();
+    let restored = JadePptx::restore(&s.jade.export_base(), &model).unwrap();
+    assert_agree(&model, &restored, "restored");
+}
+
+/// The model checks a picture's size and signature; whether jade can
+/// decode it is jade's to say, before the operation commits.
+#[test]
+fn jade_refuses_a_picture_it_cannot_decode() {
+    use jade_pptx_collab::Image;
+    let (model, jade) = open("sample-deck.pptx");
+    let mut broken = common::PNG[..20].to_vec();
+    broken.extend_from_slice(b"garbage");
+    let op = PptxOp::InsertPicture {
+        slide: model.slides()[0].id,
+        id: Id::new(1_000_000, ReplicaId(1)),
+        geometry: Geometry {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+            rotation: 0,
+        },
+        image: Image(broken),
+    };
+    let ctx = ApplyContext {
+        origin: ReplicaId(1),
+        base_seq: 0,
+        seq: Some(1),
+    };
+    assert!(model.clone().apply(&op, &ctx).is_ok(), "the model alone would take it");
+    assert!(jade.admit(&model, &op).is_err());
+}

@@ -5,9 +5,18 @@ use std::path::PathBuf;
 use jade_collab_core::id::Id;
 use jade_pptx_collab::intent::{resolve, PptxIntent, Target};
 use jade_pptx_collab::{
-    Alignment, CharFormat, Geometry, GeometryEdit, JadePptx, PptxModel, PptxOp, ShapeRef,
+    Alignment, CharFormat, Geometry, GeometryEdit, Image, JadePptx, PptxModel, PptxOp, ShapeRef,
     SlideView, StoryId,
 };
+
+/// A 1×1 PNG.
+pub const PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x64, 0x60, 0xf8, 0x5f,
+    0x0f, 0x00, 0x02, 0x87, 0x01, 0x80, 0xeb, 0x47, 0xba, 0x92, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+    0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
 
 pub fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../jade-core/public/fixtures")
@@ -124,7 +133,7 @@ pub fn generate(view: &PptxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
     let slide = &slides[slide_index];
     let stories = stories(view);
     let words = ["x", "日本", "é", "Lorem ", "😀", "a\tb", "ab"];
-    match choice % 21 {
+    match choice % 24 {
         // Typing at a random caret, through the index-addressed intent API.
         0..=4 => {
             let (number, target, story) = stories[pick(stories.len(), 8)];
@@ -309,6 +318,43 @@ pub fn generate(view: &PptxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
                 format: formats[pick(formats.len(), 34)].clone(),
             };
             resolve(view, &intent, ids).ok()?.into_iter().next()
+        }
+        // A picture, sized from its pixels or given a frame.
+        21 => Some(PptxOp::InsertPicture {
+            slide: slide.id,
+            id: ids(1),
+            geometry: Geometry {
+                x: (pick(100, 14) as i64) * 50_000,
+                y: (pick(100, 22) as i64) * 30_000,
+                width: 1 + (pick(100, 30) as i64) * 20_000,
+                height: 1 + (pick(100, 38) as i64) * 10_000,
+                rotation: 0,
+            },
+            image: Image(PNG.to_vec()),
+        }),
+        // Resizing by width, as a person drags a corner: a shape whose
+        // ratio is locked keeps it (a sequenced resize), others stretch.
+        22 => {
+            let placed: Vec<_> = slide
+                .shapes
+                .iter()
+                .filter(|s| s.geometry.is_some())
+                .collect();
+            if placed.is_empty() {
+                return None;
+            }
+            let shape = placed[pick(placed.len(), 14)];
+            let width = shape.geometry?.width;
+            let intent = PptxIntent::SetGeometry {
+                slide: slide_index + 1,
+                shape: shape.number,
+                x: None,
+                y: None,
+                width: Some((width * (1 + pick(8, 20) as i64) / 4).max(1)),
+                height: None,
+                rotation: None,
+            };
+            resolve(view, &intent, ids).ok()?.into_iter().next_back()
         }
         // Aligning a few paragraphs of a shape.
         _ => {
