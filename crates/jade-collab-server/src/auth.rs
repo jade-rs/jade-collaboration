@@ -180,6 +180,25 @@ pub(crate) fn access(grant: Option<&Grant>, name: &str) -> Option<Role> {
     }
 }
 
+/// The token a request presented, attached to it next to its [`Grant`].
+#[derive(Clone)]
+pub(crate) struct Presented(pub String);
+
+/// What `token` may do with `document` under `tokens`, or why nothing.
+pub(crate) fn recheck(
+    tokens: &Tokens,
+    token: &str,
+    document: &str,
+) -> Result<(Grant, Role), String> {
+    let grant = tokens
+        .grant(token)
+        .ok_or_else(|| "the token was withdrawn".to_string())?;
+    let role = grant
+        .role_for(document)
+        .ok_or_else(|| format!("the token no longer opens {document}"))?;
+    Ok((grant.clone(), role))
+}
+
 /// The answer to a known token without access to `name`.
 pub(crate) fn forbidden(name: &str) -> Response {
     (
@@ -210,8 +229,8 @@ fn bearer(headers: &HeaderMap) -> Option<String> {
         .then(|| token.trim().to_string())
 }
 
-/// Middleware: lets a request through with its [`Grant`] attached, or
-/// answers 401.
+/// Middleware: lets a request through with its [`Grant`] (and the token,
+/// for sockets to keep checking) attached, or answers 401.
 pub(crate) async fn authenticate(
     State(server): State<Server>,
     mut request: Request,
@@ -225,9 +244,11 @@ pub(crate) async fn authenticate(
             .ok()
             .and_then(|query| query.0.token)
     });
-    match presented.as_deref().and_then(|token| tokens.grant(token)) {
-        Some(grant) => {
-            request.extensions_mut().insert(grant.clone());
+    let granted = presented.and_then(|token| Some((tokens.grant(&token)?.clone(), token)));
+    match granted {
+        Some((grant, token)) => {
+            request.extensions_mut().insert(grant);
+            request.extensions_mut().insert(Presented(token));
             next.run(request).await
         }
         None => (

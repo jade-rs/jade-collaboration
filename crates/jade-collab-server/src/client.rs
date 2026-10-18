@@ -21,7 +21,7 @@ use crate::wire::{ClientMessage, ServerMessage};
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum ClientError {
     #[error("cannot connect: {0}")]
     Connect(String),
@@ -33,6 +33,10 @@ pub enum ClientError {
     Sync(#[from] SyncError),
     #[error("the connection closed")]
     Closed,
+    /// The server withdrew the token, or its access to the document, and
+    /// closed the connection.
+    #[error("{0}")]
+    Revoked(String),
 }
 
 /// What another replica shares about itself.
@@ -47,7 +51,7 @@ struct Shared<D: Document> {
     replica: Mutex<Replica<D>>,
     events: Mutex<Vec<ReplicaEvent<D::Op>>>,
     presence: Mutex<BTreeMap<ReplicaId, Presence>>,
-    error: Mutex<Option<String>>,
+    error: Mutex<Option<ClientError>>,
     changed: Notify,
 }
 
@@ -136,6 +140,7 @@ where
                 ..
             } => Replica::new(replica, seq, decode(snapshot)?),
             ServerMessage::Error { message } => return Err(ClientError::Protocol(message)),
+            ServerMessage::Revoked { message } => return Err(ClientError::Revoked(message)),
             other => {
                 return Err(ClientError::Protocol(format!(
                     "expected a welcome, got {other:?}"
@@ -178,6 +183,7 @@ where
             }
             ServerMessage::Rejoin { message } => return Err(ClientError::Rejoin(message)),
             ServerMessage::Error { message } => return Err(ClientError::Protocol(message)),
+            ServerMessage::Revoked { message } => return Err(ClientError::Revoked(message)),
             other => {
                 return Err(ClientError::Protocol(format!(
                     "expected resumed, got {other:?}"
@@ -230,7 +236,7 @@ where
                     Err(error) => Err(error),
                 };
                 if let Err(error) = result {
-                    *shared.error.lock().unwrap() = Some(error.to_string());
+                    *shared.error.lock().unwrap() = Some(error);
                     shared.changed.notify_waiters();
                     break;
                 }
@@ -264,6 +270,7 @@ where
                 return Ok(());
             }
             ServerMessage::Error { message } => return Err(ClientError::Protocol(message)),
+            ServerMessage::Revoked { message } => return Err(ClientError::Revoked(message)),
             other => return Err(ClientError::Protocol(format!("unexpected {other:?}"))),
         };
         let event = shared.replica.lock().unwrap().receive(downstream)?;
@@ -321,7 +328,7 @@ where
                 return Ok(());
             }
             if let Some(error) = self.shared.error.lock().unwrap().clone() {
-                return Err(ClientError::Protocol(error));
+                return Err(error);
             }
             notified.await;
         }

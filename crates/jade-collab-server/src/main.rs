@@ -3,6 +3,7 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 use jade_collab_server::{Client, Format, Fsync, Server, StorageOptions, Tokens};
@@ -50,8 +51,16 @@ enum Cli {
         /// a grant may add "documents": ["contract.docx", "deck-*.pptx",
         /// {"document": "notes.docx", "role": "viewer"}] to limit the token
         /// to those names (globs; the first match decides the role).
+        /// The file is the only source of tokens: it is read again on SIGHUP
+        /// and whenever it changes, and sockets whose token was withdrawn
+        /// are closed. A file that does not parse leaves the tokens as they
+        /// were.
         #[arg(long, value_name = "FILE")]
         tokens: Option<PathBuf>,
+        /// With --tokens, look for changes to the file this often; 0 leaves
+        /// only SIGHUP.
+        #[arg(long, value_name = "SECONDS", default_value_t = 1, requires = "tokens")]
+        tokens_poll: u64,
         files: Vec<PathBuf>,
     },
     /// Print a document's current content as JSON.
@@ -280,6 +289,7 @@ struct ServeOptions {
     keep_tail: Option<usize>,
     fsync: Option<FsyncArg>,
     tokens: Option<PathBuf>,
+    tokens_poll: u64,
     files: Vec<PathBuf>,
 }
 
@@ -292,6 +302,7 @@ async fn serve(options: ServeOptions) -> Result<(), String> {
         keep_tail,
         fsync,
         tokens,
+        tokens_poll,
         files,
     } = options;
     // Bound first, so `--addr host:0` works and the URLs printed are real.
@@ -320,10 +331,16 @@ async fn serve(options: ServeOptions) -> Result<(), String> {
         }
         None => Server::new(),
     };
-    let server = match tokens {
-        Some(path) => server.with_tokens(Tokens::load(&path).map_err(|e| e.to_string())?),
+    let server = match &tokens {
+        Some(path) => server.with_tokens(Tokens::load(path).map_err(|e| e.to_string())?),
         None => server,
     };
+    if let Some(path) = tokens {
+        if tokens_poll > 0 {
+            server.watch_tokens(path.clone(), Duration::from_secs(tokens_poll));
+        }
+        reload_on_hangup(server.clone(), path).map_err(|e| e.to_string())?;
+    }
     let stored: Vec<String> = server.documents().into_iter().map(|(n, _)| n).collect();
     let mut named = Vec::new();
     for path in files {
@@ -357,6 +374,27 @@ async fn serve(options: ServeOptions) -> Result<(), String> {
     Ok(())
 }
 
+/// Reads the tokens file again whenever the process gets SIGHUP.
+#[cfg(unix)]
+fn reload_on_hangup(server: Server, path: PathBuf) -> std::io::Result<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut hangups = signal(SignalKind::hangup())?;
+    tokio::spawn(async move {
+        while hangups.recv().await.is_some() {
+            match server.reload_tokens(&path) {
+                Ok(()) => eprintln!("took new tokens from {}", path.display()),
+                Err(error) => eprintln!("kept the tokens in force: {error}"),
+            }
+        }
+    });
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn reload_on_hangup(_: Server, _: PathBuf) -> std::io::Result<()> {
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let result = match Cli::parse() {
@@ -368,6 +406,7 @@ async fn main() -> ExitCode {
             keep_tail,
             fsync,
             tokens,
+            tokens_poll,
             files,
         } => {
             serve(ServeOptions {
@@ -378,6 +417,7 @@ async fn main() -> ExitCode {
                 keep_tail,
                 fsync,
                 tokens,
+                tokens_poll,
                 files,
             })
             .await

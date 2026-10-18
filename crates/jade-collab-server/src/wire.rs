@@ -102,6 +102,11 @@ pub enum ServerMessage {
     Error {
         message: String,
     },
+    /// The connection's token was withdrawn, or no longer opens this
+    /// document; the server closes the socket after this.
+    Revoked {
+        message: String,
+    },
 }
 
 impl ServerMessage {
