@@ -186,10 +186,11 @@ impl Server {
     /// the handle is aborted; needs a Tokio runtime.
     pub fn watch_tokens(&self, path: PathBuf, every: Duration) -> JoinHandle<()> {
         let server = self.clone();
+        // The file as it was last looked at, so each change is acted on (and
+        // each problem reported) once. Read now, not in the task: a change
+        // made before the task first runs must still count as one.
+        let mut seen = std::fs::read(&path).map_err(|e| e.to_string());
         tokio::spawn(async move {
-            // The file as it was last looked at, so each change is acted on
-            // (and each problem reported) once.
-            let mut seen = std::fs::read(&path).map_err(|e| e.to_string());
             loop {
                 tokio::time::sleep(every).await;
                 let now = std::fs::read(&path).map_err(|e| e.to_string());
