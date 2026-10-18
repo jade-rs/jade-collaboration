@@ -5,10 +5,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use futures::executor::block_on;
 use jade_collab_core::id::{Id, ReplicaId};
 use jade_collab_sync::{ApplyContext, Document, Materializer, Rejection};
-use jade_docx_document_core::document::{BodyElement, Table};
+use jade_docx_document_core::document::{BodyElement, Note, Table};
 use jade_docx_document_core::headless_api::apply_headless_commands_to_document;
 use jade_docx_document_core::selection::TextPosition;
-use jade_docx_document_core::word_document::{DocxExportError, WordDocument};
+use jade_docx_document_core::word_document::{DocxExportError, ParagraphStory, WordDocument};
 use jade_docx_document_core::Options;
 use jade_docx_headless_api::{HeadlessCommand, HeadlessEditRequest, HeadlessTableCellSelection};
 
@@ -55,9 +55,47 @@ impl JadeDocx {
         self.word.export_docx()
     }
 
+    /// jade's paragraph surfaces the model lists, in order: every one but
+    /// equations and note separators. The model's paragraph ordinals index
+    /// into this.
+    pub fn paragraph_surfaces(&self) -> Vec<usize> {
+        let document = self.word.document.as_ref();
+        let real = |notes: Option<&BTreeMap<String, Note>>, id: &str| {
+            notes
+                .and_then(|notes| notes.get(id))
+                .is_some_and(|note| note.note_type.is_none())
+        };
+        (0..self.word.paragraph_count())
+            .filter(|&s| match self.word.paragraph_story(s) {
+                None => false,
+                Some(ParagraphStory::Footnote { note_id, .. }) => {
+                    real(document.map(|d| &d.footnotes), &note_id)
+                }
+                Some(ParagraphStory::Endnote { note_id, .. }) => {
+                    real(document.map(|d| &d.endnotes), &note_id)
+                }
+                Some(_) => true,
+            })
+            .collect()
+    }
+
+    /// The text of each paragraph the model lists, in its order.
+    pub fn paragraph_texts(&self) -> Vec<String> {
+        self.paragraph_surfaces()
+            .into_iter()
+            .map(|i| self.paragraph_text(i))
+            .collect()
+    }
+
+    fn paragraph_text(&self, surface: usize) -> String {
+        self.word
+            .paragraph(surface)
+            .map(|p| p.runs.iter().map(|r| r.text.as_str()).collect())
+            .unwrap_or_default()
+    }
+
     /// jade paragraph-surface indices of the body paragraphs (table cells
-    /// included; notes, text boxes and equations excluded), in order. The
-    /// model's paragraph ordinals index into this.
+    /// included; notes, text boxes and equations excluded), in order.
     pub fn body_surfaces(&self) -> Vec<usize> {
         (0..self.word.paragraph_count())
             .filter(|&i| self.word.is_body_paragraph_surface(i))
@@ -67,12 +105,7 @@ impl JadeDocx {
     pub fn body_paragraph_texts(&self) -> Vec<String> {
         self.body_surfaces()
             .into_iter()
-            .map(|i| {
-                self.word
-                    .paragraph(i)
-                    .map(|p| p.runs.iter().map(|r| r.text.as_str()).collect())
-                    .unwrap_or_default()
-            })
+            .map(|i| self.paragraph_text(i))
             .collect()
     }
 
@@ -258,45 +291,187 @@ impl JadeDocx {
         })
     }
 
-    fn command(&self, model: &DocxModel, effect: DocxEffect) -> Result<HeadlessCommand, String> {
-        let surfaces = self.body_surfaces();
-        let surface = |p: usize| {
-            surfaces.get(p).copied().ok_or_else(|| {
-                format!(
-                    "paragraph {p} is not among jade's {} body paragraphs",
-                    surfaces.len()
-                )
-            })
+    /// The paragraph surface `at` names now.
+    fn surface(&self, at: &ParagraphStory) -> Result<usize, String> {
+        self.word
+            .paragraph_story_surface(at)
+            .ok_or_else(|| format!("jade has no paragraph {at:?}"))
+    }
+
+    fn text_len(&self, surface: usize) -> usize {
+        self.word.paragraph_text_len_at(surface).unwrap_or(0)
+    }
+
+    /// The rendered offset `offset` bytes into the paragraph at `surface`,
+    /// after `anchors` of its text boxes and note references (and their
+    /// marks). jade must have exactly that many at or before the offset.
+    fn rendered_after(
+        &self,
+        surface: usize,
+        offset: usize,
+        anchors: usize,
+    ) -> Result<usize, String> {
+        let listed = self.word.paragraph_anchors(surface);
+        let before = listed.iter().filter(|a| a.offset < offset).count();
+        let at = listed.iter().filter(|a| a.offset == offset).count();
+        if anchors < before || anchors > before + at {
+            return Err(format!(
+                "jade has {before} text boxes or note references before offset {offset} of \
+                 paragraph {surface} and {at} at it; the model has {anchors} before it"
+            ));
+        }
+        let marks: usize = listed[before..anchors].iter().map(|a| a.rendered_len).sum();
+        Ok(self.rendered(surface, offset) + marks)
+    }
+
+    /// How many paragraph surfaces jade lists without a paragraph behind
+    /// them (equations, and text-box paragraphs it lost track of).
+    fn unlisted(&self) -> usize {
+        (0..self.word.paragraph_count())
+            .filter(|&s| self.word.paragraph(s).is_none())
+            .count()
+    }
+
+    fn run(&mut self, command: HeadlessCommand) -> Result<(), String> {
+        let description = format!("{command:?}");
+        apply_headless_commands_to_document(
+            &mut self.word,
+            &HeadlessEditRequest {
+                commands: vec![command],
+            },
+        )
+        .map_err(|e| format!("{description}: {e}"))
+    }
+
+    /// Joins the paragraph at `at` (its text `len` bytes long) with the next
+    /// paragraph of its story, which jade must list right after it.
+    fn join(&mut self, at: &ParagraphStory, len: usize) -> Result<(), String> {
+        let (first, second) = (self.surface(at)?, self.surface(&next_paragraph(at))?);
+        if first + 1 != second {
+            return Err(format!(
+                "jade lists a text box or note between {at:?} and the next paragraph"
+            ));
+        }
+        let command = HeadlessCommand::ReplaceRange {
+            start_paragraph: first,
+            start_offset: self.rendered(first, len),
+            end_paragraph: second,
+            end_offset: self.rendered(second, 0),
+            text: String::new(),
         };
-        Ok(match effect {
+        self.run(command)
+    }
+
+    /// Inserts `text` `offset` bytes into the paragraph at `at`, after
+    /// `anchors` of its text boxes and note references.
+    ///
+    /// jade's own typing goes right after the character before the offset
+    /// (before the anchors there), or at a paragraph's start after the
+    /// anchors there. Concurrent edits can order text otherwise around an
+    /// anchor; jade gets that order by a split before the anchors, typing at
+    /// the start of either half and joining the halves again.
+    fn insert_text(
+        &mut self,
+        at: &ParagraphStory,
+        offset: usize,
+        anchors: usize,
+        text: String,
+    ) -> Result<(), String> {
+        let s = self.surface(at)?;
+        let listed = self.word.paragraph_anchors(s);
+        let before = listed.iter().filter(|a| a.offset < offset).count();
+        let here = listed.iter().filter(|a| a.offset == offset).count();
+        let natural = if offset == 0 { here } else { before };
+        if anchors == natural {
+            let command = HeadlessCommand::InsertText {
+                paragraph: s,
+                offset: self.rendered(s, offset),
+                text,
+            };
+            return self.run(command);
+        }
+        let in_text_box = matches!(at, ParagraphStory::TextBox { .. });
+        let half = if anchors == before + here && offset > 0 {
+            next_paragraph(at)
+        } else if anchors == 0 && offset == 0 {
+            at.clone()
+        } else {
+            return Err(format!(
+                "jade cannot place text between the text boxes and note references at \
+                 offset {offset} of {at:?}"
+            ));
+        };
+        if in_text_box {
+            return Err(format!(
+                "jade cannot place text on that side of a note reference in text box {at:?}"
+            ));
+        }
+        let saved = self.word.clone();
+        let result = (|| {
+            self.run(HeadlessCommand::InsertParagraphBreak {
+                paragraph: s,
+                offset: self.rendered(s, offset),
+                count: 1,
+            })?;
+            let target = self.surface(&half)?;
+            self.run(HeadlessCommand::InsertText {
+                paragraph: target,
+                offset: self.rendered(target, 0),
+                text,
+            })?;
+            let first = self.surface(at)?;
+            self.join(at, self.text_len(first))
+        })();
+        if result.is_err() {
+            self.word = saved;
+        }
+        result
+    }
+
+    /// Applies one effect to jade.
+    fn realize(&mut self, model: &DocxModel, effect: DocxEffect) -> Result<(), String> {
+        let command = match effect {
             DocxEffect::InsertText {
                 paragraph,
                 offset,
                 text,
-            } => {
-                let s = surface(paragraph)?;
-                HeadlessCommand::InsertText {
-                    paragraph: s,
-                    offset: self.rendered(s, offset),
-                    text,
-                }
-            }
+                anchors,
+            } => return self.insert_text(&paragraph, offset, anchors, text),
             DocxEffect::DeleteRange {
                 paragraph,
                 start,
                 end,
+                anchors,
             } => {
-                let s = surface(paragraph)?;
+                let s = self.surface(&paragraph)?;
                 HeadlessCommand::ReplaceRange {
                     start_paragraph: s,
-                    start_offset: self.rendered(s, start),
+                    start_offset: self.rendered_after(s, start, anchors)?,
                     end_paragraph: s,
-                    end_offset: self.rendered(s, end),
+                    end_offset: self.rendered_after(s, end, anchors)?,
                     text: String::new(),
                 }
             }
-            DocxEffect::SplitParagraph { paragraph, offset } => {
-                let s = surface(paragraph)?;
+            DocxEffect::SplitParagraph {
+                paragraph,
+                offset,
+                anchors,
+            } => {
+                let s = self.surface(&paragraph)?;
+                // jade's split takes the anchors at the offset along to the
+                // second half; it cannot end the first half with one.
+                let before = self
+                    .word
+                    .paragraph_anchors(s)
+                    .iter()
+                    .filter(|a| a.offset < offset)
+                    .count();
+                if anchors != before {
+                    return Err(format!(
+                        "jade cannot split {paragraph:?} after the text box or note reference \
+                         at offset {offset}: its split takes them to the next paragraph"
+                    ));
+                }
                 HeadlessCommand::InsertParagraphBreak {
                     paragraph: s,
                     offset: self.rendered(s, offset),
@@ -304,14 +479,7 @@ impl JadeDocx {
                 }
             }
             DocxEffect::JoinParagraph { paragraph, offset } => {
-                let (s, next) = (surface(paragraph)?, surface(paragraph + 1)?);
-                HeadlessCommand::ReplaceRange {
-                    start_paragraph: s,
-                    start_offset: self.rendered(s, offset),
-                    end_paragraph: next,
-                    end_offset: self.rendered(next, 0),
-                    text: String::new(),
-                }
+                return self.join(&paragraph, offset)
             }
             DocxEffect::InsertTable {
                 paragraph,
@@ -319,7 +487,7 @@ impl JadeDocx {
                 rows,
                 columns,
             } => HeadlessCommand::InsertTable {
-                after_paragraph: surface(paragraph)?,
+                after_paragraph: self.surface(&paragraph)?,
                 rows,
                 columns,
                 column_widths: Vec::new(),
@@ -384,9 +552,9 @@ impl JadeDocx {
                 start,
                 end,
                 change,
-            } => self.format_command(surface(paragraph)?, start, end, change)?,
+            } => self.format_command(self.surface(&paragraph)?, start, end, change)?,
             DocxEffect::FormatParagraph { paragraph, change } => {
-                let s = surface(paragraph)?;
+                let s = self.surface(&paragraph)?;
                 match change {
                     FormatChange::Alignment { alignment } => {
                         HeadlessCommand::SetParagraphAlignment {
@@ -412,20 +580,17 @@ impl JadeDocx {
                 end,
                 content,
                 ..
-            } => {
-                let (first, last) = (surface(start_paragraph)?, surface(end_paragraph)?);
-                HeadlessCommand::AddComment {
-                    start_paragraph: first,
-                    // Like formatting, comments count offsets in the runs' text.
-                    start_offset: Some(start),
-                    end_paragraph: last,
-                    end_offset: Some(end),
-                    text: content.text,
-                    author: content.author,
-                    initials: content.initials,
-                    date: content.date,
-                }
-            }
+            } => HeadlessCommand::AddComment {
+                start_paragraph: self.surface(&start_paragraph)?,
+                // Like formatting, comments count offsets in the runs' text.
+                start_offset: Some(start),
+                end_paragraph: self.surface(&end_paragraph)?,
+                end_offset: Some(end),
+                text: content.text,
+                author: content.author,
+                initials: content.initials,
+                date: content.date,
+            },
             DocxEffect::ReplyToComment {
                 comment, content, ..
             } => HeadlessCommand::ReplyToComment {
@@ -442,8 +607,21 @@ impl JadeDocx {
             DocxEffect::DeleteComment { comment } => HeadlessCommand::DeleteComment {
                 comment_id: self.jade_comment(model, comment)?,
             },
-        })
+        };
+        self.run(command)
     }
+}
+
+/// The paragraph after `at` in its story.
+fn next_paragraph(at: &ParagraphStory) -> ParagraphStory {
+    let mut next = at.clone();
+    match &mut next {
+        ParagraphStory::Body { index } => *index += 1,
+        ParagraphStory::TextBox { paragraph, .. }
+        | ParagraphStory::Footnote { paragraph, .. }
+        | ParagraphStory::Endnote { paragraph, .. } => *paragraph += 1,
+    }
+    next
 }
 
 impl Materializer<DocxModel> for JadeDocx {
@@ -462,13 +640,13 @@ impl Materializer<DocxModel> for JadeDocx {
             let Some(paragraph) = model.paragraph_ending_with(*story, *mark) else {
                 return Ok(()); // the model rejects it
             };
-            let surfaces = self.body_surfaces();
-            // Between two body paragraphs jade may list a text box's or a
-            // note's paragraphs; a range across them would remove those.
-            if let (Some(a), Some(b)) = (surfaces.get(paragraph), surfaces.get(paragraph + 1)) {
-                if a + 1 != *b {
+            // Between two paragraphs jade may list a text box's or a note's
+            // paragraphs; it cannot join across them.
+            let at = model.paragraphs()[paragraph].at.clone();
+            if let (Ok(a), Ok(b)) = (self.surface(&at), self.surface(&next_paragraph(&at))) {
+                if a + 1 != b {
                     return Err(Rejection::new(
-                        "joining a paragraph across a text box or note is not supported yet",
+                        "joining a paragraph across a text box or note is not supported",
                     ));
                 }
             }
@@ -490,14 +668,18 @@ impl Materializer<DocxModel> for JadeDocx {
                 _ => None,
             };
             let before: BTreeSet<String> = self.word.comments.keys().cloned().collect();
-            let command = self.command(model, effect)?;
-            apply_headless_commands_to_document(
-                &mut self.word,
-                &HeadlessEditRequest {
-                    commands: vec![command],
-                },
-            )
-            .map_err(|e| format!("{description}: {e}"))?;
+            let unlisted = matches!(effect, DocxEffect::AddComment { .. }).then(|| self.unlisted());
+            self.realize(model, effect)
+                .map_err(|e| format!("{description}: {e}"))?;
+            // jade's add_comment splits the runs it anchors to without
+            // relisting the paragraph's text boxes, whose paragraphs then
+            // point at the wrong run and vanish until the document is read
+            // again; putting jade's own state back relists them.
+            if unlisted.is_some_and(|before| self.unlisted() > before) {
+                if let Some(snapshot) = self.word.snapshot_including_package() {
+                    self.word.restore_snapshot(snapshot);
+                }
+            }
             if let Some(comment) = created {
                 // The one comment jade did not have before is this one.
                 let mut new = self

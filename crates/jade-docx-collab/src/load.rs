@@ -10,7 +10,9 @@ use jade_docx_document_core::headless_api::execute_headless_queries_on_document;
 use jade_docx_document_core::word_document::WordDocument;
 use jade_docx_headless_api::{HeadlessQuery, HeadlessQueryRequest, HeadlessQueryResult};
 
-use crate::model::{Anchor, Atom, Block, Comment, CommentContent, DocxModel, Placed, Story, Table};
+use crate::model::{
+    Anchor, Atom, Block, Comment, CommentContent, DocxModel, Note, Placed, Placement, Story, Table,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
@@ -21,6 +23,11 @@ pub enum LoadError {
 struct Loader {
     next: u64,
     tables: BTreeMap<Id, Table>,
+    footnotes: BTreeMap<Id, Note>,
+    endnotes: BTreeMap<Id, Note>,
+    text_boxes: BTreeMap<Id, Story>,
+    /// Model ids of the notes by `w:id`, footnotes and endnotes apart.
+    note_ids: BTreeMap<(bool, String), Id>,
 }
 
 impl Loader {
@@ -30,9 +37,36 @@ impl Loader {
         id
     }
 
-    /// Mirrors jade's body surface enumeration: paragraphs in order, a
-    /// table's cells row by row, recursing into cell blocks.
-    fn story(&mut self, blocks: &[BodyElement], top_level: bool) -> Story {
+    /// The model id of footnote (`footnote`) or endnote `file_id`; a
+    /// reference to a note the file does not have gets an empty one.
+    fn note(&mut self, footnote: bool, file_id: &str) -> Id {
+        if let Some(id) = self.note_ids.get(&(footnote, file_id.to_string())) {
+            return *id;
+        }
+        let id = self.id();
+        self.note_ids.insert((footnote, file_id.to_string()), id);
+        let note = Note {
+            file_id: file_id.to_string(),
+            story: Story {
+                has_paragraph: false,
+                ..Story::empty_paragraph()
+            },
+        };
+        if footnote {
+            self.footnotes.insert(id, note);
+        } else {
+            self.endnotes.insert(id, note);
+        }
+        id
+    }
+
+    /// Mirrors jade's surface enumeration: paragraphs in order, a table's
+    /// cells row by row, recursing into cell blocks. A run's text box and
+    /// note references become anchors before its text; `listed` says
+    /// whether jade lists this story's text boxes (the body's and its
+    /// cells' — not a text box's or a note's), which then get stories of
+    /// their own.
+    fn story(&mut self, blocks: &[BodyElement], top_level: bool, listed: bool) -> Story {
         let last_paragraph = blocks
             .iter()
             .rposition(|b| matches!(b, BodyElement::Paragraph(_)));
@@ -43,17 +77,34 @@ impl Loader {
         for (index, block) in blocks.iter().enumerate() {
             match block {
                 BodyElement::Paragraph(paragraph) => {
-                    let chars: Vec<Atom> = paragraph
-                        .runs
-                        .iter()
-                        .flat_map(|run| run.text.chars())
-                        .map(Atom::Char)
-                        .collect();
-                    if !chars.is_empty() {
-                        let count = chars.len() as u64;
+                    let mut atoms: Vec<Atom> = Vec::new();
+                    for run in &paragraph.runs {
+                        if let Some(text_box) = &run.text_box {
+                            let id = self.id();
+                            let story = if listed {
+                                self.story(&text_box.blocks, false, false)
+                            } else {
+                                Story {
+                                    has_paragraph: false,
+                                    ..Story::empty_paragraph()
+                                }
+                            };
+                            self.text_boxes.insert(id, story);
+                            atoms.push(Atom::Anchor(Placement::TextBox(id)));
+                        }
+                        for note in &run.footnote_reference_ids {
+                            atoms.push(Atom::Anchor(Placement::Footnote(self.note(true, note))));
+                        }
+                        for note in &run.endnote_reference_ids {
+                            atoms.push(Atom::Anchor(Placement::Endnote(self.note(false, note))));
+                        }
+                        atoms.extend(run.text.chars().map(Atom::Char));
+                    }
+                    if !atoms.is_empty() {
+                        let count = atoms.len() as u64;
                         let first = Id::new(self.next, ReplicaId::ORIGIN);
                         self.next += count;
-                        flow.insert_run(first, previous, chars).expect("fresh ids");
+                        flow.insert_run(first, previous, atoms).expect("fresh ids");
                         previous = Some(first.offset(count - 1));
                     }
                     if Some(index) == last_paragraph {
@@ -66,7 +117,7 @@ impl Loader {
                     }
                 }
                 BodyElement::Table(table) => {
-                    let id = self.table(table, top_level);
+                    let id = self.table(table, top_level, listed);
                     placed.push(Placed {
                         anchor,
                         block: Block::Table(id),
@@ -85,7 +136,7 @@ impl Loader {
         }
     }
 
-    fn table(&mut self, table: &JadeTable, top_level: bool) -> Id {
+    fn table(&mut self, table: &JadeTable, top_level: bool, listed: bool) -> Id {
         let id = self.id();
         match regular_layout(table).filter(|_| top_level) {
             Some((width, merges)) => {
@@ -95,7 +146,7 @@ impl Loader {
                 for (r, row) in table.rows.iter().enumerate() {
                     let mut c = 0;
                     for cell in &row.cells {
-                        let story = self.story(&cell.blocks, false);
+                        let story = self.story(&cell.blocks, false, listed);
                         model.add_cell(rows[r], columns[c], story);
                         c += span(cell);
                     }
@@ -125,7 +176,7 @@ impl Loader {
                 let mut model = Table::new(&[], &[], true, top_level);
                 for (row, jade_row) in rows.iter().zip(&table.rows) {
                     for (column, cell) in columns.iter().zip(&jade_row.cells) {
-                        let story = self.story(&cell.blocks, false);
+                        let story = self.story(&cell.blocks, false, listed);
                         model.add_cell(*row, *column, story);
                     }
                 }
@@ -246,22 +297,52 @@ impl Loader {
 }
 
 impl DocxModel {
-    /// The model of `word`'s body, with ids owned by [`ReplicaId::ORIGIN`].
+    /// The model of `word`'s body, notes and text boxes, with ids owned by
+    /// [`ReplicaId::ORIGIN`]. Note separators are not modelled.
     pub fn from_word_document(word: &WordDocument) -> Result<Self, LoadError> {
-        let body = word
-            .document
-            .as_ref()
-            .and_then(|doc| doc.body.as_ref())
-            .ok_or(LoadError::NoBody)?;
+        let document = word.document.as_ref().ok_or(LoadError::NoBody)?;
+        let body = document.body.as_ref().ok_or(LoadError::NoBody)?;
         let mut loader = Loader {
             next: 1,
             tables: BTreeMap::new(),
+            footnotes: BTreeMap::new(),
+            endnotes: BTreeMap::new(),
+            text_boxes: BTreeMap::new(),
+            note_ids: BTreeMap::new(),
         };
-        let body = loader.story(&body.elements, true);
+        let notes = |footnote: bool| {
+            let notes = if footnote {
+                &document.footnotes
+            } else {
+                &document.endnotes
+            };
+            notes
+                .iter()
+                .filter(|(_, note)| note.note_type.is_none())
+                .map(move |(id, note)| (footnote, id, &note.body))
+        };
+        let notes: Vec<_> = notes(true).chain(notes(false)).collect();
+        for (footnote, file_id, _) in &notes {
+            loader.note(*footnote, file_id);
+        }
+        let body = loader.story(&body.elements, true, true);
+        for (footnote, file_id, blocks) in notes {
+            let story = loader.story(blocks, false, false);
+            let id = loader.note(footnote, file_id);
+            let notes = if footnote {
+                &mut loader.footnotes
+            } else {
+                &mut loader.endnotes
+            };
+            notes.get_mut(&id).expect("listed above").story = story;
+        }
         let comments = loader.comments(word);
         Ok(DocxModel {
             body,
             tables: loader.tables,
+            footnotes: loader.footnotes,
+            endnotes: loader.endnotes,
+            text_boxes: loader.text_boxes,
             comments,
             max_lamport: loader.next - 1,
         })

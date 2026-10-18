@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 7a99225be4835f3a7cf4ced56ecdf97b5196b67f001963a2d15c212bf8f7ac01 # shrinks to fixture = "footnote-table-textbox-order.docx", choices = [(0, 1201061294644338027)], schedule = 0

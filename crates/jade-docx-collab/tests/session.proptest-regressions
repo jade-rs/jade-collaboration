@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 98896d83666e9a52a6708ad5a9cca2a863ef8ab299219965fa2a0288bd787d1c # shrinks to fixture = "comment.docx", steps = [Local { client: 0, choice: 4546543508985377833 }, Local { client: 0, choice: 0 }]
+cc 8c29e088ac52a8a508055fd941f6d87c743c7c8fd08c76ee539c72af20a7b6b1 # shrinks to fixture = "footnote-table-textbox-order.docx", steps = [Local { client: 2, choice: 16291984833174489686 }, Local { client: 2, choice: 3388595971177366918 }]

@@ -1,5 +1,7 @@
-//! The model and jade must describe the same document: the same body
-//! paragraphs in the same order with the same text, and the same top-level
+//! The model and jade must describe the same document: the same paragraphs
+//! — body, table cells, text boxes, footnotes and endnotes — in the same
+//! order with the same text, the same story positions and the same text
+//! boxes and note references at the same offsets, and the same top-level
 //! tables — on load, and after every operation the materializer realises.
 
 mod common;
@@ -7,24 +9,20 @@ mod common;
 use std::collections::{BTreeMap, BTreeSet};
 
 use common::{
-    assert_comments_agree, char_styles, generate, jade_comments, jade_core, open,
-    paragraph_formats, paragraph_snapshot, CharStyle,
+    assert_comments_agree, assert_same_order, assert_stories_agree, char_styles, commit, generate,
+    jade_comments, jade_core, open, paragraph_formats, paragraph_snapshot, surface, CharStyle,
 };
 use jade_collab_core::id::{Id, ReplicaId};
 use jade_collab_sync::{ApplyContext, Document, Lane, Materializer};
 use jade_docx_collab::intent::{resolve, IntentOp};
 use jade_docx_collab::{
     CommentContent, DocxEffect, DocxModel, DocxOp, FormatChange, JadeDocx, ParagraphAlignment,
-    StoryId,
+    ParagraphStory, StoryId,
 };
 use proptest::prelude::*;
 
 fn assert_agree(model: &DocxModel, jade: &JadeDocx, context: &str) {
-    assert_eq!(
-        model.paragraph_texts(),
-        jade.body_paragraph_texts(),
-        "paragraphs disagree {context}"
-    );
+    assert_stories_agree(model, jade, context);
     let shapes: Vec<(usize, usize)> = model
         .tables()
         .iter()
@@ -41,7 +39,8 @@ fn assert_agree(model: &DocxModel, jade: &JadeDocx, context: &str) {
 
 /// Every fixture jade can open yields a model that agrees with it. This pins
 /// the model's traversal to jade's paragraph-surface enumeration (tables,
-/// nested tables, footnotes and text boxes interleaved).
+/// nested tables, text boxes, footnotes and endnotes interleaved): every
+/// paragraph surface, not only the body's.
 #[test]
 fn every_fixture_loads_into_an_agreeing_model() {
     let dir = jade_core().join("public/fixtures");
@@ -59,6 +58,7 @@ fn every_fixture_loads_into_an_agreeing_model() {
         let model = DocxModel::from_word_document(jade.word())
             .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         assert_agree(&model, &jade, &path.display().to_string());
+        assert_same_order(&model, &jade, &path.display().to_string());
         checked += 1;
     }
     assert!(checked > 50, "only {checked} fixtures were checked");
@@ -95,7 +95,7 @@ fn hello_round_trips_an_edit_through_export() {
 
     let bytes = jade.export().unwrap();
     let reloaded = JadeDocx::load(&bytes).unwrap();
-    assert_eq!(reloaded.body_paragraph_texts(), model.paragraph_texts());
+    assert_eq!(reloaded.paragraph_texts(), model.paragraph_texts());
     assert!(model.paragraph_texts()[0].starts_with("Edited: "));
 }
 
@@ -105,6 +105,11 @@ const EDIT_FIXTURES: &[&str] = &[
     "footnote-table-textbox-order.docx",
     "table-complex-nested-merges.docx",
     "comment.docx",
+    "footnote.docx",
+    "footnote-long-continuation.docx",
+    "endnote.docx",
+    "textbox.docx",
+    "floating-wrap-sides.docx",
 ];
 
 /// Whether `style` shows `change` (for the properties jade's queries report).
@@ -151,16 +156,16 @@ fn assert_formatted(
         return;
     };
     if change.is_paragraph_level() {
-        let touched: BTreeSet<usize> = effects
+        let touched: BTreeSet<ParagraphStory> = effects
             .iter()
             .filter_map(|e| match e {
-                DocxEffect::FormatParagraph { paragraph, .. } => Some(*paragraph),
+                DocxEffect::FormatParagraph { paragraph, .. } => Some(paragraph.clone()),
                 _ => None,
             })
             .collect();
         let paragraphs = model_before.paragraphs();
         for (ordinal, paragraph) in paragraphs.iter().enumerate() {
-            if touched.contains(&ordinal) {
+            if touched.contains(&paragraph.at) {
                 if let FormatChange::Alignment { alignment } = change {
                     // jade keeps `both` where it was already justified.
                     assert_eq!(
@@ -228,8 +233,10 @@ fn anchored_text(jade: &JadeDocx, key: &str) -> Vec<String> {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(96))]
 
-    /// Random edit sequences keep the model and jade in agreement after every
-    /// single operation.
+    /// Random edit sequences — typing, deleting, splitting and joining in any
+    /// story, notes and text boxes included, and around the text boxes and
+    /// note references that place them — keep the model and jade in
+    /// agreement after every single operation.
     #[test]
     fn random_edits_keep_model_and_jade_in_agreement(
         fixture_index in 0..EDIT_FIXTURES.len(),
@@ -286,13 +293,11 @@ proptest! {
                             .filter(|(_, c)| before.range_chars(*story, *start, *end).unwrap().contains(c))
                             .map(|(ch, _)| ch)
                             .collect();
-                        let surfaces = jade.body_surfaces();
                         let story_surfaces: BTreeSet<usize> = model
                             .paragraphs()
                             .iter()
-                            .enumerate()
-                            .filter(|(_, p)| p.story == *story)
-                            .map(|(n, _)| surfaces[n])
+                            .filter(|p| p.story == *story)
+                            .map(|p| surface(&jade, p))
                             .collect();
                         let comment = jade_comments(&jade).into_iter().find(|c| c.id == key).unwrap();
                         let anchored: String = comment
@@ -307,9 +312,13 @@ proptest! {
                 Err(_) => prop_assert_eq!(&model, &before, "a rejected op changed the model"),
             }
         }
-        // And the file jade writes reads back as the same document.
+        // And the file jade writes reads back as the same document, with its
+        // notes and text boxes where the model has them.
         let reloaded = JadeDocx::load(&jade.export().unwrap()).unwrap();
-        prop_assert_eq!(reloaded.body_paragraph_texts(), model.paragraph_texts());
+        let reloaded_model = DocxModel::from_word_document(reloaded.word()).unwrap();
+        assert_same_order(&reloaded_model, &reloaded, &format!("{name} reloaded"));
+        assert_same_order(&model, &reloaded, &format!("{name} against the reloaded file"));
+        prop_assert_eq!(anchor_layout(&reloaded_model), anchor_layout(&model));
         prop_assert_eq!(jade_comments(&reloaded).len(), model.comments().len());
     }
 }
@@ -428,28 +437,7 @@ fn table_structure_is_realised_in_jade() {
     step(&mut model, &mut jade, DocxOp::DeleteTable { table });
     assert!(model.tables().is_empty());
     let reloaded = JadeDocx::load(&jade.export().unwrap()).unwrap();
-    assert_eq!(reloaded.body_paragraph_texts(), model.paragraph_texts());
-}
-
-/// Applies `op` as the server would: admit, apply, materialize.
-fn commit(model: &mut DocxModel, jade: &mut JadeDocx, op: DocxOp) -> Vec<DocxEffect> {
-    let ctx = ApplyContext {
-        origin: ReplicaId(1),
-        base_seq: 0,
-        seq: Some(1),
-    };
-    if DocxModel::lane(&op) == Lane::Sequenced {
-        jade.admit(model, &op)
-            .unwrap_or_else(|e| panic!("jade refused {op:?}: {e}"));
-    }
-    let effect = model
-        .apply(&op, &ctx)
-        .unwrap_or_else(|e| panic!("{op:?}: {e}"));
-    jade.materialize(model, effect.clone(), &ctx)
-        .unwrap_or_else(|e| panic!("{op:?}: {e}"));
-    assert_agree(model, jade, &format!("after {op:?}"));
-    assert_comments_agree(model, jade, &format!("after {op:?}"));
-    effect
+    assert_eq!(reloaded.paragraph_texts(), model.paragraph_texts());
 }
 
 /// The characters of `model` (in order) for which `pick` holds in jade.
@@ -824,4 +812,27 @@ fn jade_refuses_a_reply_it_cannot_anchor() {
             resolved: true,
         },
     );
+}
+
+/// Each paragraph's text with its anchors, as `text[anchor]text`, story by
+/// kind — what must survive an export.
+fn anchor_layout(model: &DocxModel) -> Vec<String> {
+    model
+        .paragraphs()
+        .iter()
+        .map(|p| {
+            let mut out = String::new();
+            let mut at = 0;
+            for anchor in &p.anchors {
+                out.push_str(&p.text[at..anchor.offset]);
+                at = anchor.offset;
+                out.push_str(&match anchor.story {
+                    StoryId::TextBox { .. } => "[box]".to_string(),
+                    story => format!("[{}]", model.note_id(story).unwrap()),
+                });
+            }
+            out.push_str(&p.text[at..]);
+            out
+        })
+        .collect()
 }

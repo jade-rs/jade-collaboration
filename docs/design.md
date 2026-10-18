@@ -108,8 +108,9 @@ Why keep the server when a CRDT handles text?
 
 ### Text: RGA with paragraph marks (`jade-collab-core::rga`)
 
-A *story* (the body, one table cell, …) is one RGA sequence of atoms: a
-character or a paragraph mark. Each atom names the atom it was inserted after
+A *story* (the body, one table cell, one footnote or endnote, one text box)
+is one RGA sequence of atoms: a character, a paragraph mark, or an *anchor*
+(below). Each atom names the atom it was inserted after
 (its *parent*); deletion leaves a tombstone. The visible order is a depth-first
 walk of the parent tree with siblings in **descending** identifier order.
 
@@ -127,6 +128,75 @@ against the original flat-array implementation kept as a reference.
 A story's last paragraph has no mark atom (Word's final paragraph mark cannot
 be deleted). Splitting a paragraph inserts a mark: convergent. Joining deletes
 a mark: sequenced, because a table may be anchored to that mark.
+
+### Notes and text boxes (`jade-docx-collab`)
+
+Every footnote, endnote and text box loaded from the file is a story of its
+own (`StoryId::Footnote`, `Endnote`, `TextBox`, keyed by an id minted on
+load), edited like the body: convergent text and paragraph splits,
+sequenced joins. What places it — a note's reference mark, a text box's
+anchoring run — is an **anchor atom** in its host paragraph's RGA, in run
+order. Anchors are zero-width and are never deleted: `DeleteText` refuses
+them, so a concurrent deletion of the text around one cannot take it, and a
+split or join moves it with the text around it. Creating and deleting notes
+and text boxes are out of scope; note separators are not modelled.
+
+The model's walk lists paragraphs in jade's paragraph-surface order, which
+is also the order the intent API indexes: the body (table cells row by
+row); after each body paragraph the text boxes it anchors (in run order)
+and the footnotes it references first; then the remaining footnotes by
+`w:id`; then the endnotes in order of first reference from the body or a
+text box, then by `w:id`. Each paragraph carries jade's *story position*
+(`ParagraphStory`, from jade-core's `paragraph_story` API): body index; text
+box by host body paragraph, index among the host's text boxes and paragraph;
+note by `w:id` and paragraph.
+
+The anchors follow jade's rules, which a test checks on every fixture and
+the random-edit test after every operation:
+
+* jade's text offsets cannot name a side of a zero-width run. Typing at an
+  offset where an anchor sits goes right after the character before it —
+  *before* the anchor — except at a paragraph's start, where it goes after
+  the anchors there. The intent API resolves a caret the same way (at a
+  paragraph's start the caret's parent is the last leading anchor), and an
+  RGA insert after a visible character lands before any older anchor that
+  follows it, so sequential edits always agree.
+* A split takes the anchors at its offset to the second paragraph; a mark
+  inserted after a character lands before them as well.
+* A deletion is sent to jade as ranges that never contain an anchor (split
+  around each one), with rendered offsets that skip a reference's mark.
+* jade lists a paragraph's text boxes and first-referenced footnotes between
+  it and the next paragraph and has no command that joins across them, so
+  the model refuses such a join (sequenced) and `admit` checks it again.
+
+jade writes a text box's text to the file but not new or removed paragraphs
+in it (a split is kept in memory only; shown by a test), so a text box's
+paragraphs are fixed: the model refuses `SplitParagraph` and `JoinParagraph`
+there, on every replica. jade cannot anchor a comment in a note; the model
+refuses that too. Formatting works in every story. jade's `add_comment`
+splits the runs of the paragraph it anchors to without relisting that
+paragraph's text boxes, whose paragraphs then point at a stale run until the
+file is read again; the materializer has jade relist them by restoring
+jade's own snapshot. A jade-core bug surfaced here — text typed after a note
+reference or text box alone in its paragraph went into that run, and the
+next edit that split the run (formatting, a comment) copied the reference
+into both halves — and is fixed on jade-core's `feat/paragraph-story-api`
+with the story API the model needs (`paragraph_story`,
+`paragraph_story_surface`, `paragraph_anchors`).
+
+**Concurrency around anchors.** jade's placement depends on what it sees
+when an edit arrives, the RGA's does not: text typed after a character that
+was concurrently deleted, right after an anchor, belongs after the anchor;
+text typed where a concurrent split put an anchor at the start of the new
+paragraph belongs before it. The materializer realises these orders with a
+split before the anchors, typing at the start of the half that must hold
+the text, and a join — possible unless a text box earlier in the paragraph
+sits between the halves (jade lists the first half's text boxes between
+them). One order jade cannot produce at all: a paragraph *ending* with an
+anchor because of a split right after a concurrently deleted character (its
+split always moves the anchor on). The materializer reports that as a fault
+instead of writing a different document. Both need a jade command that
+names the side of a zero-width run.
 
 ### Tables (`jade-collab-core::grid`)
 
@@ -330,9 +400,18 @@ The server owns one jade document per room and applies, for every committed
 operation, the `HeadlessCommand`s (docx), `HeadlessWorkbook` calls (xlsx) or
 jade-pptx-writer `EditSession` calls (pptx) that realise it, computing
 paragraph indices and byte offsets from the model at that point of the log.
-jade addresses paragraphs by its flattened *paragraph surface* index; the
-model mirrors the body/table part of that enumeration and a test checks the
-two agree on real fixtures. For pptx, effects name slides by position and
+jade addresses paragraphs by its flattened *paragraph surface* index. Model
+effects name a paragraph by jade's story position instead, which the
+materializer turns into a surface index with jade's `paragraph_story_surface`
+when it applies the effect, so the model never depends on jade's
+enumeration order; text commands get rendered offsets
+(`model_to_rendered_text_position`, plus the marks of the note references the
+model says come before the position), formatting and comments model
+offsets. The model mirrors jade's enumeration and a test checks the two
+agree on real fixtures — in order on load and after reloading a written
+file, by story position after edits: after a split jade lists the new
+paragraph before the footnotes the first half references until the file is
+read again. For pptx, effects name slides by position and
 text by paragraph and byte offset; the materializer turns those into jade's
 UTF-16 ranges on jade's own text.
 
@@ -355,8 +434,8 @@ The real document can know things the model does not. A `Materializer` may
 therefore **refuse a sequenced operation before it is applied**
 (`Materializer::admit`); the rejection travels back like any other. jade, for
 instance, lists a text box's or a note's paragraphs between two body
-paragraphs, and a range across them would delete those paragraphs, so the
-docx materializer refuses to join paragraphs across them; the pptx
+paragraphs and cannot join across them, so the docx materializer refuses
+such joins (the model refuses them too, knowing the anchors); the pptx
 materializer dry-runs shape deletions, slide deletions and duplications and
 text-box insertions on the current file. `admit` is never consulted for
 convergent operations — they must commit wherever they land; the pptx model
@@ -547,7 +626,9 @@ untouched.
 
 Working: the two-lane protocol over WebSockets; docx text, paragraph
 split/join, table insertion/deletion and row/column structure on simple
-tables, text in any table cell; docx formatting (character and paragraph)
+tables, text in any table cell; text of footnotes, endnotes and text boxes
+(§4; notes also split and joined), their anchors following splits, joins
+and deletions as jade moves them; docx formatting (character and paragraph)
 and comments (add, reply, resolve, delete; also comments loaded from the
 file) as sequenced operations on id ranges resolved in log order (§4); xlsx
 values, formulas (with rebasing), row/column structure, notes, cell
@@ -572,10 +653,14 @@ Not yet:
 * Optimistic formatting on the convergent lane (a Peritext-style mark CRDT);
   formatting a story's last paragraph while it is empty (it has no atom to
   name it by); editing comment text; comments in notes and headers.
+  Headers and footers are not modelled.
 * xlsx borders, whole-row/column formats, conditional formats and threaded
   comments; note authors are not modelled (jade records `jade`).
 * docx structure of ragged and nested tables (their text is editable),
-  rows/columns through merged regions, text boxes, notes, tracked changes.
+  rows/columns through merged regions, tracked changes; creating and
+  deleting notes and text boxes; splitting or joining a text box's
+  paragraphs (jade does not write them); comments in notes; the concurrent
+  orders around anchors jade cannot realise (§4).
 * Access and durability: a connection's outgoing queue is unbounded (a
   client that stops reading makes it grow), there is no audit log of who
   connected with which token, and reloading tokens on SIGHUP is Unix-only

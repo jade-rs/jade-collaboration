@@ -5,11 +5,14 @@ use std::path::PathBuf;
 
 use jade_collab_core::grid::GridOp;
 use jade_collab_core::id::Id;
+use jade_collab_sync::{ApplyContext, Document, Lane, Materializer};
 use jade_docx_collab::intent::{resolve, IntentOp};
 use jade_docx_collab::{
-    Anchor, CommentContent, DocxModel, DocxOp, FormatChange, JadeDocx, ParagraphAlignment, StoryId,
+    Anchor, CommentContent, DocxEffect, DocxModel, DocxOp, FormatChange, JadeDocx,
+    ParagraphAlignment, StoryId,
 };
 use jade_docx_document_core::headless_api::execute_headless_queries_on_document;
+use jade_docx_document_core::word_document::ParagraphAnchorKind;
 use jade_docx_headless_api::{
     HeadlessCommentSnapshot, HeadlessParagraphSnapshot, HeadlessQuery, HeadlessQueryRequest,
     HeadlessQueryResult, HeadlessRunStyle,
@@ -37,6 +40,116 @@ pub fn open(name: &str) -> (DocxModel, JadeDocx) {
     (model, jade)
 }
 
+/// The model and jade describe the same paragraphs: every paragraph surface
+/// jade lists (body, table cells, text boxes, footnotes, endnotes; not
+/// equations or note separators) is one model paragraph naming its story
+/// position, with the same text and the same text boxes and note references
+/// at the same offsets.
+///
+/// After a split jade lists the new paragraph before the footnotes the first
+/// half references, until the file is read again (`assert_same_order`); the
+/// model lists them as jade does when it reads the file. Paragraphs are
+/// therefore matched by story position, which is how the materializer
+/// addresses them.
+pub fn assert_stories_agree(model: &DocxModel, jade: &JadeDocx, context: &str) {
+    let paragraphs = model.paragraphs();
+    let mut matched: Vec<Option<usize>> = paragraphs
+        .iter()
+        .map(|p| jade.word().paragraph_story_surface(&p.at))
+        .collect();
+    matched.sort();
+    let surfaces: Vec<Option<usize>> = jade.paragraph_surfaces().into_iter().map(Some).collect();
+    let texts: Vec<&str> = paragraphs.iter().map(|p| p.text.as_str()).collect();
+    assert_eq!(
+        matched,
+        surfaces,
+        "paragraphs disagree {context}: model {texts:?}, jade {:?}",
+        jade.paragraph_texts()
+    );
+    for paragraph in &paragraphs {
+        let surface = surface(jade, paragraph);
+        assert_eq!(
+            jade.word().paragraph(surface).map(|p| p
+                .runs
+                .iter()
+                .map(|r| r.text.as_str())
+                .collect::<String>()),
+            Some(paragraph.text.clone()),
+            "text of {:?} {context}",
+            paragraph.at
+        );
+        let ours: Vec<(usize, String)> = paragraph
+            .anchors
+            .iter()
+            .map(|a| (a.offset, describe(model, a.story)))
+            .collect();
+        let theirs: Vec<(usize, String)> = jade
+            .word()
+            .paragraph_anchors(surface)
+            .into_iter()
+            .map(|a| {
+                let kind = match a.kind {
+                    ParagraphAnchorKind::TextBox { .. } => "text box".to_string(),
+                    ParagraphAnchorKind::Footnote { note_id } => format!("footnote {note_id}"),
+                    ParagraphAnchorKind::Endnote { note_id } => format!("endnote {note_id}"),
+                };
+                (a.offset, kind)
+            })
+            .collect();
+        assert_eq!(ours, theirs, "anchors of {:?} {context}", paragraph.text);
+    }
+}
+
+/// jade's paragraph surface for a model paragraph.
+pub fn surface(jade: &JadeDocx, paragraph: &jade_docx_collab::Paragraph) -> usize {
+    jade.word()
+        .paragraph_story_surface(&paragraph.at)
+        .unwrap_or_else(|| panic!("jade has no paragraph {:?}", paragraph.at))
+}
+
+/// The model lists jade's paragraphs in jade's order — as jade lists them
+/// when it reads a file.
+pub fn assert_same_order(model: &DocxModel, jade: &JadeDocx, context: &str) {
+    assert_eq!(
+        model.paragraph_texts(),
+        jade.paragraph_texts(),
+        "paragraph order {context}"
+    );
+    assert_stories_agree(model, jade, context);
+}
+
+/// How jade names the story an anchor places.
+fn describe(model: &DocxModel, story: StoryId) -> String {
+    match story {
+        StoryId::Footnote { .. } => format!("footnote {}", model.note_id(story).unwrap()),
+        StoryId::Endnote { .. } => format!("endnote {}", model.note_id(story).unwrap()),
+        StoryId::TextBox { .. } => "text box".to_string(),
+        other => panic!("{other:?} is not placed by an anchor"),
+    }
+}
+
+/// Applies `op` as the server does — admit (sequenced), apply, materialize —
+/// and checks the model and jade still agree.
+pub fn commit(model: &mut DocxModel, jade: &mut JadeDocx, op: DocxOp) -> Vec<DocxEffect> {
+    let ctx = ApplyContext {
+        origin: jade_collab_core::id::ReplicaId(1),
+        base_seq: 0,
+        seq: Some(1),
+    };
+    if DocxModel::lane(&op) == Lane::Sequenced {
+        jade.admit(model, &op)
+            .unwrap_or_else(|e| panic!("jade refused {op:?}: {e}"));
+    }
+    let effect = model
+        .apply(&op, &ctx)
+        .unwrap_or_else(|e| panic!("{op:?}: {e}"));
+    jade.materialize(model, effect.clone(), &ctx)
+        .unwrap_or_else(|e| panic!("{op:?}: {e}"));
+    assert_stories_agree(model, jade, &format!("after {op:?}"));
+    assert_comments_agree(model, jade, &format!("after {op:?}"));
+    effect
+}
+
 /// Turns a random `choice` into an operation on `view`. `ids(n)` reserves `n`
 /// consecutive identifiers. Returns `None` when the choice does not fit the
 /// document (e.g. no tables to edit).
@@ -44,7 +157,7 @@ pub fn generate(view: &DocxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
     let paragraphs = view.paragraphs();
     let pick = |n: usize, salt: u32| ((choice >> salt) as usize) % n.max(1);
     let words = ["x", "日本", "é", "Lorem ", "  ", "ab"];
-    match choice % 25 {
+    match choice % 30 {
         // Typing at a random caret, through the index-addressed intent API.
         0..=4 => {
             let p = pick(paragraphs.len(), 8);
@@ -141,7 +254,7 @@ pub fn generate(view: &DocxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
             let table = editable[pick(editable.len(), 8)];
             let row = table.rows[pick(table.rows.len(), 12)];
             let column = table.columns[pick(table.columns.len(), 16)];
-            let op = match choice % 25 {
+            let op = match choice % 30 {
                 11 => GridOp::InsertRow {
                     id: ids(1),
                     after: (pick(3, 20) != 0).then_some(row),
@@ -264,6 +377,8 @@ pub fn generate(view: &DocxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
             };
             resolve(view, &op, ids).ok()?.into_iter().next()
         }
+        // Edits right next to a text box or a note reference.
+        25..=29 => around_anchor(view, &paragraphs, choice, ids),
         _ => {
             let comments = view.comments();
             if comments.is_empty() {
@@ -271,6 +386,81 @@ pub fn generate(view: &DocxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
             }
             Some(DocxOp::DeleteComment {
                 comment: comments[pick(comments.len(), 8)].id,
+            })
+        }
+    }
+}
+
+/// An edit at a random anchor (a text box or a note reference): typing or
+/// splitting at its offset, deleting the characters on both sides of it,
+/// emptying its paragraph up to it, or joining its paragraph with the next
+/// or the previous one.
+fn around_anchor(
+    view: &DocxModel,
+    paragraphs: &[jade_docx_collab::Paragraph],
+    choice: u64,
+    ids: &mut dyn FnMut(u64) -> Id,
+) -> Option<DocxOp> {
+    let pick = |n: usize, salt: u32| ((choice >> salt) as usize) % n.max(1);
+    let anchored: Vec<(usize, usize)> = paragraphs
+        .iter()
+        .enumerate()
+        .flat_map(|(p, paragraph)| (0..paragraph.anchors.len()).map(move |a| (p, a)))
+        .collect();
+    let &(p, a) = anchored.get(pick(anchored.len(), 8))?;
+    let paragraph = &paragraphs[p];
+    let anchor = &paragraph.anchors[a];
+    // Characters before the anchor.
+    let before = paragraph.text[..anchor.offset].chars().count();
+    match choice % 30 {
+        25 => {
+            let op = IntentOp::InsertText {
+                paragraph: p,
+                offset: anchor.offset,
+                text: ["a", "日本"][pick(2, 16)].to_string(),
+            };
+            resolve(view, &op, ids).ok()?.into_iter().next()
+        }
+        26 => {
+            let op = IntentOp::InsertParagraphBreak {
+                paragraph: p,
+                offset: anchor.offset,
+                count: 1,
+            };
+            resolve(view, &op, ids).ok()?.into_iter().next()
+        }
+        27 => {
+            let chars: Vec<Id> = paragraph.chars[before.saturating_sub(1)..]
+                .iter()
+                .take(2)
+                .copied()
+                .collect();
+            (!chars.is_empty()).then_some(DocxOp::DeleteText {
+                story: paragraph.story,
+                ids: chars,
+            })
+        }
+        28 => {
+            let chars = paragraph.chars[..before].to_vec();
+            (!chars.is_empty()).then_some(DocxOp::DeleteText {
+                story: paragraph.story,
+                ids: chars,
+            })
+        }
+        _ => {
+            // This paragraph's mark, or the previous one of its story.
+            let mark = if pick(2, 16) == 0 {
+                paragraph.mark
+            } else {
+                paragraphs[..p]
+                    .iter()
+                    .rev()
+                    .find(|q| q.story == paragraph.story)
+                    .and_then(|q| q.mark)
+            }?;
+            Some(DocxOp::JoinParagraph {
+                story: paragraph.story,
+                mark,
             })
         }
     }
@@ -394,10 +584,9 @@ pub fn paragraph_snapshot(jade: &JadeDocx, surface: usize) -> HeadlessParagraphS
 
 /// Every visible character of `model`, with what jade says about it.
 pub fn char_styles(model: &DocxModel, jade: &JadeDocx) -> BTreeMap<Id, CharStyle> {
-    let surfaces = jade.body_surfaces();
     let mut out = BTreeMap::new();
-    for (ordinal, paragraph) in model.paragraphs().iter().enumerate() {
-        let surface = surfaces[ordinal];
+    for paragraph in model.paragraphs().iter() {
+        let surface = surface(jade, paragraph);
         let snapshot = paragraph_snapshot(jade, surface);
         let runs = &jade.word().paragraph(surface).expect("surface exists").runs;
         let mut offset = 0;
@@ -445,10 +634,11 @@ pub fn paragraph_formats(
     model: &DocxModel,
     jade: &JadeDocx,
 ) -> Vec<(Option<String>, Option<String>)> {
-    let surfaces = jade.body_surfaces();
-    (0..model.paragraphs().len())
-        .map(|ordinal| {
-            let snapshot = paragraph_snapshot(jade, surfaces[ordinal]);
+    model
+        .paragraphs()
+        .iter()
+        .map(|paragraph| {
+            let snapshot = paragraph_snapshot(jade, surface(jade, paragraph));
             (snapshot.alignment, snapshot.style_id)
         })
         .collect()

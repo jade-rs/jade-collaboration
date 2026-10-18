@@ -8,9 +8,13 @@ use jade_collab_core::id::{Id, ReplicaId};
 use jade_collab_sync::{ApplyContext, Document, Lane};
 use jade_docx_collab::{
     Anchor, CommentContent, DocxEffect, DocxModel, DocxOp, FormatChange, ParagraphAlignment,
-    StoryId,
+    ParagraphStory, StoryId,
 };
 use proptest::prelude::*;
+
+fn body(index: usize) -> ParagraphStory {
+    ParagraphStory::Body { index }
+}
 
 fn ctx() -> ApplyContext {
     ApplyContext {
@@ -55,7 +59,7 @@ fn delete(model: &mut DocxModel, ids: Vec<Id>) {
 
 fn text(paragraph: usize, start: usize, end: usize) -> DocxEffect {
     DocxEffect::FormatText {
-        paragraph,
+        paragraph: body(paragraph),
         start,
         end,
         change: bold(),
@@ -170,7 +174,7 @@ fn paragraph_changes_apply_to_every_paragraph_the_range_touches() {
         effects,
         (0..3)
             .map(|paragraph| DocxEffect::FormatParagraph {
-                paragraph,
+                paragraph: body(paragraph),
                 change: center.clone()
             })
             .collect::<Vec<_>>()
@@ -183,7 +187,7 @@ fn paragraph_changes_apply_to_every_paragraph_the_range_touches() {
     assert_eq!(
         apply(&mut model, format(mark, mark, style.clone())),
         vec![DocxEffect::FormatParagraph {
-            paragraph: 1,
+            paragraph: body(1),
             change: style
         }]
     );
@@ -390,9 +394,9 @@ fn a_comment_anchors_to_the_visible_range() {
         effect,
         DocxEffect::AddComment {
             comment: id(100),
-            start_paragraph: 0,
+            start_paragraph: body(0),
             start: 1,
-            end_paragraph: 1,
+            end_paragraph: body(1),
             end: 3,
             content: CommentContent {
                 text: "why?".into(),
@@ -705,7 +709,7 @@ proptest! {
         let effects = apply(&mut model, format(atoms[a].1, atoms[b].1, change.clone()));
         let expected: Vec<DocxEffect> = touched
             .into_iter()
-            .map(|paragraph| DocxEffect::FormatParagraph { paragraph, change: change.clone() })
+            .map(|paragraph| DocxEffect::FormatParagraph { paragraph: body(paragraph), change: change.clone() })
             .collect();
         prop_assert_eq!(effects, expected);
     }

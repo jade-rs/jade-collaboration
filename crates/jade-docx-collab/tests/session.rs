@@ -1,12 +1,15 @@
 //! Several replicas edit a real document concurrently through the sequencer;
 //! the server realises the log in jade. Everyone converges, and the file the
-//! server writes is the document everyone sees.
+//! server writes is the document everyone sees — footnotes, endnotes and
+//! text boxes included, with their anchors where the model has them.
 
 mod common;
 
-use common::{assert_comments_agree, generate, jade_comments, open};
+use common::{
+    assert_comments_agree, assert_same_order, assert_stories_agree, generate, jade_comments, open,
+};
 use jade_collab_sync::sim::Simulation;
-use jade_docx_collab::JadeDocx;
+use jade_docx_collab::{DocxModel, JadeDocx};
 use proptest::prelude::*;
 
 #[derive(Clone, Debug)]
@@ -36,6 +39,10 @@ proptest! {
             "jade-core/hello.docx",
             "table-cell-spacing.docx",
             "comment.docx",
+            "footnote-table-textbox-order.docx",
+            "footnote.docx",
+            "textbox.docx",
+            "floating-wrap-sides.docx",
         ]),
         steps in steps(),
     ) {
@@ -67,10 +74,12 @@ proptest! {
         for client in 0..3 {
             prop_assert_eq!(sim.client(client).view(), server.document());
         }
-        prop_assert_eq!(server.materializer().body_paragraph_texts(), server.document().paragraph_texts());
+        assert_stories_agree(server.document(), server.materializer(), "after the session");
         assert_comments_agree(server.document(), server.materializer(), "after the session");
         let reloaded = JadeDocx::load(&server.materializer().export().unwrap()).unwrap();
-        prop_assert_eq!(reloaded.body_paragraph_texts(), server.document().paragraph_texts());
+        assert_same_order(server.document(), &reloaded, "against the reloaded file");
+        let reloaded_model = DocxModel::from_word_document(reloaded.word()).unwrap();
+        assert_same_order(&reloaded_model, &reloaded, "after reloading");
         prop_assert_eq!(jade_comments(&reloaded).len(), server.document().comments().len());
     }
 }
