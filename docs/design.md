@@ -1047,7 +1047,9 @@ with `at` (milliseconds since the Unix epoch) and `event`: `connected`
 token name), `uploaded` and `downloaded`. A token is recorded by its grant's
 name and never by itself, and request URLs are reduced to their path, since
 a socket may carry its token in the query; a test checks that no secret
-reaches the file.
+reaches the file. On SIGHUP (Unix) the server opens the file again at its
+path, so logrotate can move it away and signal; if the new file cannot be
+opened, entries go on to the old one.
 
 ## 9. Status and next steps
 
@@ -1127,8 +1129,8 @@ Not yet:
   insertion deleted instead of removing it (the intent API removes it).
 * docx structure of ragged and nested tables (their text is editable);
   text boxes inside text boxes or notes, and their geometry.
-* Access: reloading tokens on SIGHUP is Unix-only (the file is still polled
-  everywhere); the audit log is a plain file that is never rotated.
+* Access: SIGHUP (reloading tokens, reopening the audit log) is Unix-only;
+  the tokens file is still polled everywhere.
 * Performance: the RGA is indexed (§4), but paragraph positions are still
   recomputed by walking the model on each operation; sequenced formatting, comment,
   note and text box operations are preflighted on a copy of the jade document; marks are

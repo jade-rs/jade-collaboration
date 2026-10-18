@@ -280,3 +280,45 @@ fn serve_with_an_audit_log_and_an_outgoing_limit() {
     assert!(text.contains(r#""event":"connected""#), "{text}");
     assert!(text.contains(r#""event":"joined""#), "{text}");
 }
+
+#[cfg(unix)]
+#[test]
+fn the_audit_log_is_reopened_on_sighup() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../jade-core");
+    std::fs::copy(core.join("hello.docx"), dir.path().join("hello.docx")).unwrap();
+    let log = dir.path().join("audit.jsonl");
+    let rotated = dir.path().join("audit.jsonl.1");
+    // No tokens: SIGHUP still reopens the audit log.
+    let (server, addr) = serve(&[
+        "--audit-log".as_ref(),
+        log.as_os_str(),
+        dir.path().join("hello.docx").as_os_str(),
+    ]);
+    let docx = format!("ws://{addr}/documents/hello.docx/ws");
+    run(&["show", &docx]);
+    std::fs::rename(&log, &rotated).unwrap();
+    let hup = Command::new("kill")
+        .args(["-HUP", &server.0.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(hup.success());
+    // The signal is handled asynchronously: connect until the new file
+    // has an entry.
+    let mut reopened = false;
+    for _ in 0..100 {
+        run(&["show", &docx]);
+        if std::fs::read_to_string(&log).is_ok_and(|text| text.contains(r#""event":"connected""#)) {
+            reopened = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        reopened,
+        "nothing was written at the log's path after SIGHUP"
+    );
+    assert!(std::fs::read_to_string(&rotated)
+        .unwrap()
+        .contains(r#""event":"connected""#));
+}

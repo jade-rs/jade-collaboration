@@ -188,6 +188,15 @@ impl Server {
         Ok(self)
     }
 
+    /// Opens the audit log's file again at its path, after it was rotated
+    /// (moved away). Does nothing without an audit log.
+    pub fn reopen_audit_log(&self) -> Result<(), ServerError> {
+        self.audit.reopen().map_err(|e| ServerError::Audit {
+            path: self.audit.path().map(Into::into).unwrap_or_default(),
+            message: e.to_string(),
+        })
+    }
+
     pub(crate) fn audit(&self) -> &Audit {
         &self.audit
     }

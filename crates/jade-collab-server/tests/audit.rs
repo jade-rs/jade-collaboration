@@ -173,3 +173,45 @@ fn an_audit_log_that_cannot_be_opened_is_an_error() {
         .with_audit_log(dir.path().join("missing").join("audit.jsonl"))
         .is_err());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rotated_audit_log_is_reopened_at_its_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("audit.jsonl");
+    let rotated = dir.path().join("audit.jsonl.1");
+    let server = Server::new()
+        .with_tokens(Tokens::from_json(TOKENS).unwrap())
+        .with_audit_log(&log)
+        .unwrap();
+    let upload = |name: &str| {
+        Request::builder()
+            .method(Method::PUT)
+            .uri(format!("/documents/{name}"))
+            .header(header::AUTHORIZATION, "Bearer ada-secret")
+            .body(Body::from(fixture("hello.docx")))
+            .unwrap()
+    };
+    let put = server.router().oneshot(upload("first.docx")).await.unwrap();
+    assert_eq!(put.status(), StatusCode::CREATED);
+    // logrotate moves the file away, then tells the server.
+    std::fs::rename(&log, &rotated).unwrap();
+    server.reopen_audit_log().unwrap();
+    let put = server
+        .router()
+        .oneshot(upload("second.docx"))
+        .await
+        .unwrap();
+    assert_eq!(put.status(), StatusCode::CREATED);
+
+    let old = entries(&rotated);
+    assert_eq!(event(&old, "uploaded").len(), 1);
+    assert_eq!(event(&old, "uploaded")[0]["document"], "first.docx");
+    let new = entries(&log);
+    assert_eq!(event(&new, "uploaded").len(), 1, "{new:#?}");
+    assert_eq!(event(&new, "uploaded")[0]["document"], "second.docx");
+}
+
+#[test]
+fn reopening_without_an_audit_log_does_nothing() {
+    Server::new().reopen_audit_log().unwrap();
+}
