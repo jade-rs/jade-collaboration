@@ -7,7 +7,7 @@ use jade_collab_core::grid::GridOp;
 use jade_collab_core::id::{Id, ReplicaId};
 use jade_collab_sync::sim::Simulation;
 use jade_collab_sync::{ApplyContext, Document, Lane, Materializer};
-use jade_xlsx_collab::{FormatChange, JadeXlsx, XlsxModel, XlsxOp};
+use jade_xlsx_collab::{BorderLine, BorderStyle, FormatChange, JadeXlsx, XlsxModel, XlsxOp};
 use proptest::prelude::*;
 
 /// Commits `op` at the next log position, materializes it and checks the
@@ -88,6 +88,13 @@ fn arb_change() -> impl Strategy<Value = FormatChange> {
             "[Red]0.0;-0.0",
             "yyyy/mm/dd",
         ]),
+        (
+            of((
+                select(&BorderStyle::ALL[..]),
+                text(&["FF0000", "#00b050", "blue", "12345", "80FF0000", ""]),
+            )),
+            of(any::<bool>()),
+        ),
     )
         .prop_map(
             |(
@@ -97,6 +104,7 @@ fn arb_change() -> impl Strategy<Value = FormatChange> {
                 font_name,
                 fill_color,
                 number_format,
+                (border, diagonal_up),
             )| {
                 FormatChange {
                     bold,
@@ -107,6 +115,8 @@ fn arb_change() -> impl Strategy<Value = FormatChange> {
                     font_name,
                     fill_color,
                     number_format,
+                    border_top: border.map(|(style, color)| BorderLine { style, color }),
+                    diagonal_up,
                     ..FormatChange::default()
                 }
             },

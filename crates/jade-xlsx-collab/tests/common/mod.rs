@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use jade_collab_core::grid::{GridOp, Merge};
 use jade_collab_core::id::Id;
 use jade_xlsx_collab::{
-    column_label, CellInput, FormatChange, HorizontalAlignment, JadeXlsx, LoadOptions,
-    VerticalAlignment, XlsxModel, XlsxOp,
+    column_label, BorderLine, BorderStyle, CellInput, FormatChange, HorizontalAlignment, JadeXlsx,
+    LoadOptions, RangeBorders, VerticalAlignment, XlsxModel, XlsxOp,
 };
 use jade_xlsx_headless_api::CellKind;
 
@@ -42,6 +42,13 @@ pub fn masked(theirs: &FormatChange, ours: &FormatChange) -> FormatChange {
         horizontal,
         vertical,
         wrap_text,
+        border_left,
+        border_right,
+        border_top,
+        border_bottom,
+        border_diagonal,
+        diagonal_up,
+        diagonal_down,
     } = ours;
     fn keep<T: Clone>(named: bool, value: &Option<T>) -> Option<T> {
         value.clone().filter(|_| named)
@@ -59,6 +66,13 @@ pub fn masked(theirs: &FormatChange, ours: &FormatChange) -> FormatChange {
         horizontal: keep(horizontal.is_some(), &theirs.horizontal),
         vertical: keep(vertical.is_some(), &theirs.vertical),
         wrap_text: keep(wrap_text.is_some(), &theirs.wrap_text),
+        border_left: keep(border_left.is_some(), &theirs.border_left),
+        border_right: keep(border_right.is_some(), &theirs.border_right),
+        border_top: keep(border_top.is_some(), &theirs.border_top),
+        border_bottom: keep(border_bottom.is_some(), &theirs.border_bottom),
+        border_diagonal: keep(border_diagonal.is_some(), &theirs.border_diagonal),
+        diagonal_up: keep(diagonal_up.is_some(), &theirs.diagonal_up),
+        diagonal_down: keep(diagonal_down.is_some(), &theirs.diagonal_down),
     }
 }
 
@@ -77,6 +91,13 @@ pub fn overlay(under: &FormatChange, over: &FormatChange) -> FormatChange {
         horizontal,
         vertical,
         wrap_text,
+        border_left,
+        border_right,
+        border_top,
+        border_bottom,
+        border_diagonal,
+        diagonal_up,
+        diagonal_down,
     } = over.clone();
     FormatChange {
         bold: bold.or(under.bold),
@@ -91,6 +112,13 @@ pub fn overlay(under: &FormatChange, over: &FormatChange) -> FormatChange {
         horizontal: horizontal.or(under.horizontal),
         vertical: vertical.or(under.vertical),
         wrap_text: wrap_text.or(under.wrap_text),
+        border_left: border_left.or(under.border_left.clone()),
+        border_right: border_right.or(under.border_right.clone()),
+        border_top: border_top.or(under.border_top.clone()),
+        border_bottom: border_bottom.or(under.border_bottom.clone()),
+        border_diagonal: border_diagonal.or(under.border_diagonal.clone()),
+        diagonal_up: diagonal_up.or(under.diagonal_up),
+        diagonal_down: diagonal_down.or(under.diagonal_down),
     }
 }
 
@@ -153,7 +181,29 @@ pub fn assert_agree(model: &XlsxModel, jade: &JadeXlsx, context: &str) {
 }
 
 /// The number of format attributes [`set_attribute`] knows.
-pub const ATTRIBUTES: u64 = 12;
+pub const ATTRIBUTES: u64 = 19;
+
+/// A border line picked by `value`, spelled the way jade reads it back.
+pub fn border_line(value: u64) -> BorderLine {
+    let styles = [
+        BorderStyle::None,
+        BorderStyle::Thin,
+        BorderStyle::Medium,
+        BorderStyle::Thick,
+        BorderStyle::Dashed,
+        BorderStyle::Double,
+        BorderStyle::Hair,
+        BorderStyle::MediumDashDotDot,
+    ];
+    let style = styles[(value % styles.len() as u64) as usize];
+    let color = [None, Some("FF0000"), Some("0070C0")][(value / 8 % 3) as usize];
+    BorderLine {
+        style,
+        color: color
+            .filter(|_| style != BorderStyle::None)
+            .map(str::to_string),
+    }
+}
 
 /// Sets one attribute (`attribute % ATTRIBUTES`) of `change` to a value
 /// picked by `value`, spelled the way jade reads it back.
@@ -189,7 +239,14 @@ pub fn set_attribute(change: &mut FormatChange, attribute: u64, value: u64) {
                 ][(value % 3) as usize],
             )
         }
-        _ => change.wrap_text = Some(flag),
+        11 => change.wrap_text = Some(flag),
+        12 => change.border_left = Some(border_line(value)),
+        13 => change.border_right = Some(border_line(value)),
+        14 => change.border_top = Some(border_line(value)),
+        15 => change.border_bottom = Some(border_line(value)),
+        16 => change.border_diagonal = Some(border_line(value)),
+        17 => change.diagonal_up = Some(flag),
+        _ => change.diagonal_down = Some(flag),
     }
 }
 
@@ -206,6 +263,20 @@ pub fn format_change(bits: u64) -> FormatChange {
             .flatten()
         {
             if !color.is_empty() {
+                *color = format!("#{}", color.to_ascii_lowercase());
+            }
+        }
+        for line in [
+            &mut change.border_left,
+            &mut change.border_right,
+            &mut change.border_top,
+            &mut change.border_bottom,
+            &mut change.border_diagonal,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(color) = &mut line.color {
                 *color = format!("#{}", color.to_ascii_lowercase());
             }
         }
@@ -232,7 +303,7 @@ pub fn generate(view: &XlsxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
             1 + pick(sheet.rows.len(), salt + 6)
         )
     };
-    match choice % 21 {
+    match choice % 22 {
         0..=5 => {
             let value = match (choice >> 28) % 6 {
                 0 => CellInput::Number(((choice >> 34) % 1000) as f64 / 4.0),
@@ -252,7 +323,7 @@ pub fn generate(view: &XlsxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
         }
         6 | 7 => Some(XlsxOp::Structure {
             sheet: sheet.id,
-            op: if choice % 21 == 6 {
+            op: if choice % 22 == 6 {
                 GridOp::InsertRow {
                     id: ids(1),
                     after: (pick(4, 30) != 0).then_some(row),
@@ -352,6 +423,30 @@ pub fn generate(view: &XlsxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
             },
         }),
         20 => Some(XlsxOp::DeleteSheet { sheet: sheet.id }),
+        21 => {
+            // Excel's border dialog over up to 3 × 3 cells.
+            let top = pick(sheet.rows.len(), 12);
+            let left = pick(sheet.columns.len(), 20);
+            let bottom = (top + pick(3, 26)).min(sheet.rows.len() - 1);
+            let right = (left + pick(3, 28)).min(sheet.columns.len() - 1);
+            let line =
+                |salt: u32| (choice >> salt & 1 == 1).then(|| border_line(choice >> (salt + 1)));
+            Some(XlsxOp::SetBorders {
+                sheet: sheet.id,
+                rows: sheet.rows[top..=bottom].to_vec(),
+                columns: sheet.columns[left..=right].to_vec(),
+                stamp: ids(1),
+                borders: RangeBorders {
+                    outline: line(30),
+                    inside: line(36),
+                    top: line(42),
+                    inside_vertical: line(48),
+                    diagonal: line(54),
+                    diagonal_up: (choice >> 60 & 1 == 1).then_some(choice >> 61 & 1 == 1),
+                    ..RangeBorders::default()
+                },
+            })
+        }
         _ => unreachable!(),
     }
 }

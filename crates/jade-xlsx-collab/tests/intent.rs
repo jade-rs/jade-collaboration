@@ -1,7 +1,7 @@
 use jade_collab_core::id::{Id, ReplicaId};
 use jade_collab_sync::{ApplyContext, Document};
 use jade_xlsx_collab::intent::{resolve, XlsxIntent};
-use jade_xlsx_collab::{CellInput, FormatChange, XlsxModel, XlsxOp};
+use jade_xlsx_collab::{BorderLine, BorderStyle, CellInput, FormatChange, XlsxModel, XlsxOp};
 
 fn apply(model: &mut XlsxModel, intent: &str) -> Result<(), String> {
     let intent: XlsxIntent = serde_json::from_str(intent).map_err(|e| e.to_string())?;
@@ -152,6 +152,75 @@ fn format_a_range_or_a_cell_by_a1_reference() {
     assert_eq!(format_at(&model, "C4").italic, Some(true));
     assert_eq!(format_at(&model, "D4").italic, Some(true));
     assert_eq!(format_at(&model, "A1").number_format, Some("0.00".into()));
+}
+
+#[test]
+fn draw_borders_by_a1_range() {
+    let mut model = XlsxModel::blank(&[("S", 4, 4)]);
+    apply(
+        &mut model,
+        r##"{"type":"set_borders","sheet":"S","range":"B2:C3","borders":{"outline":{"style":"medium","color":"#c00000"},"inside":{"style":"thin"}}}"##,
+    )
+    .unwrap();
+    let medium = Some(BorderLine {
+        style: BorderStyle::Medium,
+        color: Some("C00000".into()),
+    });
+    let thin = Some(BorderLine {
+        style: BorderStyle::Thin,
+        color: None,
+    });
+    assert_eq!(
+        format_at(&model, "B2"),
+        FormatChange {
+            border_top: medium.clone(),
+            border_left: medium.clone(),
+            border_bottom: thin.clone(),
+            border_right: thin.clone(),
+            ..FormatChange::default()
+        }
+    );
+    assert_eq!(
+        format_at(&model, "C3"),
+        FormatChange {
+            border_top: thin.clone(),
+            border_left: thin,
+            border_bottom: medium.clone(),
+            border_right: medium,
+            ..FormatChange::default()
+        }
+    );
+    assert_eq!(format_at(&model, "D4"), FormatChange::default());
+
+    // Every cell of a set_format takes the edges it names.
+    apply(
+        &mut model,
+        r#"{"type":"set_format","sheet":"S","range":"A4:B4","change":{"border_bottom":{"style":"double"},"diagonal_up":true}}"#,
+    )
+    .unwrap();
+    for reference in ["A4", "B4"] {
+        let format = format_at(&model, reference);
+        assert_eq!(
+            format.border_bottom.map(|l| l.style),
+            Some(BorderStyle::Double)
+        );
+        assert_eq!(format.diagonal_up, Some(true));
+    }
+
+    // A style OOXML does not have, and an unknown key, are not understood.
+    for intent in [
+        r#"{"type":"set_borders","sheet":"S","range":"A1","borders":{"outline":{"style":"wavy"}}}"#,
+        r#"{"type":"set_borders","sheet":"S","range":"A1","borders":{"around":{"style":"thin"}}}"#,
+    ] {
+        assert!(apply(&mut model, intent).is_err(), "{intent}");
+    }
+    // Nothing named, or outside the sheet.
+    for intent in [
+        r#"{"type":"set_borders","sheet":"S","range":"A1","borders":{}}"#,
+        r#"{"type":"set_borders","sheet":"S","range":"A1:E5","borders":{"outline":{"style":"thin"}}}"#,
+    ] {
+        assert!(apply(&mut model, intent).is_err(), "{intent}");
+    }
 }
 
 /// A range names the rows and columns the author saw, so it means the same
