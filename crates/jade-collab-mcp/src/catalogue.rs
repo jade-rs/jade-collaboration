@@ -160,9 +160,19 @@ fn edits() -> Value {
     let paragraph = || integer("Zero-based paragraph index in your current view.");
     let offset = || integer("UTF-8 byte offset inside the paragraph, on a character boundary.");
     let sheet = || string("The sheet's name.");
+    let slide = || integer("The slide's number, from 1.");
+    let target = || {
+        json!({
+            "description": "`\"notes\"` for the speaker notes, or `{\"shape\": N}` for shape N's text.",
+            "anyOf": [
+                { "type": "string", "const": "notes", "description": "The speaker notes." },
+                object("A shape's text.", json!({ "shape": integer("The shape's number.") }), &["shape"]),
+            ],
+        })
+    };
     json!({
         "type": "array",
-        "description": "Edits applied in order, each resolved against the view the previous ones left. Use the docx kinds for a .docx session and the xlsx kinds for a .xlsx one; anything else is reported as invalid.",
+        "description": "Edits applied in order, each resolved against the view the previous ones left. Use the kinds of your session's format (each description starts with docx:, xlsx: or pptx:); anything else is reported as invalid.",
         "items": {
             "description": "One edit.",
             "anyOf": [
@@ -287,6 +297,71 @@ fn edits() -> Value {
                     "sheet": sheet(),
                     "to": integer("Tab position, 0 being the first."),
                 }), &["sheet", "to"]),
+                edit("insert_text", "pptx: insert `text` in a shape or the notes; a newline splits paragraphs.", json!({
+                    "slide": slide(),
+                    "target": target(),
+                    "paragraph": paragraph(),
+                    "offset": offset(),
+                    "text": string("Text to insert."),
+                }), &["slide", "target", "paragraph", "offset", "text"]),
+                edit("replace_range", "pptx: replace a range of a shape's text or the notes.", json!({
+                    "slide": slide(),
+                    "target": target(),
+                    "start_paragraph": integer("Paragraph where the range starts."),
+                    "start_offset": integer("Byte offset where the range starts."),
+                    "end_paragraph": integer("Paragraph where the range ends."),
+                    "end_offset": integer("Byte offset where the range ends (exclusive)."),
+                    "text": string("Replacement text; empty deletes the range."),
+                }), &["slide", "target", "start_paragraph", "start_offset", "end_paragraph", "end_offset", "text"]),
+                edit("delete_text", "pptx: delete `count` characters from a caret.", json!({
+                    "slide": slide(),
+                    "target": target(),
+                    "paragraph": paragraph(),
+                    "offset": offset(),
+                    "direction": {
+                        "type": "string",
+                        "enum": ["forward", "backward"],
+                        "description": "Delete after the caret (`forward`, the default) or before it.",
+                    },
+                    "count": integer("Characters to delete; default 1."),
+                }), &["slide", "target", "paragraph", "offset"]),
+                edit("insert_paragraph_break", "pptx: split a paragraph of a shape or the notes.", json!({
+                    "slide": slide(),
+                    "target": target(),
+                    "paragraph": paragraph(),
+                    "offset": offset(),
+                    "count": integer("Breaks to insert; default 1."),
+                }), &["slide", "target", "paragraph", "offset"]),
+                edit("set_geometry", "pptx: move, resize or rotate a shape; each attribute is last-writer-wins.", json!({
+                    "slide": slide(),
+                    "shape": integer("The shape's number (read_document lists them)."),
+                    "x": integer("Left, in EMU."),
+                    "y": integer("Top, in EMU."),
+                    "width": integer("Width, in EMU."),
+                    "height": integer("Height, in EMU."),
+                    "rotation": integer("Rotation, in 1/60000 degree."),
+                }), &["slide", "shape"]),
+                edit("insert_slide", "pptx: insert a slide that becomes slide `at`.", json!({
+                    "at": integer("The new slide's number (from 1)."),
+                }), &["at"]),
+                edit("delete_slide", "pptx: delete a slide.", json!({ "slide": slide() }), &["slide"]),
+                edit("move_slide", "pptx: move a slide so it becomes slide `to`.", json!({
+                    "slide": slide(),
+                    "to": integer("Its new number (from 1)."),
+                }), &["slide", "to"]),
+                edit("duplicate_slide", "pptx: copy a slide right after it.", json!({ "slide": slide() }), &["slide"]),
+                edit("insert_text_box", "pptx: add a text box.", json!({
+                    "slide": slide(),
+                    "x": integer("Left, in EMU."),
+                    "y": integer("Top, in EMU."),
+                    "width": integer("Width, in EMU."),
+                    "height": integer("Height, in EMU."),
+                    "text": string("Its text."),
+                }), &["slide", "x", "y", "width", "height"]),
+                edit("delete_shape", "pptx: delete a shape.", json!({
+                    "slide": slide(),
+                    "shape": integer("The shape's number."),
+                }), &["slide", "shape"]),
             ],
         },
     })
@@ -346,7 +421,7 @@ fn tools() -> Vec<Tool> {
                     "description": "One entry per document, by name.",
                     "items": object("A hosted document.", json!({
                         "name": string("The document's name."),
-                        "format": string("`docx` or `xlsx`."),
+                        "format": string("`docx`, `xlsx` or `pptx`."),
                         "url": string("The ws:// URL join_document takes."),
                     }), &["name", "format", "url"]),
                 },
@@ -366,7 +441,7 @@ fn tools() -> Vec<Tool> {
             output: object("The new session.", json!({
                 "session_id": session_id(),
                 "document": string("The document's name."),
-                "format": string("`docx` or `xlsx`."),
+                "format": string("`docx`, `xlsx` or `pptx`."),
                 "replica": integer("The replica id the server gave this session."),
                 "seq": seq(),
             }), &["session_id", "document", "format", "replica", "seq"]),
@@ -377,10 +452,10 @@ fn tools() -> Vec<Tool> {
         Tool {
             name: "read_document",
             title: "Read a document",
-            description: "Your current view, a page at a time. docx: paragraphs (index, text, which story — body or a table cell) and the top-level tables; xlsx: every sheet's size and its non-blank cells in A1 form, paged over all sheets in order. Your own unanswered edits are included.",
+            description: "Your current view, a page at a time. docx: paragraphs (index, text, which story — body or a table cell) and the top-level tables; xlsx: every sheet's size and its non-blank cells in A1 form, paged over all sheets in order; pptx: slides (numbered from 1) with their shapes' numbers, text and geometry and the speaker notes. Your own unanswered edits are included.",
             input: object("Arguments.", json!({
                 "session_id": session_id(),
-                "start": integer("First paragraph (docx) or cell (xlsx) to list; default 0."),
+                "start": integer("First paragraph (docx), cell (xlsx) or slide (pptx, zero-based) to list; default 0."),
                 "limit": json!({
                     "type": "integer",
                     "minimum": 1,
@@ -388,7 +463,7 @@ fn tools() -> Vec<Tool> {
                 }),
             }), &["session_id"]),
             output: object("The view.", json!({
-                "format": string("`docx` or `xlsx`."),
+                "format": string("`docx`, `xlsx` or `pptx`."),
                 "seq": seq(),
                 "pending": pending(),
                 "start": integer("The `start` this page begins at."),
@@ -429,6 +504,20 @@ fn tools() -> Vec<Tool> {
                             "description": "A1 reference → value (`{kind, value}`, as set_cell takes it).",
                         },
                     }), &["name", "rows", "columns", "cells"]),
+                },
+                "slide_count": integer("pptx: how many slides there are."),
+                "slides": {
+                    "type": "array",
+                    "description": "pptx: the slides of this page.",
+                    "items": object("A slide.", json!({
+                        "slide": integer("Its number, as edits address it (from 1)."),
+                        "shapes": {
+                            "type": "array",
+                            "description": "Its shapes: `shape` (the number edits take), `kind`, `text` (null when jade cannot edit it), `editable`, `deletable`, `geometry` (EMU; rotation in 1/60000 degree).",
+                        },
+                        "notes": string("Speaker notes, paragraphs joined with newlines."),
+                        "notes_editable": json!({ "type": "boolean", "description": "Whether the notes can be edited." }),
+                    }), &["slide", "shapes", "notes", "notes_editable"]),
                 },
             }), &["format", "seq", "pending", "start", "next"]),
             read_only: true,

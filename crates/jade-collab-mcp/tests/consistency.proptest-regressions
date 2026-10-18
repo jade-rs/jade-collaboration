@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 164a4e4e1d40f1d13b63ed872ecf1e6aebac2399519f1e28759b5799dc4fa42a # shrinks to steps = [Bad(Object {"arguments": Object {"url": String("ws://127.0.0.1:1/documents/x.pptx/ws")}, "name": String("join_document")})]

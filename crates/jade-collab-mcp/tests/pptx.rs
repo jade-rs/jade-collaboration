@@ -48,7 +48,10 @@ async fn an_agent_joins_reads_and_edits_a_deck() {
 
     let read = agent.read_all(&session).await;
     assert_eq!(read["slides"].as_array().unwrap().len(), slides + 1);
-    assert!(read["slides"][0]["notes"].as_str().unwrap().starts_with("agent note"));
+    assert!(read["slides"][0]["notes"]
+        .as_str()
+        .unwrap()
+        .starts_with("agent note"));
 
     let direct: Client<PptxModel> = Client::connect(&url, None).await.unwrap();
     let mut expected = read_pptx(&direct.view(), 0, usize::MAX);

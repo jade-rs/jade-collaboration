@@ -220,9 +220,15 @@ async fn advertised_edits_match_the_intent_apis() {
         // format's intent, minimal and with every optional property.
         let format = description.split(':').next().unwrap_or_default();
         let parses = |value: &Value| match format {
-            "docx" => serde_json::from_value::<IntentOp>(value.clone()).map(drop).map_err(|e| e.to_string()),
-            "xlsx" => serde_json::from_value::<XlsxIntent>(value.clone()).map(drop).map_err(|e| e.to_string()),
-            "pptx" => serde_json::from_value::<PptxIntent>(value.clone()).map(drop).map_err(|e| e.to_string()),
+            "docx" => serde_json::from_value::<IntentOp>(value.clone())
+                .map(drop)
+                .map_err(|e| e.to_string()),
+            "xlsx" => serde_json::from_value::<XlsxIntent>(value.clone())
+                .map(drop)
+                .map_err(|e| e.to_string()),
+            "pptx" => serde_json::from_value::<PptxIntent>(value.clone())
+                .map(drop)
+                .map_err(|e| e.to_string()),
             other => Err(format!("{name}: no format in {other:?}")),
         };
         parses(&payload).unwrap_or_else(|e| panic!("{name}: {payload}: {e}"));

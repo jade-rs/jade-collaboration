@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use jade_collab_core::id::Id;
 use jade_docx_collab::{DocxModel, StoryId};
+use jade_pptx_collab::PptxModel;
 use jade_xlsx_collab::XlsxModel;
 use serde_json::{json, Value};
 
@@ -118,5 +119,39 @@ pub fn read_xlsx(model: &XlsxModel, start: usize, limit: usize) -> Value {
         "start": start,
         "next": next,
         "sheets": sheets,
+    })
+}
+
+/// What `read_document` reports for a pptx view, without `seq`/`pending`:
+/// slides `start..start + limit` (numbered from 1, as edits address them),
+/// each with its shapes — the shape numbers edits take, their text and
+/// geometry — and its speaker notes.
+pub fn read_pptx(model: &PptxModel, start: usize, limit: usize) -> Value {
+    let slides = model.slides();
+    let (range, next) = page(slides.len(), start, limit);
+    json!({
+        "format": "pptx",
+        "slide_count": slides.len(),
+        "start": start,
+        "next": next,
+        "slides": slides[range.clone()]
+            .iter()
+            .zip(range)
+            .map(|(slide, index)| json!({
+                "slide": index + 1,
+                "shapes": slide.shapes.iter()
+                    .map(|shape| json!({
+                        "shape": shape.number,
+                        "kind": shape.kind,
+                        "text": shape.text,
+                        "editable": shape.editable,
+                        "deletable": shape.deletable,
+                        "geometry": shape.geometry,
+                    }))
+                    .collect::<Vec<_>>(),
+                "notes": slide.notes,
+                "notes_editable": slide.notes_editable,
+            }))
+            .collect::<Vec<_>>(),
     })
 }

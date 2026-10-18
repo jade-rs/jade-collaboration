@@ -10,7 +10,8 @@ use jade_pptx_collab::{JadePptx, PptxModel};
 
 fn deck() -> Vec<u8> {
     std::fs::read(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../jade-core/public/fixtures/sample-deck.pptx"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../jade-core/public/fixtures/sample-deck.pptx"),
     )
     .unwrap()
 }
@@ -51,7 +52,13 @@ fn texts(model: &PptxModel) -> Vec<Vec<Option<String>>> {
     model
         .slides()
         .iter()
-        .map(|slide| slide.shapes.iter().map(|shape| shape.text.clone()).collect())
+        .map(|slide| {
+            slide
+                .shapes
+                .iter()
+                .map(|shape| shape.text.clone())
+                .collect()
+        })
         .collect()
 }
 
@@ -92,7 +99,10 @@ async fn two_people_edit_a_deck_and_the_file_matches() {
 
     let view = a.view();
     assert_eq!(view, b.view());
-    assert!(texts(&view)[slide - 1].iter().flatten().any(|t| t.starts_with("A: ")));
+    assert!(texts(&view)[slide - 1]
+        .iter()
+        .flatten()
+        .any(|t| t.starts_with("A: ")));
     assert!(server.faults("deck.pptx").await.unwrap().is_empty());
 
     let exported = JadePptx::open(&server.export("deck.pptx").await.unwrap()).unwrap();

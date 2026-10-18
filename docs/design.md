@@ -435,7 +435,9 @@ values, formulas (with rebasing), row/column structure, notes, cell
 formatting (per-attribute LWW, A1 ranges), merged cells and sheet
 management (add, rename, delete, move); pptx slide
 insert/delete/move/duplicate, text in shapes, group children and speaker
-notes, shape geometry, text boxes and shape deletion;
+notes, shape geometry, text boxes and shape deletion (hosted by the server,
+the CLI and the MCP server like the other formats; a restored deck's
+materializer re-learns which file id jade gave each session-made text box);
 index/A1/slide-number-addressed intent APIs for people and agents; the
 `jade-collab` CLI; resume after a disconnect; an MCP server
 (`jade-collab-mcp`) through which agents join, read, edit and watch

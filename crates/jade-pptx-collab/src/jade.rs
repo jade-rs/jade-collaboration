@@ -54,6 +54,40 @@ impl JadePptx {
             .map_err(|e| e.to_string())
     }
 
+    /// The materializer for `bytes`, a file this crate exported, described by
+    /// `model` (restored as it was, not derived from the file). jade may have
+    /// given a text box made in the session another file id than the number
+    /// the model knows it by; the two list each slide's shapes in the same
+    /// order, so the ids are matched up by position.
+    pub fn restore(bytes: &[u8], model: &PptxModel) -> Result<Self, String> {
+        let mut jade = Self::open(bytes)?;
+        let slides = model.slides();
+        if slides.len() != jade.slide_count() {
+            return Err(format!(
+                "the file has {} slides, the model {}",
+                jade.slide_count(),
+                slides.len()
+            ));
+        }
+        for (index, slide) in slides.iter().enumerate() {
+            let ids = jade.shape_ids(index);
+            if ids.len() != slide.shapes.len() {
+                return Err(format!(
+                    "slide {} has {} shapes in the file but {} in the model",
+                    index + 1,
+                    ids.len(),
+                    slide.shapes.len()
+                ));
+            }
+            for (shape, id) in slide.shapes.iter().zip(ids) {
+                if shape.number != id {
+                    jade.ids.insert((slide.id, shape.id), id);
+                }
+            }
+        }
+        Ok(jade)
+    }
+
     pub fn session(&self) -> &EditSession {
         &self.session
     }

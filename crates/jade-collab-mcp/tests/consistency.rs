@@ -128,7 +128,7 @@ fn step() -> impl Strategy<Value = Step> {
             json!({ "name": "read_document", "arguments": { "session_id": "nope" } }),
             json!({ "name": "apply_edits", "arguments": { "session_id": "nope", "edits": [] } }),
             json!({ "name": "apply_edits", "arguments": { "edits": 3 } }),
-            json!({ "name": "join_document", "arguments": { "url": "ws://127.0.0.1:1/documents/x.pptx/ws" } }),
+            json!({ "name": "join_document", "arguments": { "url": "ws://127.0.0.1:1/documents/x.txt/ws" } }),
             json!({ "name": "wait_for_changes", "arguments": { "session_id": "nope", "after_seq": "0" } }),
             json!({ "name": "no_such_tool", "arguments": {} }),
             json!({ "arguments": {} }),

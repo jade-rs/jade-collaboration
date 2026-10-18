@@ -1,6 +1,6 @@
 # jade-collaboration
 
-Real-time co-editing of `.docx` and `.xlsx` by any mix of people and AI
+Real-time co-editing of `.docx`, `.xlsx` and `.pptx` by any mix of people and AI
 agents, built on the [jade](https://github.com/jade-rs/jade-core) engine.
 
 Plain CRDTs converge, but not always to a valid document: two merges that
@@ -29,6 +29,7 @@ crates/
   jade-collab-sync     lanes, wire protocol, Sequencer (server core), Replica (client core), network simulator
   jade-docx-collab     docx model, jade materializer, paragraph/offset intent API
   jade-xlsx-collab     xlsx model, jade materializer, A1 intent API
+  jade-pptx-collab     pptx model, jade materializer, slide/shape intent API
   jade-collab-server   WebSocket server, client, and the `jade-collab` CLI
   jade-collab-mcp      MCP server through which AI agents join as replicas
 lean/                  Lean 4 proofs of the specifications
@@ -51,7 +52,7 @@ Use `git submodule update --init` if you cloned without
 
 ```sh
 cargo install --path crates/jade-collab-server
-jade-collab serve --save contract.docx budget.xlsx
+jade-collab serve --save contract.docx budget.xlsx deck.pptx
 ```
 
 Then, from any number of shells (or agents):
@@ -65,6 +66,8 @@ jade-collab apply ws://127.0.0.1:8787/documents/contract.docx/ws \
     {"type":"add_comment","start_paragraph":0,"end_paragraph":0,"text":"Remove before signing"}]'
 jade-collab apply ws://127.0.0.1:8787/documents/budget.xlsx/ws \
   '{"type":"set_cell","sheet":"Sheet1","reference":"B2","value":{"kind":"number","value":42}}'
+jade-collab apply ws://127.0.0.1:8787/documents/deck.pptx/ws \
+  '{"type":"insert_text","slide":1,"target":"notes","paragraph":0,"offset":0,"text":"Speaker note"}'
 ```
 
 `GET /documents/{name}` downloads the current file, `PUT /documents/{name}`

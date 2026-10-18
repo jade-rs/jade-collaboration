@@ -9,6 +9,8 @@ use jade_collab_server::{Client, Format, Server, StorageOptions, Tokens};
 use jade_collab_sync::ReplicaEvent;
 use jade_docx_collab::intent::{resolve, IntentOp};
 use jade_docx_collab::DocxModel;
+use jade_pptx_collab::intent::{resolve as resolve_slide, PptxIntent};
+use jade_pptx_collab::PptxModel;
 use jade_xlsx_collab::intent::{resolve as resolve_cell, XlsxIntent};
 use jade_xlsx_collab::XlsxModel;
 use serde_json::{json, Value};
@@ -64,7 +66,8 @@ enum Cli {
 }
 
 fn format_of(url: &str) -> Result<Format, String> {
-    Format::of_url(url).ok_or_else(|| format!("{url} does not name a .docx or .xlsx document"))
+    Format::of_url(url)
+        .ok_or_else(|| format!("{url} does not name a .docx, .xlsx or .pptx document"))
 }
 
 fn edits<T: serde::de::DeserializeOwned>(text: &str) -> Result<Vec<T>, String> {
@@ -123,6 +126,32 @@ fn xlsx_json(model: &XlsxModel) -> Value {
     json!({ "format": "xlsx", "sheets": sheets })
 }
 
+fn pptx_json(model: &PptxModel) -> Value {
+    let slides = model
+        .slides()
+        .iter()
+        .enumerate()
+        .map(|(index, slide)| {
+            json!({
+                "slide": index + 1,
+                "shapes": slide.shapes.iter()
+                    .map(|shape| json!({
+                        "shape": shape.number,
+                        "kind": format!("{:?}", shape.kind),
+                        "text": shape.text,
+                        "editable": shape.editable,
+                        "geometry": shape.geometry.map(|g| json!({
+                            "x": g.x, "y": g.y, "width": g.width, "height": g.height, "rotation": g.rotation,
+                        })),
+                    }))
+                    .collect::<Vec<_>>(),
+                "notes": slide.notes,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({ "format": "pptx", "slides": slides })
+}
+
 fn report<Op: std::fmt::Debug>(events: Vec<ReplicaEvent<Op>>) -> Result<(), String> {
     let rejected: Vec<String> = events
         .into_iter()
@@ -148,6 +177,12 @@ async fn show(url: &str, token: Option<&str>) -> Result<(), String> {
         ),
         Format::Xlsx => xlsx_json(
             &Client::<XlsxModel>::connect(url, token)
+                .await
+                .map_err(|e| e.to_string())?
+                .view(),
+        ),
+        Format::Pptx => pptx_json(
+            &Client::<PptxModel>::connect(url, token)
                 .await
                 .map_err(|e| e.to_string())?
                 .view(),
@@ -195,6 +230,25 @@ async fn apply(url: &str, token: Option<&str>, text: &str) -> Result<(), String>
                 serde_json::to_string_pretty(&xlsx_json(&client.view())).expect("JSON")
             );
         }
+        Format::Pptx => {
+            let client = Client::<PptxModel>::connect(url, token)
+                .await
+                .map_err(|e| e.to_string())?;
+            for edit in edits::<PptxIntent>(text)? {
+                let view = client.view();
+                let ops = resolve_slide(&view, &edit, &mut |n| client.reserve(n))
+                    .map_err(|e| e.to_string())?;
+                for op in ops {
+                    client.submit(op).map_err(|e| e.to_string())?;
+                }
+            }
+            client.settle().await.map_err(|e| e.to_string())?;
+            report(client.take_events())?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&pptx_json(&client.view())).expect("JSON")
+            );
+        }
     }
     Ok(())
 }
@@ -217,6 +271,11 @@ async fn serve(options: ServeOptions) -> Result<(), String> {
         tokens,
         files,
     } = options;
+    // Bound first, so `--addr host:0` works and the URLs printed are real.
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .map_err(|e| e.to_string())?;
+    let addr = listener.local_addr().map_err(|e| e.to_string())?;
     let server = match data {
         Some(dir) => {
             let mut storage = StorageOptions::default();
@@ -250,9 +309,10 @@ async fn serve(options: ServeOptions) -> Result<(), String> {
         }
         named.push((name, path));
     }
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .map_err(|e| e.to_string())?;
+    // Scripts wait for this line before connecting.
+    println!("listening on {addr}");
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
     tokio::select! {
         result = server.clone().serve(listener) => result.map_err(|e| e.to_string())?,
         _ = tokio::signal::ctrl_c() => {}

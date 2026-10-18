@@ -9,6 +9,7 @@ use jade_collab_core::id::ReplicaId;
 use jade_collab_sync::protocol::{Committed, Submission};
 use jade_collab_sync::{Document, Materializer, Record, Sequencer, SubmitOutcome, SyncError};
 use jade_docx_collab::{DocxModel, JadeDocx};
+use jade_pptx_collab::{JadePptx, PptxModel};
 use jade_xlsx_collab::{JadeXlsx, LoadOptions, XlsxModel};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -69,7 +70,7 @@ trait Hosted: 'static {
 
     /// The real document only, for a model that is restored rather than
     /// derived from the file.
-    fn load(bytes: &[u8]) -> Result<Self::Mat, String>;
+    fn load(bytes: &[u8], model: &Self::Doc) -> Result<Self::Mat, String>;
     /// The real document and the model derived from it.
     fn open(bytes: &[u8]) -> Result<(Self::Doc, Self::Mat), String>;
     fn export(materializer: &Self::Mat) -> Result<Vec<u8>, String>;
@@ -83,7 +84,7 @@ impl Hosted for Docx {
     type Mat = JadeDocx;
     const FORMAT: Format = Format::Docx;
 
-    fn load(bytes: &[u8]) -> Result<JadeDocx, String> {
+    fn load(bytes: &[u8], _: &DocxModel) -> Result<JadeDocx, String> {
         JadeDocx::load(bytes)
     }
 
@@ -106,7 +107,7 @@ impl Hosted for Xlsx {
     type Mat = JadeXlsx;
     const FORMAT: Format = Format::Xlsx;
 
-    fn load(bytes: &[u8]) -> Result<JadeXlsx, String> {
+    fn load(bytes: &[u8], _: &XlsxModel) -> Result<JadeXlsx, String> {
         JadeXlsx::open(bytes)
     }
 
@@ -118,6 +119,31 @@ impl Hosted for Xlsx {
     }
 
     fn export(materializer: &JadeXlsx) -> Result<Vec<u8>, String> {
+        materializer.export()
+    }
+}
+
+struct Pptx;
+
+impl Hosted for Pptx {
+    type Doc = PptxModel;
+    type Op = jade_pptx_collab::PptxOp;
+    type Mat = JadePptx;
+    const FORMAT: Format = Format::Pptx;
+
+    /// The materializer remembers which file id jade gave each text box made
+    /// in the session; restoring rebuilds that from the model.
+    fn load(bytes: &[u8], model: &PptxModel) -> Result<JadePptx, String> {
+        JadePptx::restore(bytes, model)
+    }
+
+    fn open(bytes: &[u8]) -> Result<(PptxModel, JadePptx), String> {
+        let jade = JadePptx::open(bytes)?;
+        let model = PptxModel::from_pptx(jade.bytes()).map_err(|e| e.to_string())?;
+        Ok((model, jade))
+    }
+
+    fn export(materializer: &JadePptx) -> Result<Vec<u8>, String> {
         materializer.export()
     }
 }
@@ -152,6 +178,7 @@ pub(crate) fn spawn(
         .spawn(move || match format {
             Format::Docx => host::<Docx>(source, inbox, ready),
             Format::Xlsx => host::<Xlsx>(source, inbox, ready),
+            Format::Pptx => host::<Pptx>(source, inbox, ready),
         })
         .map_err(|e| e.to_string())?;
     opened.recv().map_err(|e| e.to_string())??;
@@ -224,7 +251,7 @@ impl<H: Hosted> Hosting<H> {
             Source::Stored { dir, options } => {
                 let (store, stored) =
                     DocumentStore::open::<H::Doc, H::Op>(dir, H::FORMAT, options)?;
-                let materializer = H::load(&stored.file)?;
+                let materializer = H::load(&stored.file, &stored.checkpoint.document)?;
                 let mut sequencer = Sequencer::restore(stored.checkpoint, materializer);
                 for (index, record) in stored.journal.into_iter().enumerate() {
                     sequencer

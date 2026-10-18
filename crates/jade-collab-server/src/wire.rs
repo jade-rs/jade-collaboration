@@ -11,6 +11,7 @@ use serde_json::Value;
 pub enum Format {
     Docx,
     Xlsx,
+    Pptx,
 }
 
 impl Format {
@@ -21,6 +22,8 @@ impl Format {
             Some(Format::Docx)
         } else if lower.ends_with(".xlsx") {
             Some(Format::Xlsx)
+        } else if lower.ends_with(".pptx") {
+            Some(Format::Pptx)
         } else {
             None
         }
@@ -39,6 +42,7 @@ impl Format {
         match self {
             Format::Docx => "docx",
             Format::Xlsx => "xlsx",
+            Format::Pptx => "pptx",
         }
     }
 }

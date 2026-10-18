@@ -9,17 +9,20 @@ use jade_collab_server::{Client, ClientError, Format};
 use jade_collab_sync::{Document, ReplicaEvent};
 use jade_docx_collab::intent::{resolve as resolve_docx, IntentOp};
 use jade_docx_collab::DocxModel;
+use jade_pptx_collab::intent::{resolve as resolve_pptx, PptxIntent};
+use jade_pptx_collab::PptxModel;
 use jade_xlsx_collab::intent::{resolve as resolve_xlsx, XlsxIntent};
 use jade_xlsx_collab::XlsxModel;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::read::{read_docx, read_xlsx};
+use crate::read::{read_docx, read_pptx, read_xlsx};
 
 pub(crate) enum Session {
     Docx(Client<DocxModel>),
     Xlsx(Client<XlsxModel>),
+    Pptx(Client<PptxModel>),
 }
 
 /// What became of one edit before the server answered.
@@ -55,6 +58,15 @@ fn xlsx_ops(
     resolve_xlsx(view, &intent, ids)
         .map(|op| vec![op])
         .map_err(|e| e.to_string())
+}
+
+fn pptx_ops(
+    view: &PptxModel,
+    edit: Value,
+    ids: &mut dyn FnMut(u64) -> Id,
+) -> Result<Vec<<PptxModel as Document>::Op>, String> {
+    let intent: PptxIntent = serde_json::from_value(edit).map_err(|e| e.to_string())?;
+    resolve_pptx(view, &intent, ids).map_err(|e| e.to_string())
 }
 
 fn connection_lost(error: ClientError) -> String {
@@ -173,6 +185,7 @@ impl Session {
         Ok(match format {
             Format::Docx => Session::Docx(Client::connect(url, token).await.map_err(connect)?),
             Format::Xlsx => Session::Xlsx(Client::connect(url, token).await.map_err(connect)?),
+            Format::Pptx => Session::Pptx(Client::connect(url, token).await.map_err(connect)?),
         })
     }
 
@@ -180,6 +193,7 @@ impl Session {
         match self {
             Session::Docx(client) => client.id().0,
             Session::Xlsx(client) => client.id().0,
+            Session::Pptx(client) => client.id().0,
         }
     }
 
@@ -187,6 +201,7 @@ impl Session {
         match self {
             Session::Docx(client) => client.seq(),
             Session::Xlsx(client) => client.seq(),
+            Session::Pptx(client) => client.seq(),
         }
     }
 
@@ -194,6 +209,7 @@ impl Session {
         match self {
             Session::Docx(client) => client.pending_len(),
             Session::Xlsx(client) => client.pending_len(),
+            Session::Pptx(client) => client.pending_len(),
         }
     }
 
@@ -204,6 +220,7 @@ impl Session {
         let mut read = match self {
             Session::Docx(client) => read_docx(&client.view(), start, limit),
             Session::Xlsx(client) => read_xlsx(&client.view(), start, limit),
+            Session::Pptx(client) => read_pptx(&client.view(), start, limit),
         };
         read["seq"] = json!(seq);
         read["pending"] = json!(pending);
@@ -218,6 +235,7 @@ impl Session {
         match self {
             Session::Docx(client) => apply(client, edits, timeout, docx_ops).await,
             Session::Xlsx(client) => apply(client, edits, timeout, xlsx_ops).await,
+            Session::Pptx(client) => apply(client, edits, timeout, pptx_ops).await,
         }
     }
 
@@ -225,6 +243,7 @@ impl Session {
         match self {
             Session::Docx(client) => wait(client, after, timeout).await,
             Session::Xlsx(client) => wait(client, after, timeout).await,
+            Session::Pptx(client) => wait(client, after, timeout).await,
         }
     }
 
@@ -234,6 +253,7 @@ impl Session {
         match self {
             Session::Docx(client) => drop(client.disconnect().await),
             Session::Xlsx(client) => drop(client.disconnect().await),
+            Session::Pptx(client) => drop(client.disconnect().await),
         }
         unanswered
     }

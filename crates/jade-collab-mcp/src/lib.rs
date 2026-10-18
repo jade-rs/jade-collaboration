@@ -23,7 +23,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-pub use read::{read_docx, read_xlsx};
+pub use read::{read_docx, read_pptx, read_xlsx};
 use session::Session;
 
 /// MCP protocol version echoed back when the client does not request one.
@@ -211,7 +211,9 @@ impl McpServer {
             )));
         }
         let format = Format::of_url(&url).ok_or_else(|| {
-            CallError::Invalid(format!("{url} does not name a .docx or .xlsx document"))
+            CallError::Invalid(format!(
+                "{url} does not name a .docx, .xlsx or .pptx document"
+            ))
         })?;
         let session = Session::join(&url, format, token(given).as_deref())
             .await
