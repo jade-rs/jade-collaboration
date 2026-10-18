@@ -3,7 +3,8 @@
 use std::collections::HashMap;
 
 use jade_collab_core::id::Id;
-use jade_docx_collab::{DocxModel, Paragraph, ParagraphStory, StoryId};
+use jade_docx_collab::intent::revision_kind_name;
+use jade_docx_collab::{DocxModel, Paragraph, ParagraphStory, RevisionKind, StoryId};
 use jade_pptx_collab::PptxModel;
 use jade_xlsx_collab::XlsxModel;
 use serde_json::{json, Value};
@@ -94,8 +95,27 @@ pub fn read_docx(model: &DocxModel, start: usize, limit: usize) -> Value {
                 if !p.anchors.is_empty() {
                     entry["anchors"] = anchors(model, p);
                 }
+                let spans = revision_spans(p);
+                if !spans.is_empty() {
+                    entry["revisions"] = json!(spans);
+                }
                 entry
             })
+            .collect::<Vec<_>>(),
+        "tracking": model.tracking(),
+        "revisions": model
+            .revisions()
+            .into_iter()
+            .map(|r| json!({
+                "id": r.id.to_string(),
+                "kind": revision_kind_name(r.revision.kind),
+                "author": r.revision.author,
+                "date": r.revision.date,
+                "file_id": r.revision.file_id,
+                "moved": r.revision.moved,
+                "text": r.text,
+                "paragraphs": r.paragraphs,
+            }))
             .collect::<Vec<_>>(),
         "tables": tables
             .iter()
@@ -135,6 +155,45 @@ fn anchors(model: &DocxModel, paragraph: &Paragraph) -> Value {
                 text_boxes += 1;
                 json!({ "offset": anchor.offset, "kind": "text_box", "text_box": text_boxes - 1 })
             }
+        })
+        .collect()
+}
+
+/// The UTF-8 byte spans of a paragraph's text each tracked change covers:
+/// insertions, and deletions as Word attributes them (deleted text is still
+/// in `text`), in order.
+fn revision_spans(paragraph: &Paragraph) -> Vec<Value> {
+    let mut spans: Vec<(usize, RevisionKind, Id, usize)> = Vec::new();
+    let mut offset = 0;
+    for (c, tracked) in paragraph.text.chars().zip(&paragraph.tracked) {
+        let end = offset + c.len_utf8();
+        let marks = [
+            (RevisionKind::Insertion, tracked.inserted),
+            (RevisionKind::Deletion, tracked.deleted),
+        ];
+        for (kind, revision) in marks {
+            let Some(revision) = revision else { continue };
+            let open = spans
+                .iter_mut()
+                .rev()
+                .find(|(_, k, r, e)| *k == kind && *r == revision && *e == offset);
+            match open {
+                Some(span) => span.3 = end,
+                None => spans.push((offset, kind, revision, end)),
+            }
+        }
+        offset = end;
+    }
+    spans.sort_by_key(|(start, kind, _, _)| (*start, *kind));
+    spans
+        .into_iter()
+        .map(|(start, kind, revision, end)| {
+            json!({
+                "kind": revision_kind_name(kind),
+                "revision": revision.to_string(),
+                "start": start,
+                "end": end,
+            })
         })
         .collect()
 }

@@ -626,6 +626,7 @@ async fn connection(
                     if commands
                         .send(Command::Submit {
                             replica,
+                            author: access.grant.as_ref().map(|grant| grant.name.clone()),
                             submission,
                         })
                         .is_err()

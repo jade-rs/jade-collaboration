@@ -75,11 +75,12 @@ async fn revisions_are_authored_by_the_token_that_made_them() {
     agent.wait_for_seq(seq).await.unwrap();
     edit(
         &agent,
-        IntentOp::DeleteText {
-            paragraph: 1,
-            offset: 4,
-            direction: Default::default(),
-            count: 5,
+        IntentOp::ReplaceRange {
+            start_paragraph: 1,
+            start_offset: 4,
+            end_paragraph: 1,
+            end_offset: 9,
+            text: String::new(),
         },
     );
     settle(&agent).await;

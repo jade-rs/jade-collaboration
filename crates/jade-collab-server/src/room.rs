@@ -8,7 +8,7 @@ use std::thread;
 use jade_collab_core::id::ReplicaId;
 use jade_collab_sync::protocol::{Committed, Submission};
 use jade_collab_sync::{Document, Materializer, Record, Sequencer, SubmitOutcome, SyncError};
-use jade_docx_collab::{DocxModel, JadeDocx};
+use jade_docx_collab::{DocxModel, DocxOp, JadeDocx};
 use jade_pptx_collab::{JadePptx, PptxModel};
 use jade_xlsx_collab::{JadeXlsx, LoadOptions, XlsxModel};
 use serde::de::DeserializeOwned;
@@ -34,6 +34,9 @@ pub(crate) enum Command {
     },
     Submit {
         replica: ReplicaId,
+        /// The connection's token name, which the server makes the author
+        /// of the replica's tracked changes.
+        author: Option<String>,
         submission: Submission<Value>,
     },
     /// Carries the connection's outbox, so a late update from a replica's
@@ -74,6 +77,19 @@ trait Hosted: 'static {
     /// The real document and the model derived from it.
     fn open(bytes: &[u8]) -> Result<(Self::Doc, Self::Mat), String>;
     fn export(materializer: &Self::Mat) -> Result<Vec<u8>, String>;
+
+    /// The operation the server commits, as the document's origin, before
+    /// `op` from `replica` — whose token is named `author` — so that the
+    /// revision `op` makes carries that name; `None` when nothing needs
+    /// saying (the default).
+    fn author_op(
+        _document: &Self::Doc,
+        _replica: ReplicaId,
+        _author: &str,
+        _op: &Self::Op,
+    ) -> Option<Self::Op> {
+        None
+    }
 }
 
 struct Docx;
@@ -96,6 +112,24 @@ impl Hosted for Docx {
 
     fn export(materializer: &JadeDocx) -> Result<Vec<u8>, String> {
         materializer.export().map_err(|e| e.to_string())
+    }
+
+    /// A tracked change by a replica the model does not know under its
+    /// token's name is preceded by `SetAuthor`.
+    fn author_op(
+        document: &DocxModel,
+        replica: ReplicaId,
+        author: &str,
+        op: &DocxOp,
+    ) -> Option<DocxOp> {
+        let tracked = matches!(
+            op,
+            DocxOp::TrackInsertText { .. } | DocxOp::TrackDeleteText { .. }
+        );
+        (tracked && document.author(replica) != Some(author)).then(|| DocxOp::SetAuthor {
+            replica,
+            name: author.to_string(),
+        })
     }
 }
 
@@ -353,6 +387,7 @@ impl<H: Hosted> Hosting<H> {
                 },
                 Command::Submit {
                     replica,
+                    author,
                     submission,
                 } => {
                     let op = match serde_json::from_value::<H::Op>(submission.op) {
@@ -370,6 +405,22 @@ impl<H: Hosted> Hosting<H> {
                             continue;
                         }
                     };
+                    // Who the replica is goes into the log before what it
+                    // does, for every replica to apply in that order.
+                    let named = author.as_deref().and_then(|author| {
+                        H::author_op(self.sequencer.document(), replica, author, &op)
+                    });
+                    if let Some(named) = named {
+                        match self.sequencer.commit_origin(named) {
+                            Ok(committed) => {
+                                self.journal(Record::Committed(committed.clone()))?;
+                                let json =
+                                    ServerMessage::Committed(committed_json(committed)).to_json();
+                                subscribers.retain(|_, outbox| outbox.send(json.clone()).is_ok());
+                            }
+                            Err(error) => eprintln!("cannot name replica {replica}: {error}"),
+                        }
+                    }
                     let submission = Submission {
                         client_seq: submission.client_seq,
                         base_seq: submission.base_seq,

@@ -502,7 +502,7 @@ async fn an_agent_edits_with_track_changes_and_revisions_are_decided() {
             json!([
                 { "type": "set_tracking", "on": true },
                 { "type": "insert_text", "paragraph": 1, "offset": 5, "text": "!" },
-                { "type": "delete_text", "paragraph": 1, "offset": 0, "count": 1 },
+                { "type": "delete_text", "paragraph": 1, "offset": 0, "direction": "forward", "count": 1 },
             ]),
         )
         .await;

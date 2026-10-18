@@ -254,6 +254,19 @@ fn edits() -> Value {
                     "row": integer("The merge's first row, zero-based."),
                     "column": integer("The merge's first column, zero-based."),
                 }), &["table", "row", "column"]),
+                edit("set_tracking", "docx: switch Track Changes on or off for the whole document. While it is on, typing and deleting become revisions authored by your token's name (deleting your own tracked insertion removes it; text already deleted is left as it is); paragraph breaks, joins, tables, formatting and comments are not tracked.", json!({
+                    "on": json!({ "type": "boolean", "description": "Tracking on (true) or off." }),
+                }), &["on"]),
+                edit("accept_revisions", "docx: accept whole revisions: an insertion becomes plain text, a deletion's text goes. Name them by id (read_document lists them), or take those touching a paragraph range, or (neither) all; a revision someone makes meanwhile is not included.", json!({
+                    "revision_ids": json!({ "type": "array", "items": { "type": "string" }, "description": "Revision ids (`id` or the file's `file_id`, as read_document lists them)." }),
+                    "start_paragraph": integer("First paragraph whose revisions to take."),
+                    "end_paragraph": integer("Last paragraph whose revisions to take (inclusive)."),
+                }), &[]),
+                edit("reject_revisions", "docx: reject whole revisions: an insertion's text goes, a deletion's text stays. Chosen as for accept_revisions.", json!({
+                    "revision_ids": json!({ "type": "array", "items": { "type": "string" }, "description": "Revision ids (`id` or the file's `file_id`, as read_document lists them)." }),
+                    "start_paragraph": integer("First paragraph whose revisions to take."),
+                    "end_paragraph": integer("Last paragraph whose revisions to take (inclusive)."),
+                }), &[]),
                 edit("set_cell", "xlsx: store a value or formula in a cell.", json!({
                     "sheet": sheet(),
                     "reference": string("The cell, in A1 form (`B3`)."),
@@ -467,7 +480,7 @@ fn tools() -> Vec<Tool> {
         Tool {
             name: "read_document",
             title: "Read a document",
-            description: "Your current view, a page at a time. docx: paragraphs (index, text, which story — body, a table cell, a text box, a footnote or an endnote — and where its text boxes and note references sit) and the top-level tables; xlsx: every sheet's size and its non-blank cells in A1 form, paged over all sheets in order; pptx: slides (numbered from 1) with their shapes' numbers, text and geometry and the speaker notes. Your own unanswered edits are included.",
+            description: "Your current view, a page at a time. docx: paragraphs (index, text, which story — body, a table cell, a text box, a footnote or an endnote — where its text boxes and note references sit, and which bytes tracked changes cover: deleted text stays in `text` until the deletion is accepted), the top-level tables, whether Track Changes is on and every revision with its author; xlsx: every sheet's size and its non-blank cells in A1 form, paged over all sheets in order; pptx: slides (numbered from 1) with their shapes' numbers, text and geometry and the speaker notes. Your own unanswered edits are included.",
             input: object("Arguments.", json!({
                 "session_id": session_id(),
                 "start": integer("First paragraph (docx), cell (xlsx) or slide (pptx, zero-based) to list; default 0."),
@@ -494,7 +507,26 @@ fn tools() -> Vec<Tool> {
                             "type": "object",
                             "description": "Where it is: `{kind: body}`, `{kind: table_cell, table, row, column}` (zero-based), or `{kind: nested_table_cell}`.",
                         },
+                        "revisions": {
+                            "type": "array",
+                            "description": "Tracked changes in it, if any: `{kind: insertion|deletion, revision, start, end}` (UTF-8 byte offsets into `text`).",
+                        },
                     }), &["index", "text", "story"]),
+                },
+                "tracking": json!({ "type": "boolean", "description": "docx: whether Track Changes is on." }),
+                "revisions": {
+                    "type": "array",
+                    "description": "docx: every tracked change with text left, by id.",
+                    "items": object("A revision.", json!({
+                        "id": string("Its id, as accept_revisions and reject_revisions take it."),
+                        "kind": string("`insertion` or `deletion`."),
+                        "author": json!({ "type": ["string", "null"], "description": "Who made it (the token's name); null if anonymous." }),
+                        "date": json!({ "type": ["string", "null"], "description": "When (`w:date`); may be null." }),
+                        "file_id": json!({ "type": ["string", "null"], "description": "Its `w:id` if it came with the file; null otherwise." }),
+                        "moved": json!({ "type": "boolean", "description": "A move (moveFrom / moveTo) from the file." }),
+                        "text": string("Its text."),
+                        "paragraphs": json!({ "type": "array", "items": { "type": "integer" }, "description": "The paragraphs holding it." }),
+                    }), &["id", "kind", "text", "paragraphs"]),
                 },
                 "tables": {
                     "type": "array",

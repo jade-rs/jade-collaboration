@@ -178,6 +178,7 @@ fn sample(schema: &Value) -> Value {
         Some("number") => json!(1.5),
         Some("boolean") => json!(true),
         Some("string") => json!("B"),
+        Some("array") => json!([sample(&schema["items"])]),
         Some("object") => {
             let mut object = serde_json::Map::new();
             for name in schema["required"].as_array().into_iter().flatten() {
