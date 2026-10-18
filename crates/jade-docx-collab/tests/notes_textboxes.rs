@@ -778,10 +778,10 @@ proptest! {
 /// before a lone note reference is deleted, text typed after the reference
 /// and the paragraph split after that text, splitting the note's paragraph
 /// loses track of the new body paragraph and writes the note's first half
-/// unchanged (the second half is added). Present on jade-core main before
-/// jade-rs/jade-core#30 too; without the deletion and typing it works.
+/// unchanged (the second half is added). jade-core now finds a note
+/// paragraph's halves by story position (jade-rs/jade-core#31, merged with
+/// #33); this keeps it fixed.
 #[test]
-#[ignore = "jade-core: a note split after a body split behind a lone reference is mis-written"]
 fn a_note_split_after_a_body_split_behind_a_lone_reference_is_written() {
     use jade_docx_document_core::headless_api::apply_headless_commands_to_document;
     use jade_docx_document_core::selection::TextPosition;
