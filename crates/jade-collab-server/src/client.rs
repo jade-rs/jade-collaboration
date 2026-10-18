@@ -24,6 +24,8 @@ pub enum ClientError {
     Connect(String),
     #[error("protocol error: {0}")]
     Protocol(String),
+    #[error("the server cannot resume this replica: {0}")]
+    Rejoin(String),
     #[error(transparent)]
     Sync(#[from] SyncError),
     #[error("the connection closed")]
@@ -116,7 +118,9 @@ where
     }
 
     /// Reconnects a replica taken from [`Client::disconnect`]: catches up
-    /// on what it missed and resends what the server never answered.
+    /// on what it missed and resends what the server never answered. Fails
+    /// with [`ClientError::Rejoin`] when the server can no longer resume it;
+    /// [`Client::connect`] then joins as a new replica.
     pub async fn resume(url: &str, mut replica: Replica<D>) -> Result<Self, ClientError> {
         let (socket, _) = connect_async(url)
             .await
@@ -142,6 +146,7 @@ where
                     missed,
                 })?
             }
+            ServerMessage::Rejoin { message } => return Err(ClientError::Rejoin(message)),
             ServerMessage::Error { message } => return Err(ClientError::Protocol(message)),
             other => {
                 return Err(ClientError::Protocol(format!(

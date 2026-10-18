@@ -1033,6 +1033,7 @@ dependencies = [
  "jade-collab-sync",
  "jade-docx-collab",
  "jade-xlsx-collab",
+ "proptest",
  "serde",
  "serde_json",
  "tempfile",

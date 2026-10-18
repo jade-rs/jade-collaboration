@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use jade_collab_server::{Client, Format, Server};
+use jade_collab_server::{Client, Format, Server, StorageOptions};
 use jade_collab_sync::ReplicaEvent;
 use jade_docx_collab::intent::{resolve, IntentOp};
 use jade_docx_collab::DocxModel;
@@ -26,6 +26,13 @@ enum Cli {
         /// Write every document back to its file on Ctrl-C.
         #[arg(long)]
         save: bool,
+        /// Keep documents durable in this directory: everything stored there
+        /// is served again on restart, and wins over a file of the same name.
+        #[arg(long, value_name = "DIR")]
+        data: Option<PathBuf>,
+        /// With --data, take a checkpoint after this many journal records.
+        #[arg(long, value_name = "N", requires = "data")]
+        checkpoint_every: Option<u64>,
         files: Vec<PathBuf>,
     },
     /// Print a document's current content as JSON.
@@ -174,8 +181,37 @@ async fn apply(url: &str, text: &str) -> Result<(), String> {
     Ok(())
 }
 
-async fn serve(addr: &str, save: bool, files: Vec<PathBuf>) -> Result<(), String> {
-    let server = Server::new();
+struct ServeOptions {
+    addr: String,
+    save: bool,
+    data: Option<PathBuf>,
+    checkpoint_every: Option<u64>,
+    files: Vec<PathBuf>,
+}
+
+async fn serve(options: ServeOptions) -> Result<(), String> {
+    let ServeOptions {
+        addr,
+        save,
+        data,
+        checkpoint_every,
+        files,
+    } = options;
+    let server = match data {
+        Some(dir) => {
+            let mut storage = StorageOptions::default();
+            if let Some(n) = checkpoint_every {
+                storage.checkpoint_every = n.max(1);
+            }
+            let server = Server::with_storage_options(dir, storage).map_err(|e| e.to_string())?;
+            for (name, _) in server.documents() {
+                println!("serving ws://{addr}/documents/{name}/ws (stored)");
+            }
+            server
+        }
+        None => Server::new(),
+    };
+    let stored: Vec<String> = server.documents().into_iter().map(|(n, _)| n).collect();
     let mut named = Vec::new();
     for path in files {
         let name = path
@@ -183,12 +219,14 @@ async fn serve(addr: &str, save: bool, files: Vec<PathBuf>) -> Result<(), String
             .and_then(|n| n.to_str())
             .ok_or_else(|| format!("{} has no file name", path.display()))?
             .to_string();
-        let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        server.open(&name, bytes).map_err(|e| e.to_string())?;
-        println!("serving ws://{addr}/documents/{name}/ws");
+        if !stored.contains(&name) {
+            let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            server.open(&name, bytes).map_err(|e| e.to_string())?;
+            println!("serving ws://{addr}/documents/{name}/ws");
+        }
         named.push((name, path));
     }
-    let listener = tokio::net::TcpListener::bind(addr)
+    let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .map_err(|e| e.to_string())?;
     tokio::select! {
@@ -208,7 +246,22 @@ async fn serve(addr: &str, save: bool, files: Vec<PathBuf>) -> Result<(), String
 #[tokio::main]
 async fn main() -> ExitCode {
     let result = match Cli::parse() {
-        Cli::Serve { addr, save, files } => serve(&addr, save, files).await,
+        Cli::Serve {
+            addr,
+            save,
+            data,
+            checkpoint_every,
+            files,
+        } => {
+            serve(ServeOptions {
+                addr,
+                save,
+                data,
+                checkpoint_every,
+                files,
+            })
+            .await
+        }
         Cli::Show { url } => show(&url).await,
         Cli::Apply { url, edits } => apply(&url, &edits).await,
     };

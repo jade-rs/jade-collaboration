@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
 
 use axum::body::Bytes;
@@ -12,8 +13,10 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc::unbounded_channel, oneshot};
 
-use crate::room::{self, Command};
+use crate::room::{self, Command, Source};
+use crate::storage::{newest_generation, StorageOptions};
 use crate::wire::{ClientMessage, Format, ServerMessage};
+use jade_collab_sync::SyncError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
@@ -23,6 +26,10 @@ pub enum ServerError {
     Exists(String),
     #[error("{0} is neither a .docx nor a .xlsx name")]
     UnknownFormat(String),
+    #[error("{0:?} is not a usable document name")]
+    InvalidName(String),
+    #[error("storage directory {dir}: {message}")]
+    Storage { dir: PathBuf, message: String },
     #[error("cannot open {name}: {message}")]
     Open { name: String, message: String },
     #[error("document {0} stopped")]
@@ -36,25 +43,110 @@ struct RoomHandle {
     commands: mpsc::Sender<Command>,
 }
 
+#[derive(Clone, Debug)]
+struct Storage {
+    dir: PathBuf,
+    options: StorageOptions,
+}
+
 /// Hosts named documents. Cheap to clone; clones share the documents.
 #[derive(Clone, Default)]
 pub struct Server {
     rooms: Arc<Mutex<BTreeMap<String, RoomHandle>>>,
+    storage: Option<Arc<Storage>>,
+}
+
+/// A name that is a single plain file name, so it can name a directory too.
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && !name
+            .chars()
+            .any(|c| matches!(c, '/' | '\\' | ':') || c.is_control())
 }
 
 impl Server {
+    /// A server that keeps documents in memory only.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// A server whose documents are durable in `dir`, with every document
+    /// already there reopened as it was.
+    pub fn with_storage(dir: impl Into<PathBuf>) -> Result<Self, ServerError> {
+        Self::with_storage_options(dir, StorageOptions::default())
+    }
+
+    pub fn with_storage_options(
+        dir: impl Into<PathBuf>,
+        options: StorageOptions,
+    ) -> Result<Self, ServerError> {
+        let dir = dir.into();
+        let storage_error = |message: String| ServerError::Storage {
+            dir: dir.clone(),
+            message,
+        };
+        std::fs::create_dir_all(&dir).map_err(|e| storage_error(e.to_string()))?;
+        let server = Self {
+            rooms: Arc::default(),
+            storage: Some(Arc::new(Storage {
+                dir: dir.clone(),
+                options,
+            })),
+        };
+        let entries = std::fs::read_dir(&dir).map_err(|e| storage_error(e.to_string()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| storage_error(e.to_string()))?;
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let Some(format) = Format::of(&name).filter(|_| valid_name(&name)) else {
+                continue;
+            };
+            // A directory without a snapshot is an open that never finished.
+            if newest_generation(&entry.path())
+                .map_err(storage_error)?
+                .is_none()
+            {
+                continue;
+            }
+            server.start(
+                &name,
+                format,
+                Source::Stored {
+                    dir: entry.path(),
+                    options,
+                },
+            )?;
+        }
+        Ok(server)
+    }
+
     /// Opens `bytes` as the document `name` (its extension picks the format).
+    /// On a durable server the document is stored before it is served.
     pub fn open(&self, name: &str, bytes: Vec<u8>) -> Result<Format, ServerError> {
+        if !valid_name(name) {
+            return Err(ServerError::InvalidName(name.to_string()));
+        }
         let format =
             Format::of(name).ok_or_else(|| ServerError::UnknownFormat(name.to_string()))?;
         if self.rooms.lock().unwrap().contains_key(name) {
             return Err(ServerError::Exists(name.to_string()));
         }
-        let commands = room::spawn(name, format, bytes).map_err(|message| ServerError::Open {
+        let source = match &self.storage {
+            Some(storage) => Source::NewStored {
+                bytes,
+                dir: storage.dir.join(name),
+                options: storage.options,
+            },
+            None => Source::File(bytes),
+        };
+        self.start(name, format, source)?;
+        Ok(format)
+    }
+
+    fn start(&self, name: &str, format: Format, source: Source) -> Result<(), ServerError> {
+        let commands = room::spawn(name, format, source).map_err(|message| ServerError::Open {
             name: name.to_string(),
             message,
         })?;
@@ -63,7 +155,7 @@ impl Server {
             return Err(ServerError::Exists(name.to_string()));
         }
         rooms.insert(name.to_string(), RoomHandle { format, commands });
-        Ok(format)
+        Ok(())
     }
 
     pub fn documents(&self) -> Vec<(String, Format)> {
@@ -147,7 +239,9 @@ fn error_response(error: ServerError) -> Response {
     let status = match error {
         ServerError::NotFound(_) => StatusCode::NOT_FOUND,
         ServerError::Exists(_) => StatusCode::CONFLICT,
-        ServerError::UnknownFormat(_) | ServerError::Open { .. } => StatusCode::BAD_REQUEST,
+        ServerError::UnknownFormat(_) | ServerError::InvalidName(_) | ServerError::Open { .. } => {
+            StatusCode::BAD_REQUEST
+        }
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (status, error.to_string()).into_response()
@@ -247,7 +341,14 @@ async fn connection(socket: WebSocket, commands: mpsc::Sender<Command>) {
                 }
                 match answer.await {
                     Ok(Ok(())) => replica = Some(id),
-                    Ok(Err(message)) => say(ServerMessage::Error { message }),
+                    Ok(Err(
+                        error @ (SyncError::Compacted { .. } | SyncError::UnknownReplica(_)),
+                    )) => say(ServerMessage::Rejoin {
+                        message: error.to_string(),
+                    }),
+                    Ok(Err(error)) => say(ServerMessage::Error {
+                        message: error.to_string(),
+                    }),
                     Err(_) => break,
                 }
             }

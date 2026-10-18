@@ -101,7 +101,11 @@ fn files(dir: &Path) -> Vec<String> {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_restarted_server_resumes_every_replica_where_it_was() {
     let dir = tempfile::tempdir().unwrap();
-    let server = Server::with_storage(dir.path()).unwrap();
+    // Restarts from a checkpoint taken mid-session plus the journal after it.
+    let options = StorageOptions {
+        checkpoint_every: 5,
+    };
+    let server = Server::with_storage_options(dir.path(), options).unwrap();
     server.open("hello.docx", fixture("hello.docx")).unwrap();
     server.open("book.xlsx", fixture(XLSX)).unwrap();
     let (base, task) = listen(&server).await;
@@ -115,7 +119,7 @@ async fn a_restarted_server_resumes_every_replica_where_it_was() {
     type_text(&a, 0, "[a] ");
     type_text(&b, 0, "[b] ");
     set_cell(&c, "E6", CellInput::Number(7.0));
-    insert_row(&d, 3);
+    insert_row(&d, 6);
     set_cell(&d, "D9", CellInput::Formula("E6*2".into()));
     for client in [&a, &b] {
         client.settle().await.unwrap();
@@ -142,7 +146,7 @@ async fn a_restarted_server_resumes_every_replica_where_it_was() {
     task.abort();
     drop(server);
 
-    let server = Server::with_storage(dir.path()).unwrap();
+    let server = Server::with_storage_options(dir.path(), options).unwrap();
     let mut documents: Vec<String> = server.documents().into_iter().map(|(n, _)| n).collect();
     documents.sort();
     assert_eq!(documents, ["book.xlsx", "hello.docx"]);
@@ -203,11 +207,19 @@ async fn checkpoints_bound_the_log_and_replicas_behind_them_must_rejoin() {
     let writer: Client<DocxModel> = Client::connect(&url).await.unwrap();
     let idle: Client<DocxModel> = Client::connect(&url).await.unwrap();
     let idle = idle.disconnect().await;
+    let idle_live: Client<DocxModel> = Client::connect(&url).await.unwrap();
+    let idle_live = idle_live.disconnect().await;
     for i in 0..10 {
         type_text(&writer, 0, &format!("{i}"));
         writer.settle().await.unwrap();
     }
     catch_up(&server, "hello.docx", &writer).await;
+    // A running server forgets the log before its checkpoint too.
+    let error = Client::resume(&url, idle_live)
+        .await
+        .err()
+        .expect("refused");
+    assert!(matches!(error, ClientError::Rejoin(_)), "{error}");
     let before = server.export("hello.docx").await.unwrap();
     let writer = writer.disconnect().await;
     task.abort();

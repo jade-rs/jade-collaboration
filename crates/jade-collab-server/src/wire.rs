@@ -25,6 +25,14 @@ impl Format {
             None
         }
     }
+
+    /// The file extension, without the dot.
+    pub fn extension(self) -> &'static str {
+        match self {
+            Format::Docx => "docx",
+            Format::Xlsx => "xlsx",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -56,6 +64,11 @@ pub enum ServerMessage {
     },
     Committed(Committed<Value>),
     Rejected(Rejected),
+    /// The server cannot resume the replica (it never joined, or its log
+    /// position was compacted into a checkpoint); join again.
+    Rejoin {
+        message: String,
+    },
     Error {
         message: String,
     },

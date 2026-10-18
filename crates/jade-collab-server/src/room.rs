@@ -1,12 +1,13 @@
 //! One document's actor thread.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 
 use jade_collab_core::id::ReplicaId;
 use jade_collab_sync::protocol::{Committed, Submission};
-use jade_collab_sync::{Document, Materializer, Sequencer, SubmitOutcome};
+use jade_collab_sync::{Document, Materializer, Record, Sequencer, SubmitOutcome, SyncError};
 use jade_docx_collab::{DocxModel, JadeDocx};
 use jade_xlsx_collab::{JadeXlsx, LoadOptions, XlsxModel};
 use serde::de::DeserializeOwned;
@@ -14,6 +15,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
 
+use crate::storage::{DocumentStore, StorageOptions};
 use crate::wire::{Format, ServerMessage};
 
 pub(crate) type Outbox = UnboundedSender<String>;
@@ -27,7 +29,7 @@ pub(crate) enum Command {
         replica: ReplicaId,
         seq: u64,
         outbox: Outbox,
-        reply: oneshot::Sender<Result<(), String>>,
+        reply: oneshot::Sender<Result<(), SyncError>>,
     },
     Submit {
         replica: ReplicaId,
@@ -52,11 +54,15 @@ pub(crate) enum Command {
 
 /// A format the server can host: how to open it and write it back.
 trait Hosted: 'static {
-    type Doc: Document<Op = Self::Op> + Serialize;
+    type Doc: Document<Op = Self::Op> + Serialize + DeserializeOwned;
     type Op: Clone + std::fmt::Debug + PartialEq + Serialize + DeserializeOwned;
     type Mat: Materializer<Self::Doc>;
     const FORMAT: Format;
 
+    /// The real document only, for a model that is restored rather than
+    /// derived from the file.
+    fn load(bytes: &[u8]) -> Result<Self::Mat, String>;
+    /// The real document and the model derived from it.
     fn open(bytes: &[u8]) -> Result<(Self::Doc, Self::Mat), String>;
     fn export(materializer: &Self::Mat) -> Result<Vec<u8>, String>;
 }
@@ -68,6 +74,10 @@ impl Hosted for Docx {
     type Op = jade_docx_collab::DocxOp;
     type Mat = JadeDocx;
     const FORMAT: Format = Format::Docx;
+
+    fn load(bytes: &[u8]) -> Result<JadeDocx, String> {
+        JadeDocx::load(bytes)
+    }
 
     fn open(bytes: &[u8]) -> Result<(DocxModel, JadeDocx), String> {
         let jade = JadeDocx::load(bytes)?;
@@ -88,6 +98,10 @@ impl Hosted for Xlsx {
     type Mat = JadeXlsx;
     const FORMAT: Format = Format::Xlsx;
 
+    fn load(bytes: &[u8]) -> Result<JadeXlsx, String> {
+        JadeXlsx::open(bytes)
+    }
+
     fn open(bytes: &[u8]) -> Result<(XlsxModel, JadeXlsx), String> {
         let jade = JadeXlsx::open(bytes)?;
         let model = XlsxModel::from_workbook(jade.workbook(), LoadOptions::default())
@@ -100,23 +114,62 @@ impl Hosted for Xlsx {
     }
 }
 
+/// Where a document comes from.
+pub(crate) enum Source {
+    /// A file, kept in memory only.
+    File(Vec<u8>),
+    /// A file, made durable in a new directory.
+    NewStored {
+        bytes: Vec<u8>,
+        dir: PathBuf,
+        options: StorageOptions,
+    },
+    /// A directory a durable server wrote.
+    Stored {
+        dir: PathBuf,
+        options: StorageOptions,
+    },
+}
+
 /// Starts a document thread; returns once the document has opened (or failed to).
 pub(crate) fn spawn(
     name: &str,
     format: Format,
-    bytes: Vec<u8>,
+    source: Source,
 ) -> Result<mpsc::Sender<Command>, String> {
     let (commands, inbox) = mpsc::channel();
     let (ready, opened) = mpsc::channel();
     thread::Builder::new()
         .name(format!("doc:{name}"))
         .spawn(move || match format {
-            Format::Docx => run::<Docx>(&bytes, inbox, ready),
-            Format::Xlsx => run::<Xlsx>(&bytes, inbox, ready),
+            Format::Docx => host::<Docx>(source, inbox, ready),
+            Format::Xlsx => host::<Xlsx>(source, inbox, ready),
         })
         .map_err(|e| e.to_string())?;
     opened.recv().map_err(|e| e.to_string())??;
     Ok(commands)
+}
+
+fn host<H: Hosted>(
+    source: Source,
+    inbox: mpsc::Receiver<Command>,
+    ready: mpsc::Sender<Result<(), String>>,
+) {
+    let mut hosting = match Hosting::<H>::open(source) {
+        Ok(hosting) => {
+            let _ = ready.send(Ok(()));
+            hosting
+        }
+        Err(error) => {
+            let _ = ready.send(Err(error));
+            return;
+        }
+    };
+    if let Err(error) = hosting.serve(inbox) {
+        // Answering without a durable journal would let replicas run ahead
+        // of the disk; the document stops instead.
+        eprintln!("document stopped: {error}");
+    }
 }
 
 fn committed_json<Op: Serialize>(committed: Committed<Op>) -> Committed<Value> {
@@ -129,113 +182,176 @@ fn committed_json<Op: Serialize>(committed: Committed<Op>) -> Committed<Value> {
     }
 }
 
-fn run<H: Hosted>(
-    bytes: &[u8],
-    inbox: mpsc::Receiver<Command>,
-    ready: mpsc::Sender<Result<(), String>>,
-) {
-    let (document, materializer) = match H::open(bytes) {
-        Ok(opened) => {
-            let _ = ready.send(Ok(()));
-            opened
-        }
-        Err(error) => {
-            let _ = ready.send(Err(error));
-            return;
-        }
-    };
-    let mut sequencer = Sequencer::with_materializer(document, materializer);
-    let mut subscribers: BTreeMap<ReplicaId, Outbox> = BTreeMap::new();
+/// A document and, on a durable server, its directory.
+struct Hosting<H: Hosted> {
+    sequencer: Sequencer<H::Doc, H::Mat>,
+    store: Option<DocumentStore>,
+}
 
-    while let Ok(command) = inbox.recv() {
-        match command {
-            Command::Join { outbox, reply } => {
-                let welcome = sequencer.join();
-                let message = ServerMessage::Welcome {
-                    format: H::FORMAT,
-                    replica: welcome.replica,
-                    seq: welcome.seq,
-                    snapshot: serde_json::to_value(&welcome.snapshot).expect("models serialize"),
-                };
-                // Sent from this thread before any later commit, so the
-                // replica starts exactly at `seq`.
-                let _ = outbox.send(message.to_json());
-                subscribers.insert(welcome.replica, outbox);
-                let _ = reply.send(welcome.replica);
+impl<H: Hosted> Hosting<H> {
+    fn open(source: Source) -> Result<Self, String> {
+        Ok(match source {
+            Source::File(bytes) => {
+                let (document, materializer) = H::open(&bytes)?;
+                Hosting {
+                    sequencer: Sequencer::with_materializer(document, materializer),
+                    store: None,
+                }
             }
-            Command::Resume {
-                replica,
-                seq,
-                outbox,
-                reply,
-            } => match sequencer.resume(replica, seq) {
-                Ok(resume) => {
-                    let message = ServerMessage::Resumed {
-                        processed_client_seq: resume.processed_client_seq,
-                        missed: resume.missed.into_iter().map(committed_json).collect(),
-                    };
-                    let _ = outbox.send(message.to_json());
-                    subscribers.insert(replica, outbox);
-                    let _ = reply.send(Ok(()));
-                }
-                Err(error) => {
-                    let _ = reply.send(Err(error.to_string()));
-                }
-            },
-            Command::Submit {
-                replica,
-                submission,
+            Source::NewStored {
+                bytes,
+                dir,
+                options,
             } => {
-                let op = match serde_json::from_value::<H::Op>(submission.op) {
-                    Ok(op) => op,
-                    Err(error) => {
-                        if let Some(outbox) = subscribers.get(&replica) {
-                            let message = ServerMessage::Error {
-                                message: format!(
-                                    "submission {} is not a valid operation: {error}",
-                                    submission.client_seq
-                                ),
-                            };
-                            let _ = outbox.send(message.to_json());
-                        }
-                        continue;
-                    }
-                };
-                let submission = Submission {
-                    client_seq: submission.client_seq,
-                    base_seq: submission.base_seq,
-                    op,
-                };
-                match sequencer.submit(replica, submission) {
-                    SubmitOutcome::Committed(committed) => {
-                        let json = ServerMessage::Committed(committed_json(committed)).to_json();
-                        subscribers.retain(|_, outbox| outbox.send(json.clone()).is_ok());
-                    }
-                    SubmitOutcome::Rejected(rejected) => {
-                        if let Some(outbox) = subscribers.get(&replica) {
-                            let _ = outbox.send(ServerMessage::Rejected(rejected).to_json());
-                        }
-                    }
-                    SubmitOutcome::Duplicate => {}
+                let (document, materializer) = H::open(&bytes)?;
+                let sequencer = Sequencer::with_materializer(document, materializer);
+                let file = H::export(sequencer.materializer())?;
+                let store =
+                    DocumentStore::create(dir, H::FORMAT, options, &sequencer.checkpoint(), &file)?;
+                Hosting {
+                    sequencer,
+                    store: Some(store),
                 }
             }
-            Command::Leave { replica, outbox } => {
-                if subscribers
-                    .get(&replica)
-                    .is_some_and(|current| current.same_channel(&outbox))
-                {
-                    subscribers.remove(&replica);
+            Source::Stored { dir, options } => {
+                let (store, stored) =
+                    DocumentStore::open::<H::Doc, H::Op>(dir, H::FORMAT, options)?;
+                let materializer = H::load(&stored.file)?;
+                let mut sequencer = Sequencer::restore(stored.checkpoint, materializer);
+                for (index, record) in stored.journal.into_iter().enumerate() {
+                    sequencer
+                        .replay(record)
+                        .map_err(|e| format!("journal record {}: {e}", index + 1))?;
+                }
+                Hosting {
+                    sequencer,
+                    store: Some(store),
                 }
             }
-            Command::Export { reply } => {
-                let _ = reply.send(H::export(sequencer.materializer()));
-            }
-            Command::Seq { reply } => {
-                let _ = reply.send(sequencer.seq());
-            }
-            Command::Faults { reply } => {
-                let _ = reply.send(sequencer.faults().to_vec());
+        })
+    }
+
+    /// Journals `record` before anyone hears of it, and checkpoints when due.
+    fn journal(&mut self, record: Record<H::Op>) -> Result<(), String> {
+        let Some(store) = &mut self.store else {
+            return Ok(());
+        };
+        if store.append(&record)? {
+            // A file that cannot be exported now is checkpointed later; the
+            // journal keeps everything until then.
+            match H::export(self.sequencer.materializer()) {
+                Ok(file) => {
+                    store.checkpoint(&self.sequencer.checkpoint(), &file)?;
+                    self.sequencer.compact();
+                }
+                Err(error) => eprintln!("cannot checkpoint: {error}"),
             }
         }
+        Ok(())
+    }
+
+    fn serve(&mut self, inbox: mpsc::Receiver<Command>) -> Result<(), String> {
+        let mut subscribers: BTreeMap<ReplicaId, Outbox> = BTreeMap::new();
+        while let Ok(command) = inbox.recv() {
+            match command {
+                Command::Join { outbox, reply } => {
+                    let welcome = self.sequencer.join();
+                    self.journal(Record::Joined {
+                        replica: welcome.replica,
+                    })?;
+                    let message = ServerMessage::Welcome {
+                        format: H::FORMAT,
+                        replica: welcome.replica,
+                        seq: welcome.seq,
+                        snapshot: serde_json::to_value(&welcome.snapshot)
+                            .expect("models serialize"),
+                    };
+                    // Sent from this thread before any later commit, so the
+                    // replica starts exactly at `seq`.
+                    let _ = outbox.send(message.to_json());
+                    subscribers.insert(welcome.replica, outbox);
+                    let _ = reply.send(welcome.replica);
+                }
+                Command::Resume {
+                    replica,
+                    seq,
+                    outbox,
+                    reply,
+                } => match self.sequencer.resume(replica, seq) {
+                    Ok(resume) => {
+                        let message = ServerMessage::Resumed {
+                            processed_client_seq: resume.processed_client_seq,
+                            missed: resume.missed.into_iter().map(committed_json).collect(),
+                        };
+                        let _ = outbox.send(message.to_json());
+                        subscribers.insert(replica, outbox);
+                        let _ = reply.send(Ok(()));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                    }
+                },
+                Command::Submit {
+                    replica,
+                    submission,
+                } => {
+                    let op = match serde_json::from_value::<H::Op>(submission.op) {
+                        Ok(op) => op,
+                        Err(error) => {
+                            if let Some(outbox) = subscribers.get(&replica) {
+                                let message = ServerMessage::Error {
+                                    message: format!(
+                                        "submission {} is not a valid operation: {error}",
+                                        submission.client_seq
+                                    ),
+                                };
+                                let _ = outbox.send(message.to_json());
+                            }
+                            continue;
+                        }
+                    };
+                    let submission = Submission {
+                        client_seq: submission.client_seq,
+                        base_seq: submission.base_seq,
+                        op,
+                    };
+                    let outcome = self.sequencer.submit(replica, submission);
+                    if let Some(record) = outcome.record(replica) {
+                        self.journal(record)?;
+                    }
+                    match outcome {
+                        SubmitOutcome::Committed(committed) => {
+                            let json =
+                                ServerMessage::Committed(committed_json(committed)).to_json();
+                            subscribers.retain(|_, outbox| outbox.send(json.clone()).is_ok());
+                        }
+                        SubmitOutcome::Rejected(rejected) => {
+                            if let Some(outbox) = subscribers.get(&replica) {
+                                let _ = outbox.send(ServerMessage::Rejected(rejected).to_json());
+                            }
+                        }
+                        SubmitOutcome::Duplicate => {}
+                    }
+                }
+                Command::Leave { replica, outbox } => {
+                    if subscribers
+                        .get(&replica)
+                        .is_some_and(|current| current.same_channel(&outbox))
+                    {
+                        subscribers.remove(&replica);
+                    }
+                }
+                Command::Export { reply } => {
+                    let _ = reply.send(H::export(self.sequencer.materializer()));
+                }
+                Command::Seq { reply } => {
+                    let _ = reply.send(self.sequencer.seq());
+                }
+                Command::Faults { reply } => {
+                    let _ = reply.send(self.sequencer.faults().to_vec());
+                }
+            }
+        }
+        Ok(())
     }
 }
