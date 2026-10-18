@@ -39,7 +39,10 @@ fn shown<V: Clone + PartialEq + std::fmt::Debug>(
 
 /// The winning (mark id, value) of every covered (atom, key), from
 /// [`MarkSet::effective`].
-fn per_atom<T, V: Clone>(rga: &Rga<T>, marks: &MarkSet<u8, V>) -> BTreeMap<(Id, u8), (Id, Option<V>)>
+fn per_atom<T, V: Clone>(
+    rga: &Rga<T>,
+    marks: &MarkSet<u8, V>,
+) -> BTreeMap<(Id, u8), (Id, Option<V>)>
 where
     T: Clone,
 {
@@ -64,21 +67,40 @@ fn bold_expands_at_its_end_and_a_link_does_not() {
     let (b, c) = (id(2, 1), id(3, 1));
     let mut marks = MarkSet::new();
     let (start, end) = anchors(&rga, b, c, Expand::End).unwrap();
-    assert_eq!((start, end), (Boundary::Before(b), Boundary::Before(id(4, 1))));
-    marks.insert(Mark::new(id(10, 2), 0u8, start, end, Some(1u8))).unwrap();
+    assert_eq!(
+        (start, end),
+        (Boundary::Before(b), Boundary::Before(id(4, 1)))
+    );
+    marks
+        .insert(Mark::new(id(10, 2), 0u8, start, end, Some(1u8)))
+        .unwrap();
     let (start, end) = anchors(&rga, b, c, Expand::None).unwrap();
     assert_eq!((start, end), (Boundary::Before(b), Boundary::After(c)));
-    marks.insert(Mark::new(id(11, 2), 1u8, start, end, Some(1u8))).unwrap();
+    marks
+        .insert(Mark::new(id(11, 2), 1u8, start, end, Some(1u8)))
+        .unwrap();
     // "x" typed right after "c", "y" right before "b".
     rga.insert(id(20, 3), Some(c), 'x').unwrap();
     rga.insert(id(21, 3), Some(id(1, 1)), 'y').unwrap();
     let bold: String = shown(&rga, &marks, 0)
         .iter()
-        .map(|(ch, v)| if v.is_some() { ch.to_ascii_uppercase() } else { *ch })
+        .map(|(ch, v)| {
+            if v.is_some() {
+                ch.to_ascii_uppercase()
+            } else {
+                *ch
+            }
+        })
         .collect();
     let link: String = shown(&rga, &marks, 1)
         .iter()
-        .map(|(ch, v)| if v.is_some() { ch.to_ascii_uppercase() } else { *ch })
+        .map(|(ch, v)| {
+            if v.is_some() {
+                ch.to_ascii_uppercase()
+            } else {
+                *ch
+            }
+        })
         .collect();
     assert_eq!(bold, "ayBCXde");
     assert_eq!(link, "ayBCxde");
@@ -92,7 +114,10 @@ fn a_mark_ending_at_the_story_end_expands_to_text_appended_later() {
     let mut marks = MarkSet::new();
     marks.insert(mark(10, 0, start, end, Some(1))).unwrap();
     rga.insert(id(20, 3), Some(id(5, 1)), 'f').unwrap();
-    let covered: Vec<bool> = shown(&rga, &marks, 0).iter().map(|(_, v)| v.is_some()).collect();
+    let covered: Vec<bool> = shown(&rga, &marks, 0)
+        .iter()
+        .map(|(_, v)| v.is_some())
+        .collect();
     assert_eq!(covered, [false, false, false, true, true, true]);
 }
 
@@ -104,15 +129,33 @@ fn the_newest_mark_wins_per_key_and_keys_are_independent() {
     marks.insert(mark(10, 0, all.0, all.1, Some(1))).unwrap();
     // An older mark arriving later does not win.
     marks
-        .insert(mark(9, 0, Boundary::Before(id(2, 1)), Boundary::After(id(2, 1)), Some(7)))
+        .insert(mark(
+            9,
+            0,
+            Boundary::Before(id(2, 1)),
+            Boundary::After(id(2, 1)),
+            Some(7),
+        ))
         .unwrap();
     marks
-        .insert(mark(11, 0, Boundary::Before(id(3, 1)), Boundary::After(id(3, 1)), Some(2)))
+        .insert(mark(
+            11,
+            0,
+            Boundary::Before(id(3, 1)),
+            Boundary::After(id(3, 1)),
+            Some(2),
+        ))
         .unwrap();
     marks.insert(mark(5, 1, all.0, all.1, Some(3))).unwrap();
-    let bold: Vec<Option<u8>> = shown(&rga, &marks, 0).iter().map(|(_, v)| v.flatten()).collect();
+    let bold: Vec<Option<u8>> = shown(&rga, &marks, 0)
+        .iter()
+        .map(|(_, v)| v.flatten())
+        .collect();
     assert_eq!(bold, [Some(1), Some(1), Some(2), Some(1), Some(1)]);
-    let other: Vec<Option<u8>> = shown(&rga, &marks, 1).iter().map(|(_, v)| v.flatten()).collect();
+    let other: Vec<Option<u8>> = shown(&rga, &marks, 1)
+        .iter()
+        .map(|(_, v)| v.flatten())
+        .collect();
     assert_eq!(other, [Some(3); 5]);
 }
 
@@ -121,15 +164,34 @@ fn an_unset_mark_returns_its_atoms_to_the_base_formatting() {
     let rga = abcde();
     let mut marks = MarkSet::new();
     marks
-        .insert(mark(10, 0, Boundary::Before(id(1, 1)), Boundary::End, Some(1)))
+        .insert(mark(
+            10,
+            0,
+            Boundary::Before(id(1, 1)),
+            Boundary::End,
+            Some(1),
+        ))
         .unwrap();
     marks
-        .insert(mark(11, 0, Boundary::Before(id(2, 1)), Boundary::Before(id(4, 1)), None))
+        .insert(mark(
+            11,
+            0,
+            Boundary::Before(id(2, 1)),
+            Boundary::Before(id(4, 1)),
+            None,
+        ))
         .unwrap();
-    let bold: Vec<Option<Option<u8>>> = shown(&rga, &marks, 0).into_iter().map(|(_, v)| v).collect();
+    let bold: Vec<Option<Option<u8>>> =
+        shown(&rga, &marks, 0).into_iter().map(|(_, v)| v).collect();
     assert_eq!(
         bold,
-        [Some(Some(1)), Some(None), Some(None), Some(Some(1)), Some(Some(1))]
+        [
+            Some(Some(1)),
+            Some(None),
+            Some(None),
+            Some(Some(1)),
+            Some(Some(1))
+        ]
     );
     assert_eq!(marks.at(&rga, id(2, 1), &0), Some((id(11, 2), None)));
     assert_eq!(marks.at(&rga, id(1, 1), &0), Some((id(10, 2), Some(&1))));
@@ -168,9 +230,21 @@ fn marks_whose_anchors_are_missing_cover_nothing_and_are_refused_by_validation()
     );
     marks.insert(ghost).unwrap();
     assert!(marks.effective(&rga).is_empty());
-    let inverted = mark(11, 0, Boundary::After(id(3, 1)), Boundary::Before(id(2, 1)), Some(1));
+    let inverted = mark(
+        11,
+        0,
+        Boundary::After(id(3, 1)),
+        Boundary::Before(id(2, 1)),
+        Some(1),
+    );
     assert_eq!(MarkSet::validate(&rga, &inverted), Err(MarkError::Empty));
-    let empty = mark(12, 0, Boundary::Before(id(3, 1)), Boundary::Before(id(3, 1)), Some(1));
+    let empty = mark(
+        12,
+        0,
+        Boundary::Before(id(3, 1)),
+        Boundary::Before(id(3, 1)),
+        Some(1),
+    );
     assert_eq!(MarkSet::validate(&rga, &empty), Err(MarkError::Empty));
     let ok = mark(13, 0, Boundary::Start, Boundary::After(id(1, 1)), Some(1));
     assert_eq!(MarkSet::validate(&rga, &ok), Ok(()));
@@ -229,8 +303,15 @@ enum Op {
 
 #[derive(Clone, Debug)]
 enum Action {
-    Insert { peer: usize, at: usize, value: char },
-    Delete { peer: usize, at: usize },
+    Insert {
+        peer: usize,
+        at: usize,
+        value: char,
+    },
+    Delete {
+        peer: usize,
+        at: usize,
+    },
     Mark {
         peer: usize,
         from: usize,
@@ -239,7 +320,10 @@ enum Action {
         value: Option<u8>,
         expand: bool,
     },
-    Sync { from: usize, to: usize },
+    Sync {
+        from: usize,
+        to: usize,
+    },
 }
 
 fn action(peers: usize) -> impl Strategy<Value = Action> {
@@ -316,7 +400,8 @@ fn run(peers: usize, actions: &[Action]) -> (Vec<Op>, Vec<Peer>) {
             Action::Insert { peer, at, value } => {
                 let replica = &mut replicas[peer];
                 let len = replica.rga.len();
-                let parent = (at % (len + 1) != len).then(|| replica.rga.nodes()[at % (len + 1)].id);
+                let parent =
+                    (at % (len + 1) != len).then(|| replica.rga.nodes()[at % (len + 1)].id);
                 let id = replica.clock.tick();
                 (peer, Op::Insert { id, parent, value })
             }
@@ -329,7 +414,14 @@ fn run(peers: usize, actions: &[Action]) -> (Vec<Op>, Vec<Peer>) {
                 let id = replica.rga.visible_id_at(at % len).unwrap();
                 (peer, Op::Delete { id })
             }
-            Action::Mark { peer, from, len, key, value, expand } => {
+            Action::Mark {
+                peer,
+                from,
+                len,
+                key,
+                value,
+                expand,
+            } => {
                 let replica = &mut replicas[peer];
                 let visible = replica.rga.visible_len();
                 if visible == 0 {

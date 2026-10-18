@@ -61,7 +61,10 @@ fn oracle(input: &str) -> Vec<String> {
 
 #[derive(Clone, Debug)]
 enum Choice {
-    Insert { peer: usize, at: usize },
+    Insert {
+        peer: usize,
+        at: usize,
+    },
     Mark {
         peer: usize,
         from: usize,
@@ -70,7 +73,10 @@ enum Choice {
         value: Option<u8>,
         expand: bool,
     },
-    Sync { from: usize, to: usize },
+    Sync {
+        from: usize,
+        to: usize,
+    },
 }
 
 fn choice() -> impl Strategy<Value = Choice> {
