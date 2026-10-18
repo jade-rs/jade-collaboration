@@ -866,13 +866,18 @@ impl Materializer<DocxModel> for JadeDocx {
                 _ => None,
             };
             let before: BTreeSet<String> = self.word.comments.keys().cloned().collect();
-            let unlisted = matches!(effect, DocxEffect::AddComment { .. }).then(|| self.unlisted());
+            let unlisted = matches!(
+                effect,
+                DocxEffect::AddComment { .. } | DocxEffect::ReplyToComment { .. }
+            )
+            .then(|| self.unlisted());
             self.realize(model, effect)
                 .map_err(|e| format!("{description}: {e}"))?;
-            // jade's add_comment splits the runs it anchors to without
-            // relisting the paragraph's text boxes, whose paragraphs then
-            // point at the wrong run and vanish until the document is read
-            // again; putting jade's own state back relists them.
+            // jade's add_comment (and a reply, anchored the same way) splits
+            // the runs it anchors to without relisting the paragraph's text
+            // boxes, whose paragraphs then point at the wrong run and vanish
+            // until the document is read again; putting jade's own state
+            // back relists them.
             if unlisted.is_some_and(|before| self.unlisted() > before) {
                 if let Some(snapshot) = self.word.snapshot_including_package() {
                     self.word.restore_snapshot(snapshot);
