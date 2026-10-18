@@ -371,6 +371,7 @@ fn stamp(n: u64) -> Id {
 fn line_formats_reach_jade_and_new_lines_take_them_as_in_jade() {
     let (mut model, mut jade) = open("grid-operations-workbook.xlsx");
     let (sheet, row3, column_b) = model.locate("Operations", "B3").unwrap();
+    let (_, _, column_d) = model.locate("Operations", "D3").unwrap();
     let mut seq = 0;
     let fill = FormatChange {
         fill_color: Some("FFFF00".into()),
@@ -391,7 +392,7 @@ fn line_formats_reach_jade_and_new_lines_take_them_as_in_jade() {
         &mut model,
         &mut jade,
         &mut seq,
-        line(LineAxis::Columns, column_b, 1, bold(true)),
+        line(LineAxis::Columns, column_b, 4, bold(true)),
     );
     commit(
         &mut model,
@@ -415,7 +416,7 @@ fn line_formats_reach_jade_and_new_lines_take_them_as_in_jade() {
         XlsxOp::Structure {
             sheet,
             op: GridOp::InsertRow {
-                id: stamp(4),
+                id: stamp(6),
                 after: Some(row6),
             },
         },
@@ -426,21 +427,21 @@ fn line_formats_reach_jade_and_new_lines_take_them_as_in_jade() {
         &mut seq,
         XlsxOp::Structure {
             sheet,
+            // After D: outside the Excel table, whose new columns Excel names.
             op: GridOp::InsertColumn {
-                id: stamp(5),
-                after: Some(column_b),
+                id: stamp(7),
+                after: Some(column_d),
             },
         },
     );
-    assert_eq!(model.format(sheet, stamp(4), column_b), bold(true));
+    assert_eq!(model.format(sheet, stamp(6), column_b), bold(true));
     assert_eq!(
-        model.format(sheet, row3, stamp(5)).fill_color,
+        model.format(sheet, row3, stamp(7)).fill_color,
         Some("FFFF00".into())
     );
     let reopened = JadeXlsx::open(&jade.export().unwrap()).unwrap();
     assert_agree(&model, &reopened, "after export");
-    // Column B's format reaches far past the modelled rows; the column
-    // inserted after it is not part of it.
+    // Column B's format reaches far past the modelled rows.
     let far = |reference: &str| {
         reopened
             .workbook()
@@ -532,13 +533,13 @@ proptest! {
         for client in 0..3 {
             prop_assert_eq!(sim.client(client).view(), server.document());
         }
-        for r in 0..3 {
-            for c in 0..3 {
+        for (r, row) in rows.iter().enumerate() {
+            for (c, column) in columns.iter().enumerate() {
                 let expected = writes
                     .iter()
                     .filter(|(_, rs, cs, _)| rs.contains(&r) && cs.contains(&c))
                     .fold(FormatChange::default(), |under, (.., over)| common::overlay(&under, over));
-                let ours = server.document().format(sheet, rows[r], columns[c]);
+                let ours = server.document().format(sheet, *row, *column);
                 prop_assert_eq!(&ours, &expected);
                 let reference = format!("{}{}", jade_xlsx_collab::column_label(c as u32 + 1), r + 5);
                 let theirs = server.materializer().workbook().format_at("Operations", &reference).unwrap();

@@ -23,6 +23,6 @@ pub use jade_xlsx_headless_api::CellInput;
 pub use jade_xlsx_headless_editor::{BorderLine, BorderStyle, FormatChange};
 pub use jade_xlsx_reader::{HorizontalAlignment, VerticalAlignment};
 pub use model::{
-    column_label, parse_reference, LoadError, LoadOptions, RangeBorders, SheetView, XlsxEffect,
-    XlsxModel, XlsxOp,
+    column_label, parse_reference, LineAxis, LoadError, LoadOptions, RangeBorders, SheetView,
+    XlsxEffect, XlsxModel, XlsxOp,
 };

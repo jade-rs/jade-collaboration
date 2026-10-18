@@ -287,8 +287,8 @@ with jade by reusing jade's own reference shifter
 Notes and cell formats are convergent too. A note is a last-writer-wins
 register per cell, like a value. A format is one register per cell *and
 attribute* (bold, italic, underline, strike, font colour/size/name, fill,
-number format, horizontal/vertical alignment, wrap — exactly jade's
-`FormatChange`): jade's `set_format` is a partial change that keeps every
+number format, horizontal/vertical alignment, wrap, the border edges —
+exactly jade's `FormatChange`): jade's `set_format` is a partial change that keeps every
 attribute it does not name, so attributes are independent, concurrent
 changes to different attributes of one cell both survive, and each
 attribute converges to its newest write. jade is only told the attributes a
@@ -306,6 +306,47 @@ in a row another replica inserted concurrently or not depending on where
 the two land in the log, which a convergent operation must not depend on.
 The server realises it with one `set_format` per rectangle of cells that
 won the same attributes.
+
+**Borders** (jade-rs/jade-core#21 added them to jade's `set_format` and
+`format_at`) are five more attributes, one per edge — left, right, top,
+bottom and the diagonal — each a register holding the line's style *and*
+colour, plus one per diagonal direction. Style and colour share a
+register because they are one look: a newer automatic-colour line must
+not keep an older line's red. Different edges are different registers,
+so one person drawing a cell's top edge while another draws its left edge
+both survive. `SetBorders` is Excel's border dialog over a range — the
+outline, the lines inside, single edges, the diagonals — expanded into
+per-cell edges by each cell's place in the row and column lists the
+operation names (never by the grid it lands in), so it stays convergent;
+the server realises it with one `set_format` per rectangle of cells that
+won the same edges. Excel stores a border on each cell, so a line between
+two cells may be the bottom edge of one and the top edge of the other;
+like Excel, `SetBorders` draws an inside line on both sides and the
+outline only on the range's own cells. On structure edits the model
+follows jade, which here differs from Excel's default: Excel gives an
+inserted row the format of the row above ("Format Same As Above"), jade
+leaves it unformatted, so a row inserted inside a box is open on the
+sides — the model knows no format for its cells, as for any line made
+after a range was drawn. A deleted edge row takes its edge with it.
+Merging copies the anchor's edges into the covered cells, as jade (and
+Excel) copy the anchor's style; jade reports a merged cell's borders at
+the anchor, and so does the model.
+
+**Whole rows and columns** (Excel's `<row s=…>` / `<col style=…>`, which
+jade writes for `set_format` on `3:5` or `B:D`, together with every stored
+cell and row/column intersection on them) are registers per line and
+attribute, written by the convergent `SetLineFormat`. A cell shows, per
+attribute, the newest write among its own, its row's and its column's.
+jade only sees the writes that won their register, in log order, and a
+line write patches every cell of the line, so when it arrives the server
+puts back, cell by cell, the attributes where a newer cell or crossing
+line write shows; a cell write older than its row's or column's reaches
+jade not at all. Lines inserted later behave as in jade: a new row has no
+row format and shows its columns' formats, a new column shows its rows'
+(jade widens a multi-column `<col>` span around a column inserted inside
+it; the model does not claim that format, so the two never disagree on
+what it knows). A merge copies what shows at the anchor, its row's and
+column's formats included.
 
 jade reports a merged cell's format at the merge's anchor, so the model
 loads the file's merges into the sheet grid, which moves them exactly as
@@ -499,7 +540,9 @@ Tests are written first. Three layers:
    specification (RGA differential test), convergence of random concurrent
    histories across N replicas under random message scheduling, grid
    invariants under random structural operations, docx/xlsx/pptx model ↔
-   jade agreement after random edit sequences, a restarted server
+   jade agreement after random edit sequences, concurrent xlsx border,
+   cell, row and column formats ending — on every replica and in jade — at
+   the newest write per cell, edge and attribute, a restarted server
    indistinguishable from one that kept running and resuming within its
    kept tail exactly as one that never checkpointed, the journal reading
    back whatever was appended, checkpointed and torn and being synced as its
@@ -659,7 +702,9 @@ and deletions as jade moves them; docx formatting (character and paragraph)
 and comments (add, reply, resolve, delete; also comments loaded from the
 file) as sequenced operations on id ranges resolved in log order (§4); xlsx
 values, formulas (with rebasing), row/column structure, notes, cell
-formatting (per-attribute LWW, A1 ranges), merged cells and sheet
+formatting (per-attribute LWW, A1 ranges), cell borders (a register per
+edge; Excel's outline/inside lines over a range), whole-row and
+whole-column formats, merged cells and sheet
 management (add, rename, delete, move); pptx slide
 insert/delete/move/duplicate, text in shapes, group children and speaker
 notes, shape geometry, text boxes and shape deletion (hosted by the server,
@@ -682,8 +727,11 @@ Not yet:
   formatting a story's last paragraph while it is empty (it has no atom to
   name it by); editing comment text; comments in notes and headers.
   Headers and footers are not modelled.
-* xlsx borders, whole-row/column formats, conditional formats and threaded
-  comments; note authors are not modelled (jade records `jade`).
+* xlsx conditional formats and threaded comments; borders on whole rows
+  and columns through `set_borders` (`set_format` takes edges for them);
+  the formats a file already had are not loaded into the model, so reads
+  list only what was written in the collaboration; note authors are not
+  modelled (jade records `jade`).
 * docx structure of ragged and nested tables (their text is editable),
   rows/columns through merged regions, tracked changes; creating and
   deleting notes and text boxes; splitting or joining a text box's

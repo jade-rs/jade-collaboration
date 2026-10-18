@@ -6,7 +6,7 @@ use jade_collab_core::grid::{GridOp, Merge};
 use jade_collab_core::id::Id;
 use serde::{Deserialize, Serialize};
 
-use crate::model::{parse_reference, LoadOptions, RangeBorders, XlsxModel, XlsxOp};
+use crate::model::{parse_reference, LineAxis, LoadOptions, RangeBorders, XlsxModel, XlsxOp};
 use crate::{CellInput, FormatChange};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -47,6 +47,8 @@ pub enum XlsxIntent {
     /// Formats `range` (`B2:D5`, or one cell `B2`): the attributes `change`
     /// names, keeping the rest. The range is fixed to the cells it covers
     /// now, so a row another replica inserts into it meanwhile is left out.
+    /// Whole rows (`3:5`) or columns (`B:D`) are formatted as lines: every
+    /// cell they hold, also ones inserted later.
     SetFormat {
         sheet: String,
         range: String,
@@ -98,6 +100,40 @@ pub enum XlsxIntentError {
     NoSuchCell(String),
     #[error("{0} is an Excel table header: it holds the column's name, as text")]
     HeaderText(String),
+}
+
+/// The rows (`3:5`) or columns (`B:D`) a whole-line range names; `None`
+/// when `range` is not one.
+fn whole_lines(
+    rows: &[Id],
+    columns: &[Id],
+    range: &str,
+) -> Option<Result<(LineAxis, Vec<Id>), XlsxIntentError>> {
+    let (first, last) = range.split_once(':')?;
+    let (first, last) = (first.trim_start_matches('$'), last.trim_start_matches('$'));
+    let outside = || XlsxIntentError::NoSuchCell(range.to_string());
+    let span = |lines: &[Id], a: u32, b: u32| {
+        lines
+            .get(a.min(b) as usize..=a.max(b) as usize)
+            .map(<[Id]>::to_vec)
+            .ok_or_else(outside)
+    };
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+    let letters = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_alphabetic());
+    if digits(first) && digits(last) {
+        let number = |text: &str| text.parse::<u32>().ok().and_then(|n| n.checked_sub(1));
+        return Some(match (number(first), number(last)) {
+            (Some(a), Some(b)) => span(rows, a, b).map(|lines| (LineAxis::Rows, lines)),
+            _ => Err(outside()),
+        });
+    }
+    if letters(first) && letters(last) {
+        return Some(match (column_index(first), column_index(last)) {
+            (Some(a), Some(b)) => span(columns, a, b).map(|lines| (LineAxis::Columns, lines)),
+            _ => Err(outside()),
+        });
+    }
+    None
 }
 
 /// The rows and columns `range` (`B2:D5` or `B2`) covers, top-left first.
@@ -176,6 +212,16 @@ pub fn resolve(
             change,
         } => {
             let s = sheet_named(sheet)?;
+            if let Some(lines) = whole_lines(&s.rows, &s.columns, range) {
+                let (axis, lines) = lines?;
+                return Ok(XlsxOp::SetLineFormat {
+                    sheet: s.id,
+                    axis,
+                    lines,
+                    stamp: ids(1),
+                    change: change.clone(),
+                });
+            }
             let (rows, columns) = rectangle(&s.rows, &s.columns, range)?;
             XlsxOp::SetFormat {
                 sheet: s.id,

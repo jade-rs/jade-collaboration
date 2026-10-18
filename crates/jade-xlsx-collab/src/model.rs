@@ -58,6 +58,14 @@ struct Sheet {
     /// is left to jade: an attribute nobody wrote here is not modelled.
     #[serde(with = "pairs")]
     formats: BTreeMap<(Id, Id), CellFormat>,
+    /// Whole-row formats (Excel's `<row s=…>`), by row id, written through
+    /// the model. A cell shows, per attribute, the newest of its own, its
+    /// row's and its column's.
+    #[serde(default, with = "pairs")]
+    row_formats: BTreeMap<Id, CellFormat>,
+    /// Whole-column formats (`<col style=…>`), by column id.
+    #[serde(default, with = "pairs")]
+    column_formats: BTreeMap<Id, CellFormat>,
     /// Header and totals cells of Excel tables. Excel rewrites what is typed
     /// there (a blank header becomes "Column1"), so they are read-only.
     protected: BTreeSet<(Id, Id)>,
@@ -185,6 +193,45 @@ impl CellFormat {
             }};
         }
         each_attribute!(inherit)
+    }
+
+    /// Per attribute, the newest write among `layers` — a cell's own
+    /// registers, its row's and its column's.
+    fn newest(layers: &[Option<&CellFormat>]) -> CellFormat {
+        let mut merged = CellFormat::default();
+        for layer in layers.iter().flatten() {
+            macro_rules! merge {
+                ($($name:ident),*) => {{
+                    $(merged.$name.merge(&layer.$name);)*
+                }};
+            }
+            each_attribute!(merge);
+        }
+        merged
+    }
+
+    /// The known attributes whose newest write is the one stamped `stamp`.
+    fn written_by(&self, stamp: Id) -> FormatChange {
+        macro_rules! written {
+            ($($name:ident),*) => {
+                FormatChange { $($name: self.$name
+                    .get()
+                    .cloned()
+                    .flatten()
+                    .filter(|_| self.$name.stamp() == Some(stamp)),)* }
+            };
+        }
+        each_attribute!(written)
+    }
+
+    /// The attributes of `change` that `mask` names.
+    fn only(change: &FormatChange, mask: &FormatChange) -> FormatChange {
+        macro_rules! only {
+            ($($name:ident),*) => {
+                FormatChange { $($name: change.$name.clone().filter(|_| mask.$name.is_some()),)* }
+            };
+        }
+        each_attribute!(only)
     }
 
     /// The known attributes written after `stamp`.
@@ -388,7 +435,43 @@ fn rectangles(sheet: &str, cells: BTreeMap<(usize, usize), FormatChange>) -> Vec
         .collect()
 }
 
+/// Lines and the attributes each won, as one `set_format` per run of
+/// consecutive lines that won the same: `3:5`, `B:D`.
+fn line_runs(sheet: &str, axis: LineAxis, lines: BTreeMap<usize, FormatChange>) -> Vec<XlsxEffect> {
+    let mut runs: Vec<(usize, usize, FormatChange)> = Vec::new();
+    for (at, change) in lines {
+        match runs.last_mut() {
+            Some((_, last, previous)) if *last + 1 == at && *previous == change => *last = at,
+            _ => runs.push((at, at, change)),
+        }
+    }
+    runs.into_iter()
+        .map(|(first, last, change)| {
+            let label = |at: usize| match axis {
+                LineAxis::Rows => (at + 1).to_string(),
+                LineAxis::Columns => column_label(at as u32),
+            };
+            XlsxEffect::SetFormat {
+                sheet: sheet.to_string(),
+                range: format!("{}:{}", label(first), label(last)),
+                change,
+            }
+        })
+        .collect()
+}
+
 impl Sheet {
+    /// What shows at `(row, column)` itself (not its merge anchor): per
+    /// attribute, the newest of the cell's, its row's and its column's
+    /// writes.
+    fn effective(&self, row: Id, column: Id) -> CellFormat {
+        CellFormat::newest(&[
+            self.formats.get(&(row, column)),
+            self.row_formats.get(&row),
+            self.column_formats.get(&column),
+        ])
+    }
+
     /// `B3` for a cell in alive lines.
     fn reference(&self, row: Id, column: Id) -> Option<String> {
         let r = self.grid.row_index(row)?;
@@ -508,6 +591,14 @@ pub struct SheetView {
     pub columns: Vec<Id>,
 }
 
+/// Which lines a [`XlsxOp::SetLineFormat`] formats.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LineAxis {
+    Rows,
+    Columns,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum XlsxOp {
@@ -556,6 +647,17 @@ pub enum XlsxOp {
         columns: Vec<Id>,
         stamp: Id,
         borders: RangeBorders,
+    },
+    /// Convergent: whole rows or columns (Excel's `<row s=…>` /
+    /// `<col style=…>`), every cell they hold now or later, as a register
+    /// per line and attribute. A cell shows, per attribute, the newest of
+    /// its own, its row's and its column's writes.
+    SetLineFormat {
+        sheet: Id,
+        axis: LineAxis,
+        lines: Vec<Id>,
+        stamp: Id,
+        change: FormatChange,
     },
     /// Sequenced: merge a rectangle (no overlap with another merge or an
     /// Excel table). As in Excel the top-left value stays and the others are
@@ -743,6 +845,8 @@ impl XlsxModel {
                 cells: BTreeMap::new(),
                 notes: BTreeMap::new(),
                 formats: BTreeMap::new(),
+                row_formats: BTreeMap::new(),
+                column_formats: BTreeMap::new(),
                 protected: BTreeSet::new(),
                 tables: Vec::new(),
                 visible: true,
@@ -950,10 +1054,8 @@ impl XlsxModel {
         let Some(s) = self.sheets.iter().find(|s| s.id == sheet) else {
             return FormatChange::default();
         };
-        s.formats
-            .get(&s.format_anchor(row, column))
-            .map(CellFormat::current)
-            .unwrap_or_default()
+        let (row, column) = s.format_anchor(row, column);
+        s.effective(row, column).current()
     }
 
     /// The cells of `sheet`'s current grid that show attributes written
@@ -994,6 +1096,30 @@ impl XlsxModel {
                 )
             })
             .filter(|(_, format)| !format.is_empty())
+            .collect()
+    }
+
+    /// The whole-row (`3`) or whole-column (`B`) formats of `sheet`'s
+    /// current grid written through the model, in order.
+    pub fn line_formats(&self, sheet: Id, axis: LineAxis) -> Vec<(String, FormatChange)> {
+        let Some(s) = self.sheets.iter().find(|s| s.id == sheet) else {
+            return Vec::new();
+        };
+        let (lines, formats) = match axis {
+            LineAxis::Rows => (s.grid.rows(), &s.row_formats),
+            LineAxis::Columns => (s.grid.columns(), &s.column_formats),
+        };
+        lines
+            .iter()
+            .enumerate()
+            .filter_map(|(at, line)| {
+                let format = formats.get(line)?.current();
+                let label = match axis {
+                    LineAxis::Rows => (at + 1).to_string(),
+                    LineAxis::Columns => column_label(at as u32),
+                };
+                (!format.is_empty()).then_some((label, format))
+            })
             .collect()
     }
 
@@ -1198,11 +1324,17 @@ impl XlsxModel {
                 if change.is_empty() {
                     continue;
                 }
-                let attributes = sheet
+                let own = sheet
                     .formats
                     .entry((*row, *column))
                     .or_default()
                     .apply(stamp, &change);
+                // A newer row or column write still shows over it.
+                let attributes = if own.is_empty() {
+                    own
+                } else {
+                    sheet.effective(*row, *column).written_by(stamp)
+                };
                 let at = sheet
                     .grid
                     .row_index(*row)
@@ -1216,6 +1348,73 @@ impl XlsxModel {
             return Ok(Vec::new());
         }
         Ok(rectangles(&sheet.name, won))
+    }
+
+    fn set_line_format(
+        &mut self,
+        sheet: Id,
+        axis: LineAxis,
+        lines: &[Id],
+        stamp: Id,
+        change: &FormatChange,
+    ) -> Result<Vec<XlsxEffect>, Rejection> {
+        let index = self.sheet_index(sheet)?;
+        let change = canonical_format(change)?;
+        let s = &self.sheets[index];
+        let known = |line: &Id| match axis {
+            LineAxis::Rows => s.grid.contains_row(*line),
+            LineAxis::Columns => s.grid.contains_column(*line),
+        };
+        if lines.is_empty() || !lines.iter().all(known) {
+            return Err(reject("no such row or column"));
+        }
+        self.max_lamport = self.max_lamport.max(stamp.lamport);
+        let sheet = &mut self.sheets[index];
+        // Alive lines by index, with the attributes they won.
+        let mut won = BTreeMap::new();
+        for line in lines {
+            let (registers, at) = match axis {
+                LineAxis::Rows => (
+                    sheet.row_formats.entry(*line).or_default(),
+                    sheet.grid.row_index(*line),
+                ),
+                LineAxis::Columns => (
+                    sheet.column_formats.entry(*line).or_default(),
+                    sheet.grid.column_index(*line),
+                ),
+            };
+            let attributes = registers.apply(stamp, &change);
+            if let (false, Some(at)) = (attributes.is_empty(), at) {
+                won.insert(at, attributes);
+            }
+        }
+        if sheet.deleted {
+            return Ok(Vec::new());
+        }
+        // jade formats every cell of the line, so the cells where a newer
+        // write — their own or the crossing line's — shows get it back.
+        let (rows, columns) = (sheet.grid.rows(), sheet.grid.columns());
+        let mut restore = BTreeMap::new();
+        for (at, attributes) in &won {
+            let across = match axis {
+                LineAxis::Rows => &columns,
+                LineAxis::Columns => &rows,
+            };
+            for (k, other) in across.iter().enumerate() {
+                let (row, column, cell) = match axis {
+                    LineAxis::Rows => (rows[*at], *other, (*at, k)),
+                    LineAxis::Columns => (*other, columns[*at], (k, *at)),
+                };
+                let newer =
+                    CellFormat::only(&sheet.effective(row, column).newer_than(stamp), attributes);
+                if !newer.is_empty() {
+                    restore.insert(cell, newer);
+                }
+            }
+        }
+        let mut effects = line_runs(&sheet.name, axis, won);
+        effects.extend(rectangles(&sheet.name, restore));
+        Ok(effects)
     }
 
     fn structure(
@@ -1542,7 +1741,8 @@ impl XlsxModel {
         let s = &mut self.sheets[index];
         s.grid = grid;
         let anchor = (merge.top, merge.left);
-        let anchor_format = s.formats.get(&anchor).cloned().unwrap_or_default();
+        // What shows at the anchor, its row's and column's formats included.
+        let anchor_format = s.effective(anchor.0, anchor.1);
         // After jade's merge, put back what was written after it.
         let mut restore = Vec::new();
         let mut formats = BTreeMap::new();
@@ -1562,9 +1762,13 @@ impl XlsxModel {
                         value: value.clone(),
                     });
                 }
-                let format = s.formats.entry(cell).or_default();
-                format.inherit(stamp, &anchor_format);
-                let newer = format.newer_than(stamp);
+                s.formats
+                    .entry(cell)
+                    .or_default()
+                    .inherit(stamp, &anchor_format);
+                // A newer write — the cell's, its row's or its column's —
+                // still shows over what jade's merge copied.
+                let newer = s.effective(*row, *column).newer_than(stamp);
                 if !newer.is_empty() {
                     let at = (
                         s.grid.row_index(*row).expect("alive"),
@@ -1659,6 +1863,8 @@ impl XlsxModel {
                 cells: BTreeMap::new(),
                 notes: BTreeMap::new(),
                 formats: BTreeMap::new(),
+                row_formats: BTreeMap::new(),
+                column_formats: BTreeMap::new(),
                 protected: BTreeSet::new(),
                 tables: Vec::new(),
                 visible: true,
@@ -1792,9 +1998,10 @@ impl Document for XlsxModel {
             | XlsxOp::Derived { .. } => Lane::Sequenced,
             // Id-keyed last-writer-wins registers (per attribute for
             // formats) commute and do not depend on the log position.
-            XlsxOp::SetNote { .. } | XlsxOp::SetFormat { .. } | XlsxOp::SetBorders { .. } => {
-                Lane::Convergent
-            }
+            XlsxOp::SetNote { .. }
+            | XlsxOp::SetFormat { .. }
+            | XlsxOp::SetBorders { .. }
+            | XlsxOp::SetLineFormat { .. } => Lane::Convergent,
         }
     }
 
@@ -1829,6 +2036,13 @@ impl Document for XlsxModel {
                 stamp,
                 borders,
             } => self.set_borders(*sheet, rows, columns, *stamp, borders),
+            XlsxOp::SetLineFormat {
+                sheet,
+                axis,
+                lines,
+                stamp,
+                change,
+            } => self.set_line_format(*sheet, *axis, lines, *stamp, change),
             XlsxOp::MergeCells {
                 sheet,
                 merge,

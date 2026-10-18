@@ -329,9 +329,9 @@ fn edits() -> Value {
                     "sheet": sheet(),
                     "reference": string("The cell (`B3`)."),
                 }), &["sheet", "reference"]),
-                edit("set_format", "xlsx: format a cell or range; each attribute is last-writer-wins.", json!({
+                edit("set_format", "xlsx: format a cell, a range, or whole rows or columns; each attribute is last-writer-wins, and a cell shows the newest of its own, its row's and its column's.", json!({
                     "sheet": sheet(),
-                    "range": string("`B2` or `B2:D5`."),
+                    "range": string("`B2` or `B2:D5`; whole rows `3:5` or columns `B:D` (also the cells they get later)."),
                     "change": xlsx_format_change(),
                 }), &["sheet", "range", "change"]),
                 edit("set_borders", "xlsx: draw border lines over a range (outline, inside lines, single edges, diagonals); each cell's edge is last-writer-wins.", json!({
@@ -574,9 +574,17 @@ fn tools() -> Vec<Tool> {
                         },
                         "formats": {
                             "type": "object",
-                            "description": "A1 reference → the format attributes written through this collaboration (as set_format takes them, borders included; a merged cell shows its anchor's). Formats the file already had are not listed.",
+                            "description": "A1 reference → the format attributes written through this collaboration that show at the cell (as set_format takes them, borders included; its row's and column's formats count, a merged cell shows its anchor's). Listed for cells formatted on their own or merged; formats the file already had are not listed.",
                         },
-                    }), &["name", "rows", "columns", "cells", "formats"]),
+                        "row_formats": {
+                            "type": "object",
+                            "description": "Row number (`3`) → the whole-row format written through this collaboration.",
+                        },
+                        "column_formats": {
+                            "type": "object",
+                            "description": "Column letter (`B`) → the whole-column format written through this collaboration.",
+                        },
+                    }), &["name", "rows", "columns", "cells", "formats", "row_formats", "column_formats"]),
                 },
                 "slide_count": integer("pptx: how many slides there are."),
                 "slides": {
