@@ -497,3 +497,43 @@ fn typing_where_a_note_is_added_concurrently_lands_beside_it() {
         }
     }
 }
+
+/// A deletion can bring two anchors together while text typed after the
+/// deleted character is on its way: the text lands between them, which
+/// jade's typing cannot write — its insert_text_among_anchors can (found by
+/// the session property test).
+#[test]
+fn text_typed_between_two_anchors_brought_together_is_written() {
+    let (mut model, mut jade) = open("footnote.docx");
+    // "Hello" ¹ → "Hell" ⁿ "o" ¹.
+    edit(&mut model, &mut jade, insert_footnote(0, 4, "n"));
+    let p = model.paragraphs();
+    let o = p[0].chars[4];
+    commit(
+        &mut model,
+        &mut jade,
+        DocxOp::DeleteText {
+            story: StoryId::Body,
+            ids: vec![o],
+        },
+    );
+    // Typed right after the "o" by someone who had not seen it go.
+    let first = Id::new(model.max_lamport() + 1, ReplicaId(2));
+    commit(
+        &mut model,
+        &mut jade,
+        DocxOp::InsertText {
+            story: StoryId::Body,
+            parent: Some(o),
+            first,
+            text: "x".into(),
+        },
+    );
+    let number = model
+        .note_id(model.paragraphs()[1].story)
+        .unwrap()
+        .to_string();
+    assert_eq!(layout(&model, 0), format!("Hell[{number}]x[1]"));
+    let (again, _) = reloaded(&jade);
+    assert_eq!(layouts(&again), layouts(&model));
+}
