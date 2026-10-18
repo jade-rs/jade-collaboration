@@ -204,10 +204,10 @@ jade's parsed body.
 | Crate | Role |
 | --- | --- |
 | `jade-collab-core` | identifiers, Lamport clock, RGA (+ executable spec), LWW register, table grid |
-| `jade-collab-sync` | `Document` trait, lanes, wire protocol, `Sequencer` (server core), `Replica` (client core), deterministic network simulator |
+| `jade-collab-sync` | `Document` trait, lanes, wire protocol, `Sequencer` (server core, with checkpoints, journal records and replay), `Replica` (client core), deterministic network simulator |
 | `jade-docx-collab` | docx model + operations, loading from a jade `WordDocument`, materialization to `HeadlessCommand`s, index-addressed intent API (migrated from jade-core) |
 | `jade-xlsx-collab` | xlsx model + operations, loading from / materializing into a jade `HeadlessWorkbook` |
-| `jade-collab-server` | WebSocket server (one actor thread per document, since jade documents are `!Send`), WebSocket client, `jade-collab` CLI |
+| `jade-collab-server` | WebSocket server (one actor thread per document, since jade documents are `!Send`), document storage, bearer tokens, presence relay, WebSocket client, `jade-collab` CLI |
 
 ## 7. Verification strategy
 
@@ -222,18 +222,73 @@ Tests are written first. Three layers:
 2. **Property-based tests** (`proptest`) — the implementation against the
    specification (RGA differential test), convergence of random concurrent
    histories across N replicas under random message scheduling, grid
-   invariants under random structural operations, and docx/xlsx model ↔ jade
-   agreement after random edit sequences.
+   invariants under random structural operations, docx/xlsx model ↔ jade
+   agreement after random edit sequences, a restarted server indistinguishable
+   from one that kept running, the journal reading back whatever was appended,
+   checkpointed and torn, only configured tokens being accepted, and presence
+   settling on everyone's latest state.
 3. **Example tests** — protocol edge cases, real fixtures through jade, and an
    end-to-end WebSocket session with a human-like and an agent-like client.
 
-## 8. Status and next steps
+## 8. Durability, access and presence
+
+### Durable documents
+
+A server with a storage directory keeps, per document, the newest
+**checkpoint** and a **journal** of what happened after it:
+
+```
+<dir>/<name>/snapshot-<n>.json    {"format": "docx", "checkpoint": {seq, processed, next_replica, faults, document}}
+<dir>/<name>/snapshot-<n>.docx    the file jade exported at that seq
+<dir>/<name>/log-<n>.jsonl        one record per line: joined | committed | rejected
+```
+
+The checkpoint holds the *model*, not just the file. Model identifiers are
+minted when a file is loaded, so a model derived again from the exported
+file would not match the identifiers every replica holds. Restoring loads the
+model from the checkpoint and the file into the materializer, then replays the
+journal (`Sequencer::restore`, `Sequencer::replay`). The journal records
+joins (so replica ids are never reused), commits and rejections (a rejection
+moves the replica's processed client sequence number, which is what a resume
+reports). Each record is appended before anyone hears of it, so no replica can
+be ahead of the disk; a torn last line is dropped.
+
+Every `checkpoint_every` records a new generation is written (file, empty
+journal, then the `.json`, which is the commit point), older ones are removed
+and the in-memory log is compacted. A replica further behind than the
+checkpoint cannot resume and is told to join again (`rejoin`). A property
+test runs two simulated sessions side by side, one whose server restarts from
+what is on disk and one whose clients merely reconnect, and requires them to
+agree at every step.
+
+### Access control
+
+With a token list, every HTTP route and the WebSocket require a bearer token
+(`Authorization: Bearer …` or `?token=…`, since browsers cannot set headers on
+a WebSocket). A token grants a name and a role. A viewer joins, reads and
+follows the log, but its connection answers each of its submissions with a
+rejection itself, so nothing a viewer sends reaches the sequencer or the
+journal.
+
+### Presence
+
+`presence {state}` carries arbitrary JSON (a cursor, a selection) and is
+relayed to the other replicas of the document as
+`presence {replica, name?, state}`, with `presence_left {replica}` when a
+connection closes or the replica resumes elsewhere. The document's thread
+keeps the latest presence in memory for newcomers. Presence never touches the
+sequencer, the log or the disk. Because it shares the per-connection channel
+with commits, it cannot reorder them.
+
+## 9. Status and next steps
 
 Working: the two-lane protocol over WebSockets; docx text, paragraph
 split/join, table insertion/deletion and row/column structure on simple
 tables, text in any table cell; xlsx values, formulas (with rebasing), and
 row/column structure; index/A1-addressed intent APIs for people and agents;
-the `jade-collab` CLI; resume after a disconnect.
+the `jade-collab` CLI; resume after a disconnect; durable documents with
+checkpoints and log compaction; bearer-token authentication with editor and
+viewer roles; presence.
 
 Not yet:
 
@@ -244,8 +299,12 @@ Not yet:
   boxes, notes, comments, tracked changes.
 * xlsx merges, sheets added/renamed, Excel table structure.
 * An MCP server so agents join as replicas without a shell.
-* Persistence of the log (today: export on demand, `--save` on exit),
-  snapshots and log compaction, authentication and authorization, presence.
+* Durability and access, beyond what §8 covers: per-document permissions
+  (a token is valid for every document), token rotation without a restart,
+  an fsync per journal record (records are written to the OS at once; only
+  checkpoints are fsynced), keeping a tail of the log after a checkpoint so
+  that briefly disconnected replicas need not rejoin, and limits on the size
+  and rate of presence updates.
 * Performance: RGA lookups are linear and paragraph positions are recomputed
   by walking the model on each operation; jade's xlsx editor rereads the
   workbook on every write. Fine for the first milestone, not for large
