@@ -436,3 +436,90 @@ async fn documents_with_unsafe_names_are_refused() {
     }
     assert!(files(dir.path()).is_empty());
 }
+
+/// The bold characters of the second body paragraph of a written file.
+fn bold_in_second_paragraph(bytes: &[u8]) -> String {
+    let jade = JadeDocx::load(bytes).unwrap();
+    let surface = jade.body_surfaces()[1];
+    jade.word()
+        .paragraph(surface)
+        .unwrap()
+        .runs
+        .iter()
+        .filter(|r| r.properties.as_ref().and_then(|p| p.bold) == Some(true))
+        .map(|r| r.text.clone())
+        .collect()
+}
+
+fn edit(client: &Client<DocxModel>, op: IntentOp) {
+    let ops = resolve(&client.view(), &op, &mut |n| client.reserve(n)).unwrap();
+    for op in ops {
+        client.submit(op).unwrap();
+    }
+}
+
+/// Character formatting is a set of marks in the model; a checkpoint keeps
+/// them in the model and the file without them, so a restarted server
+/// writes the same file, and text typed next to a mark afterwards follows
+/// the mark's expand rule rather than a bold run baked into the file.
+#[tokio::test(flavor = "multi_thread")]
+async fn marks_survive_a_restart_and_keep_their_expand_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = StorageOptions {
+        checkpoint_every: 1,
+        ..StorageOptions::default()
+    };
+    let server = Server::with_storage_options(dir.path(), options).unwrap();
+    server.open("hello.docx", fixture("hello.docx")).unwrap();
+    let (base, task) = listen(&server).await;
+    let url = format!("{base}/hello.docx/ws");
+    let writer: Client<DocxModel> = Client::connect(&url, None).await.unwrap();
+    assert_eq!(writer.view().paragraph_texts()[1], "World");
+    edit(
+        &writer,
+        IntentOp::Format {
+            start_paragraph: 1,
+            start_offset: 0,
+            end_paragraph: 1,
+            end_offset: 3,
+            change: jade_docx_collab::FormatChange::Bold { value: true },
+        },
+    );
+    writer.settle().await.unwrap();
+    catch_up(&server, "hello.docx", &writer).await;
+    let before = server.export("hello.docx").await.unwrap();
+    assert_eq!(bold_in_second_paragraph(&before), "Wor");
+    let writer = writer.disconnect().await;
+    task.abort();
+    drop(server);
+
+    let server = Server::with_storage_options(dir.path(), options).unwrap();
+    assert_eq!(server.export("hello.docx").await.unwrap(), before);
+    let (base, _task) = listen(&server).await;
+    let writer = Client::resume(&format!("{base}/hello.docx/ws"), writer, None)
+        .await
+        .unwrap();
+    // Right before the bold text, at the paragraph's start, and right after it.
+    edit(
+        &writer,
+        IntentOp::InsertText {
+            paragraph: 1,
+            offset: 0,
+            text: "x".into(),
+        },
+    );
+    edit(
+        &writer,
+        IntentOp::InsertText {
+            paragraph: 1,
+            offset: 4,
+            text: "y".into(),
+        },
+    );
+    writer.settle().await.unwrap();
+    catch_up(&server, "hello.docx", &writer).await;
+    assert_eq!(writer.view().paragraph_texts()[1], "xWoryld");
+    let after = server.export("hello.docx").await.unwrap();
+    assert_eq!(bold_in_second_paragraph(&after), "Wory");
+    assert!(server.faults("hello.docx").await.unwrap().is_empty());
+}
