@@ -98,6 +98,7 @@ pub fn overlay(under: &FormatChange, over: &FormatChange) -> FormatChange {
 /// and every format attribute the model records (jade's `format_at`, which
 /// reports a merged cell's anchor, as Excel shows it).
 pub fn assert_agree(model: &XlsxModel, jade: &JadeXlsx, context: &str) {
+    assert_merges_agree(model, jade, context);
     for sheet in model.sheets() {
         for (r, row) in sheet.rows.iter().enumerate() {
             for (c, column) in sheet.columns.iter().enumerate() {
@@ -150,6 +151,68 @@ pub fn assert_agree(model: &XlsxModel, jade: &JadeXlsx, context: &str) {
             }
         }
     }
+}
+
+/// (top, left, bottom, right) zero-based indices of a merged range.
+pub type Region = (usize, usize, usize, usize);
+
+/// The model's merged ranges of each sheet, as jade's are: the same ranges
+/// (jade's clipped to the part of the sheet the model covers).
+pub fn assert_merges_agree(model: &XlsxModel, jade: &JadeXlsx, context: &str) {
+    for sheet in model.sheets() {
+        let index = |lines: &[Id], id: Id| lines.iter().position(|l| *l == id).unwrap();
+        let mut ours: Vec<Region> = model
+            .merges(sheet.id)
+            .iter()
+            .map(|m| {
+                (
+                    index(&sheet.rows, m.top),
+                    index(&sheet.columns, m.left),
+                    index(&sheet.rows, m.bottom),
+                    index(&sheet.columns, m.right),
+                )
+            })
+            .collect();
+        ours.sort();
+        let mut theirs: Vec<Region> = jade_merges(jade, &sheet.name)
+            .into_iter()
+            .filter(|m| m.0 < sheet.rows.len() && m.1 < sheet.columns.len())
+            .map(|(t, l, b, r)| {
+                (
+                    t,
+                    l,
+                    b.min(sheet.rows.len() - 1),
+                    r.min(sheet.columns.len() - 1),
+                )
+            })
+            .filter(|(t, l, b, r)| (t, l) != (b, r))
+            .collect();
+        theirs.sort();
+        assert_eq!(ours, theirs, "{context}: merges of {}", sheet.name);
+    }
+}
+
+/// jade's merged ranges of a sheet.
+pub fn jade_merges(jade: &JadeXlsx, sheet: &str) -> Vec<Region> {
+    jade.workbook()
+        .workbook()
+        .sheets
+        .iter()
+        .find(|s| s.name == sheet)
+        .map(|s| {
+            s.merges
+                .iter()
+                .map(|m| {
+                    (
+                        m.start.row as usize,
+                        m.start.column as usize,
+                        m.end.row as usize,
+                        m.end.column as usize,
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The number of format attributes [`set_attribute`] knows.
@@ -225,6 +288,30 @@ pub fn generate(view: &XlsxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
     let sheet = &sheets[pick(sheets.len(), 4)];
     let row = sheet.rows[pick(sheet.rows.len(), 12)];
     let column = sheet.columns[pick(sheet.columns.len(), 20)];
+    // Half the time a structural change goes through a merge: a line just
+    // above (left of) one, inside it, or its last line.
+    let merges = view.merges(sheet.id);
+    let through = (pick(2, 56) == 0)
+        .then(|| merges.get(pick(merges.len(), 58)))
+        .flatten();
+    let near = |lines: &[Id], first: Id, last: Id, fallback: Id| {
+        let a = lines.iter().position(|l| *l == first);
+        let b = lines.iter().position(|l| *l == last);
+        match (a, b) {
+            (Some(a), Some(b)) => {
+                let from = a.saturating_sub(1);
+                lines[from + pick(b - from + 1, 60)]
+            }
+            _ => fallback,
+        }
+    };
+    let (row, column) = match through {
+        Some(m) => (
+            near(&sheet.rows, m.top, m.bottom, row),
+            near(&sheet.columns, m.left, m.right, column),
+        ),
+        None => (row, column),
+    };
     let a1 = |salt: u32| {
         format!(
             "{}{}",

@@ -120,11 +120,25 @@ positions).
   leaves a valid grid.
 - `check_iff_valid`: the executable `check` (the loops of `check_invariants`)
   decides `Valid`.
+- Rows and columns through merged regions, as in Word and Excel, stated on
+  the cells a merge covers (`between`, `covers`, `Holds`):
+  `insertRow_covers` / `insertCol_covers` — merges keep their corners, every
+  other line is inside or outside each merge as before, and the new line is
+  inside a merge exactly when inserted after one of its lines other than the
+  last (strictly inside: the merge grows; at its edge: it does not);
+  `deleteRow_covers` / `deleteCol_covers` — a surviving merge covers exactly
+  its old alive cells minus the deleted line (an edge moves inward;
+  `aliveSpan_bounds`, `normalizeOne_holds`), and a merge is dropped exactly
+  when fewer than two cells are left between its corners
+  (`normalizeOne_none`, via `cnt_aliveSpan`).
+- `mergeAt_spec`: `mergeAt` (`Grid::merge_at`) returns the merge covering an
+  alive cell; in a valid grid there is at most one.
 - `sanity_*`: the unit tests of `crates/jade-collab-core/tests/grid.rs`,
   evaluated by `decide` (insert after an anchor, deleted rows still anchor
   inserts, last row/column kept, overlapping and malformed merges rejected,
   deleting an anchor row shrinks a merge and a one-cell merge disappears,
-  unmerge, the naive union of two merges is invalid).
+  unmerge, the naive union of two merges is invalid, rows and columns
+  inserted inside or at the edge of a merge, edges moving inward).
 
 ### `JadeCollab/CellCommute.lean`: cell contents are convergent
 
@@ -166,7 +180,7 @@ a visible mark, delete a table.
 ## `grid-oracle`
 
 `lake build` also builds `.lake/build/bin/grid-oracle` (`GridOracle.lean`),
-which runs the same `apply` and `check` as `Grid.lean` on a line protocol, for
+which runs the same `apply`, `check` and `mergeAt` as `Grid.lean` on a line protocol, for
 differential testing against the Rust `Grid`:
 
 ```
@@ -183,7 +197,8 @@ u <top> <left>                     Unmerge
 It prints `ok` or `err` per operation, then `rows <id>:<1|0> ...` and
 `cols <id>:<1|0> ...` (every line ever inserted, in order, with its alive
 flag), `merges <top>,<left>,<bottom>,<right> ...` (in list order; the bare word
-when there are none) and `valid` or `invalid`. A malformed line is reported on
+when there are none), `cover <row>,<col>=<top>,<left> ...` (`mergeAt` of every
+alive cell a merge covers, row by row) and `valid` or `invalid`. A malformed line is reported on
 stderr with exit code 2.
 
 ```sh
@@ -194,6 +209,7 @@ ok
 rows 1:0 2:1 3:0
 cols 101:1
 merges
+cover
 valid
 ```
 

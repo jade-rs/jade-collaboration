@@ -288,23 +288,8 @@ impl Sheet {
     /// it, a deleted corner moves to the next line, a merge left with one
     /// cell is gone.
     fn format_anchor(&self, row: Id, column: Id) -> (Id, Id) {
-        let (Some(r), Some(c)) = (self.grid.row_index(row), self.grid.column_index(column)) else {
-            return (row, column);
-        };
-        let span = |first: Option<usize>, last: Option<usize>, at: usize| {
-            first.zip(last).is_some_and(|(a, b)| a <= at && at <= b)
-        };
         self.grid
-            .merges()
-            .iter()
-            .find(|m| {
-                span(self.grid.row_index(m.top), self.grid.row_index(m.bottom), r)
-                    && span(
-                        self.grid.column_index(m.left),
-                        self.grid.column_index(m.right),
-                        c,
-                    )
-            })
+            .merge_at(row, column)
             .map_or((row, column), |m| (m.top, m.left))
     }
 }
@@ -393,7 +378,9 @@ pub enum XlsxOp {
         stamp: Id,
         value: CellInput,
     },
-    /// Sequenced: insert or delete a row or column.
+    /// Sequenced: insert or delete a row or column. Merged ranges move as
+    /// in Excel: a line inserted strictly inside one joins it, a deleted
+    /// edge moves inward, a range left with one cell is no merge.
     Structure { sheet: Id, op: GridOp },
     /// Convergent: the cell's note, a last-writer-wins register like a
     /// value; `None` (or empty text) deletes it.

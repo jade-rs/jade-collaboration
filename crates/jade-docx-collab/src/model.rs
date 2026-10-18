@@ -196,18 +196,17 @@ impl Table {
         self.layout.insert((row, column), vec![key]);
     }
 
+    /// A cell a merge covers: its story exists (an edit made before the
+    /// merge was seen still lands somewhere) but no position shows it.
+    fn add_hidden_cell(&mut self, row: Id, column: Id) {
+        self.stories
+            .insert(StoryKey::Cell(row, column), Story::empty_paragraph());
+    }
+
     /// Alive (row, column) positions of `merge`, row by row.
     fn positions(&self, merge: &Merge) -> Vec<(Id, Id)> {
-        let between = |lines: Vec<Id>, first: Id, last: Id| {
-            let a = lines.iter().position(|l| *l == first);
-            let b = lines.iter().position(|l| *l == last);
-            match (a, b) {
-                (Some(a), Some(b)) if a <= b => lines[a..=b].to_vec(),
-                _ => Vec::new(),
-            }
-        };
-        let rows = between(self.grid.rows(), merge.top, merge.bottom);
-        let columns = between(self.grid.columns(), merge.left, merge.right);
+        let rows = lines_between(&self.grid.rows(), merge.top, merge.bottom);
+        let columns = lines_between(&self.grid.columns(), merge.left, merge.right);
         rows.iter()
             .flat_map(|r| columns.iter().map(move |c| (*r, *c)))
             .collect()
@@ -227,6 +226,16 @@ impl Table {
                 ))
             })
             .collect()
+    }
+}
+
+/// The lines of `lines` from `first` through `last`, in order.
+fn lines_between(lines: &[Id], first: Id, last: Id) -> Vec<Id> {
+    let a = lines.iter().position(|l| *l == first);
+    let b = lines.iter().position(|l| *l == last);
+    match (a, b) {
+        (Some(a), Some(b)) if a <= b => lines[a..=b].to_vec(),
+        _ => Vec::new(),
     }
 }
 
@@ -639,7 +648,13 @@ pub enum DocxOp {
         rows: Vec<Id>,
         columns: Vec<Id>,
     },
-    /// Sequenced. Row and column structure of a top-level table.
+    /// Sequenced. Row and column structure of a top-level table. Rows and
+    /// columns go through merged cells as in Word: a line inserted strictly
+    /// inside a merge joins it (its cells there are covered, a vertical
+    /// merge's new follower is empty), a deleted edge line moves the edge
+    /// inward — deleting the top row deletes what the merged cell shows,
+    /// deleting the left column keeps it — and a merge left with one cell is
+    /// an ordinary cell.
     Table { table: Id, op: GridOp },
     /// Sequenced. Merges a rectangle of cells as Word and jade do: the
     /// top-left cell shows every covered cell's content, row by row; each
@@ -1509,57 +1524,76 @@ impl DocxModel {
                 "merge and unmerge cells with merge_cells / unmerge_cells",
             ));
         }
-        // Rows and columns stay clear of merged regions: jade would have to
-        // split or grow the merge, which the model does not follow.
+        // Rows and columns go through merged regions as in Word and jade: a
+        // line inserted strictly inside a merge joins it, a deleted edge
+        // moves inward, a merge left with one cell is gone (the grid; Lean:
+        // `Grid.insertRow_covers`, `Grid.deleteRow_covers`).
         let mut grid = table.grid.clone();
         let deleted_at = match op {
             GridOp::DeleteRow { id } => table.grid.row_index(*id),
             GridOp::DeleteColumn { id } => table.grid.column_index(*id),
             _ => None,
         };
+        // A merged cell's `w:tc` sits in its left column; deleting that
+        // column leaves the `w:tc` (one column narrower) in the next one, so
+        // what the merged cell and its followers show moves there.
+        let moved: Vec<(Id, Id, Vec<Id>)> = match op {
+            GridOp::DeleteColumn { id } => table
+                .grid
+                .merges()
+                .iter()
+                .filter(|m| m.left == *id)
+                .filter_map(|m| {
+                    let columns = lines_between(&table.grid.columns(), m.left, m.right);
+                    let next = *columns.get(1)?;
+                    Some((
+                        *id,
+                        next,
+                        lines_between(&table.grid.rows(), m.top, m.bottom),
+                    ))
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
         grid.apply(op)?;
-        let rows_axis = matches!(op, GridOp::InsertRow { .. } | GridOp::DeleteRow { .. });
         let at = match op {
             GridOp::InsertRow { id, .. } => grid.row_index(*id),
             GridOp::InsertColumn { id, .. } => grid.column_index(*id),
             _ => deleted_at,
         }
         .expect("the grid validated the line");
-        let inserted = matches!(op, GridOp::InsertRow { .. } | GridOp::InsertColumn { .. });
-        let merges = table.merge_indices();
-        let span = |(top, left, bottom, right): (usize, usize, usize, usize)| {
-            if rows_axis {
-                (top, bottom)
-            } else {
-                (left, right)
-            }
-        };
-        let through = merges.iter().any(|m| {
-            let (first, last) = span(*m);
-            if inserted {
-                first < at && at <= last
-            } else {
-                first <= at && at <= last
-            }
-        });
-        if through {
-            return Err(reject("rows and columns cannot go through merged cells"));
-        }
         // A new line copies its neighbour's formatting, unless the neighbour
-        // is part of a merge (jade would copy its spans).
+        // is part of a merge (jade would take a merged cell's width).
+        let rows_axis = matches!(op, GridOp::InsertRow { .. } | GridOp::DeleteRow { .. });
         let template = at.checked_sub(1).filter(|i| {
-            !merges.iter().any(|m| {
-                let (first, last) = span(*m);
-                first <= *i && *i <= last
-            })
+            !table
+                .merge_indices()
+                .iter()
+                .any(|&(top, left, bottom, right)| {
+                    let (first, last) = if rows_axis {
+                        (top, bottom)
+                    } else {
+                        (left, right)
+                    };
+                    first <= *i && *i <= last
+                })
         });
         let (all_rows, all_columns) = (table.grid.all_rows(), table.grid.all_columns());
         let table = self.tables.get_mut(&table_id).expect("checked");
         table.grid = grid;
+        // A new cell a merge covers (not in the merge's left column) has no
+        // `w:tc`: its story exists, hidden, like a merged cell's.
+        let covered = |grid: &Grid, row: Id, column: Id| {
+            grid.merge_at(row, column).is_some_and(|m| m.left != column)
+        };
         let effect = match op {
             GridOp::InsertRow { id, .. } => {
                 for column in &all_columns {
-                    table.add_cell(*id, *column, Story::empty_paragraph());
+                    if covered(&table.grid, *id, *column) {
+                        table.add_hidden_cell(*id, *column);
+                    } else {
+                        table.add_cell(*id, *column, Story::empty_paragraph());
+                    }
                 }
                 DocxEffect::InsertTableRow {
                     table: order,
@@ -1569,7 +1603,11 @@ impl DocxModel {
             }
             GridOp::InsertColumn { id, .. } => {
                 for row in &all_rows {
-                    table.add_cell(*row, *id, Story::empty_paragraph());
+                    if covered(&table.grid, *row, *id) {
+                        table.add_hidden_cell(*row, *id);
+                    } else {
+                        table.add_cell(*row, *id, Story::empty_paragraph());
+                    }
                 }
                 DocxEffect::InsertTableColumn {
                     table: order,
@@ -1581,10 +1619,19 @@ impl DocxModel {
                 table: order,
                 row: at,
             },
-            GridOp::DeleteColumn { .. } => DocxEffect::DeleteTableColumn {
-                table: order,
-                column: at,
-            },
+            GridOp::DeleteColumn { .. } => {
+                for (from, to, rows) in &moved {
+                    for row in rows {
+                        if let Some(shown) = table.layout.remove(&(*row, *from)) {
+                            table.layout.insert((*row, *to), shown);
+                        }
+                    }
+                }
+                DocxEffect::DeleteTableColumn {
+                    table: order,
+                    column: at,
+                }
+            }
             GridOp::Merge(_) | GridOp::Unmerge { .. } => unreachable!("handled above"),
         };
         if let GridOp::InsertRow { id, .. } | GridOp::InsertColumn { id, .. } = op {

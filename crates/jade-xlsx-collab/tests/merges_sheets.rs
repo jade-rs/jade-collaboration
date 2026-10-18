@@ -4,10 +4,10 @@
 mod common;
 
 use common::{assert_agree, open};
-use jade_collab_core::grid::Merge;
+use jade_collab_core::grid::{GridOp, Merge};
 use jade_collab_core::id::{Id, ReplicaId};
 use jade_collab_sync::{ApplyContext, Document, Lane, Materializer};
-use jade_xlsx_collab::{CellInput, FormatChange, JadeXlsx, XlsxModel, XlsxOp};
+use jade_xlsx_collab::{column_label, CellInput, FormatChange, JadeXlsx, XlsxModel, XlsxOp};
 use proptest::prelude::*;
 
 fn ctx(origin: u64, base_seq: u64, seq: u64) -> ApplyContext {
@@ -184,6 +184,111 @@ fn merged_cells_show_the_anchor_format() {
     run(&mut model, &mut jade, &op, &ctx(1, 2, 3));
     // jade copied the anchor's format into the cells it covered.
     assert_eq!(model.format(sheet, b7r, b7c).bold, Some(true));
+}
+
+/// The sheet's merged ranges as A1 references, in order.
+fn merged_ranges(model: &XlsxModel) -> Vec<String> {
+    let sheet = model
+        .sheets()
+        .into_iter()
+        .find(|s| s.name == "Operations")
+        .unwrap();
+    let a1 = |row: Id, column: Id| {
+        let r = sheet.rows.iter().position(|x| *x == row).unwrap();
+        let c = sheet.columns.iter().position(|x| *x == column).unwrap();
+        format!("{}{}", column_label(c as u32), r + 1)
+    };
+    let mut out: Vec<String> = model
+        .merges(sheet.id)
+        .iter()
+        .map(|m| format!("{}:{}", a1(m.top, m.left), a1(m.bottom, m.right)))
+        .collect();
+    out.sort();
+    out
+}
+
+fn structure(model: &XlsxModel, op: GridOp) -> XlsxOp {
+    let (sheet, _, _) = cell(model, "A1");
+    XlsxOp::Structure { sheet, op }
+}
+
+/// Excel: a row inserted strictly inside a merge (below its top row, above
+/// or at its bottom row) joins it; one inserted above its top or below its
+/// bottom moves it or leaves it alone. Columns alike.
+#[test]
+fn rows_and_columns_inserted_inside_a_merge_join_it() {
+    let (mut model, mut jade) = open("grid-operations-workbook.xlsx");
+    let op = merge(&model, "D6", "E7", 1);
+    run(&mut model, &mut jade, &op, &ctx(1, 0, 1));
+    let row = |model: &XlsxModel, at: &str| cell(model, at).1;
+    let op = structure(
+        &model,
+        GridOp::InsertRow {
+            id: stamp(2),
+            after: Some(row(&model, "D6")),
+        },
+    );
+    run(&mut model, &mut jade, &op, &ctx(1, 1, 2));
+    assert_eq!(merged_ranges(&model), ["D6:E8", "E1:F1"]);
+    // Above the top and below the bottom: the merge moves, it does not grow.
+    let op = structure(
+        &model,
+        GridOp::InsertRow {
+            id: stamp(3),
+            after: Some(row(&model, "D5")),
+        },
+    );
+    run(&mut model, &mut jade, &op, &ctx(1, 2, 3));
+    let op = structure(
+        &model,
+        GridOp::InsertRow {
+            id: stamp(4),
+            after: Some(row(&model, "D9")),
+        },
+    );
+    run(&mut model, &mut jade, &op, &ctx(1, 3, 4));
+    assert_eq!(merged_ranges(&model), ["D7:E9", "E1:F1"]);
+    let (_, _, column_d) = cell(&model, "D7");
+    let op = structure(
+        &model,
+        GridOp::InsertColumn {
+            id: stamp(5),
+            after: Some(column_d),
+        },
+    );
+    run(&mut model, &mut jade, &op, &ctx(1, 4, 5));
+    assert_eq!(merged_ranges(&model), ["D7:F9", "F1:G1"]);
+    let (sheet, r, c) = cell(&model, "E8");
+    assert_eq!(model.value(sheet, r, c), None, "a new cell inside is empty");
+}
+
+/// Excel: deleting a merge's top row or left column moves that edge to the
+/// next line in (the anchor's value goes with it); a merge left with one
+/// cell is no merge.
+#[test]
+fn deleting_a_merge_edge_moves_it_inward_and_one_cell_is_no_merge() {
+    let (mut model, mut jade) = open("grid-operations-workbook.xlsx");
+    let op = set(&model, "D6", 1, CellInput::Text("anchor".into()));
+    run(&mut model, &mut jade, &op, &ctx(1, 0, 1));
+    let op = merge(&model, "D6", "F8", 2);
+    run(&mut model, &mut jade, &op, &ctx(1, 1, 2));
+    let (_, row6, column_d) = cell(&model, "D6");
+    let op = structure(&model, GridOp::DeleteRow { id: row6 });
+    run(&mut model, &mut jade, &op, &ctx(1, 2, 3));
+    assert_eq!(merged_ranges(&model), ["D6:F7", "E1:F1"]);
+    let (sheet, r, c) = cell(&model, "D6");
+    assert_eq!(model.value(sheet, r, c), Some(&CellInput::Blank));
+    let op = structure(&model, GridOp::DeleteColumn { id: column_d });
+    run(&mut model, &mut jade, &op, &ctx(1, 3, 4));
+    assert_eq!(merged_ranges(&model), ["D1:E1", "D6:E7"]);
+    let (_, row7, _) = cell(&model, "D7");
+    let op = structure(&model, GridOp::DeleteRow { id: row7 });
+    run(&mut model, &mut jade, &op, &ctx(1, 4, 5));
+    assert_eq!(merged_ranges(&model), ["D1:E1", "D6:E6"]);
+    let (_, _, column_e) = cell(&model, "E6");
+    let op = structure(&model, GridOp::DeleteColumn { id: column_e });
+    run(&mut model, &mut jade, &op, &ctx(1, 5, 6));
+    assert!(merged_ranges(&model).is_empty());
 }
 
 #[test]

@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc b1bbc95f530e53b64f8f3f57a81ec00f0ac237a55b6bb0cdab75e6d44e7e07b0 # shrinks to ops = [InsertColumn { id: Id { lamport: 109, replica: ReplicaId(0) }, after: None }, InsertRow { id: Id { lamport: 8, replica: ReplicaId(0) }, after: None }, Merge(Merge { top: Id { lamport: 8, replica: ReplicaId(0) }, left: Id { lamport: 109, replica: ReplicaId(0) }, bottom: Id { lamport: 8, replica: ReplicaId(0) }, right: Id { lamport: 101, replica: ReplicaId(0) } }), DeleteColumn { id: Id { lamport: 109, replica: ReplicaId(0) } }]
+cc 9aac2c62b3a279001456b32520b50a07cf9506c3f31d44598c46e9eb6554e553 # shrinks to ops = [Merge(Merge { top: Id { lamport: 2, replica: ReplicaId(0) }, left: Id { lamport: 101, replica: ReplicaId(0) }, bottom: Id { lamport: 3, replica: ReplicaId(0) }, right: Id { lamport: 102, replica: ReplicaId(0) } }), DeleteRow { id: Id { lamport: 2, replica: ReplicaId(0) } }]

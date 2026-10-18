@@ -55,10 +55,23 @@ fn describe(grid: &Grid) -> Vec<String> {
             m.top.lamport, m.left.lamport, m.bottom.lamport, m.right.lamport
         ));
     }
+    // Which merge covers each alive cell, row by row.
+    let mut cover = "cover".to_string();
+    for row in grid.rows() {
+        for column in grid.columns() {
+            if let Some(m) = grid.merge_at(row, column) {
+                cover.push_str(&format!(
+                    " {},{}={},{}",
+                    row.lamport, column.lamport, m.top.lamport, m.left.lamport
+                ));
+            }
+        }
+    }
     vec![
         axis("rows", grid.all_rows(), grid.rows()),
         axis("cols", grid.all_columns(), grid.columns()),
         merges,
+        cover,
         if grid.check_invariants().is_ok() {
             "valid"
         } else {
