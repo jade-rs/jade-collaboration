@@ -33,6 +33,21 @@ descending `(lamport, replica, value)` order and tombstones filtered out.
   deletions, in any order and with any duplication, render the same document
   (strong eventual consistency).
 
+### `JadeCollab/RgaWalk.lean`: the shape of the walk
+
+`Valid` is what `Rga::insert` accepts, as a property of the insert set: ids
+are unique, and every atom's parent is present and has a smaller Lamport time
+(`MissingParent`, `NotNewerThanParent`). `valid_state`: a replica's state is
+valid exactly when the inserts it received are.
+
+- `walk_nodup`: the walk visits each atom at most once.
+- `walk_fuel`: fuel `s.length` is enough (a chain from the story start has
+  increasing Lamport times, so `path_length_le` bounds its length).
+- `walk_filter`: the walk of a larger valid set, restricted to the atoms of a
+  smaller valid set it contains, is the smaller set's walk.
+- `walk_insert`: an atom that sorts before its siblings and has no children is
+  visited right after its parent (`insertAfter`).
+
 ### `JadeCollab/Lww.lean`: last-writer-wins registers (`LwwRegister`)
 
 - `merge_comm`, `merge_assoc`, `merge_idem`: `merge` is a join semilattice.
@@ -55,11 +70,11 @@ covering mark with the greatest identifier, as a `Lww` write.
   that received the same inserts, deletions and marks show the same text with
   the same formatting; deletions do not enter the formatting.
 - `covers_preserved`, `effective_preserved`: atoms inserted later (any
-  number, anywhere, as long as old atoms keep their relative order, which the
-  RGA guarantees) never change the formatting of the atoms already there.
+  number, anywhere, as long as old atoms keep their relative order:
+  `Extends`) never change the formatting of the atoms already there.
 - `covers_in_gap`, `effective_in_gap`, `covers_at_start`: an atom that lands
-  in the gap after `l` gets exactly the formatting of the marks spanning that
-  gap — whoever inserted it and whenever it arrived.
+  in the gap after `l` (`InGap`, `AtStart`) gets exactly the formatting of
+  the marks spanning that gap — whoever inserted it and whenever it arrived.
 - `markOver_covers_iff`, `typed_inside`, `typed_after_end`,
   `typed_before_start`, `typed_at_story_start`: the expand rules of the marks
   the intent API makes (`before first` … `before` the next atom or `stop`
@@ -67,6 +82,32 @@ covering mark with the greatest identifier, as a `Lww` write.
   inside the range is covered, one typed right after the last atom is
   covered exactly when the attribute expands, one typed right before the
   first atom never is.
+
+These are stated over sequences related by `Extends` / `InGap` / `AtStart`;
+`MarksRga.lean` proves those relations for the RGA.
+
+### `JadeCollab/MarksRga.lean`: the mark theorems for RGA histories
+
+`Later s s'`: both states valid and duplicate-free, every insert of `s` in
+`s'` (`later_state` for replicas' states). `Typed s s' x p`: `x` is in `s'`,
+not in `s`, was typed after `p` (`none`: the story start), and is newer than
+every atom of `s` typed after `p` — as it is when its typist had seen them.
+
+- `extends_order`: a later state keeps every atom of an earlier one in the
+  same relative order (`Extends`), whatever was inserted, concurrently or not.
+- `inGap_order`, `atStart_order`: a typed atom lands in the gap right after
+  its parent (`InGap`), or before every old atom at the story start
+  (`AtStart`), whatever else was inserted into that gap.
+- `concurrent_typing_lands_after_unseen_sibling`: the "newer" proviso is
+  needed. Replica 1 holds `a₁ a₂ c` (`c` typed after `a₂`) and bolds
+  `a₁ a₂`, expanding, so the mark ends before `c`; replica 2, which had not
+  seen `c`, types `x` after `a₂` with an older id. The merged story is
+  `a₁ a₂ c x`: `x` is not in the gap after `a₂` and not bold, although it was
+  typed at the end of the bold text on replica 2.
+- `effective_preserved_rga`, `format_preserved`, `effective_in_gap_rga`,
+  `typed_inside_rga`, `typed_after_end_rga`, `typed_before_start_rga`,
+  `typed_at_story_start_rga`: the mark theorems above with `Extends`,
+  `InGap` and `AtStart` discharged — they hold for every RGA history.
 
 ### `JadeCollab/Sequencer.lean`: why tables are sequenced
 

@@ -33,14 +33,19 @@ What is proved:
 * `covers_preserved`, `effective_preserved`: atoms inserted later — anywhere,
   any number, concurrently or not — never change the formatting of the atoms
   that were there, as long as the new atoms keep the old ones' relative order
-  (which the RGA does).
+  (`Extends`).
 * `covers_in_gap`, `effective_in_gap`: an atom that lands in the gap right
-  after atom `l` gets exactly the formatting of the marks spanning that gap;
-  `covers_at_start` for the gap before the first atom.
+  after atom `l` (`InGap`) gets exactly the formatting of the marks spanning
+  that gap; `covers_at_start` for the gap before the first atom (`AtStart`).
 * `markOver_covers_iff`, `typed_inside`, `typed_after_end`,
   `typed_before_start`: the expand rules — an atom inserted inside a mark's
   range is covered, one inserted right after its last atom is covered exactly
   when the mark expands, one inserted right before its first atom never is.
+
+These theorems are stated over any two sequences related by `Extends`,
+`InGap` or `AtStart`. `MarksRga.lean` proves those relations from `Rga.walk`
+for every pair of states the RGA reaches and restates the theorems without
+them (`effective_preserved_rga`, `typed_after_end_rga`, …).
 -/
 
 namespace JadeCollab.Marks
@@ -441,8 +446,8 @@ theorem lt_eq_not_le {seq : List Id} {a b : Id} (ha : a ∈ seq) (hb : b ∈ seq
   · simp [h, Nat.le_of_not_lt h]
 
 /-- `seq'` extends `seq`: it holds every atom of `seq`, in the same relative
-order. The RGA guarantees this for every insert (an atom is integrated into
-the walk without moving any other). -/
+order. The RGA guarantees this for every later state
+(`MarksRga.extends_order`). -/
 structure Extends (seq seq' : List Id) : Prop where
   mem : ∀ a, a ∈ seq → a ∈ seq'
   lt_eq : ∀ a b, a ∈ seq → b ∈ seq → lt seq' a b = lt seq a b
@@ -504,8 +509,10 @@ theorem effective_preserved {seq seq' : List Id} (h : Extends seq seq') {ms : Li
 /-! ## What a new atom gets -/
 
 /-- In `seq'`, the new atom `x` sits in the gap right after the old atom `l`:
-after every old atom up to `l`, before every later one. Any number of atoms
-inserted concurrently into that gap each satisfy this. -/
+after every old atom up to `l`, before every later one, whatever else was
+inserted. In the RGA an atom typed after `l` does, provided it is newer than
+every atom already typed after `l` (`MarksRga.inGap_order`; without that it
+lands after them, `MarksRga.concurrent_typing_lands_after_unseen_sibling`). -/
 structure InGap (seq seq' : List Id) (l x : Id) : Prop where
   ext : Extends seq seq'
   l_mem : l ∈ seq
@@ -588,7 +595,8 @@ theorem effective_in_gap {seq seq' : List Id} {l x : Id} (g : InGap seq seq' l x
   intro m hm
   rw [covers_in_gap g (hms m hm)]
 
-/-- In `seq'`, the new atom `x` comes before every old atom. -/
+/-- In `seq'`, the new atom `x` comes before every old atom
+(`MarksRga.atStart_order`). -/
 structure AtStart (seq seq' : List Id) (x : Id) : Prop where
   ext : Extends seq seq'
   fresh : x ∉ seq
