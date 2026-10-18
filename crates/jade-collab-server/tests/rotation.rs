@@ -225,7 +225,9 @@ async fn a_changed_role_applies_to_open_connections() {
     assert_eq!(server.seq("hello.docx").await.unwrap(), 1);
 }
 
-#[tokio::test(flavor = "multi_thread")]
+// One thread: the watcher task cannot run before the file is replaced, so a
+// watcher that reads its baseline inside the task misses the change.
+#[tokio::test(flavor = "current_thread")]
 async fn a_watched_tokens_file_is_taken_when_it_changes() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tokens.json");
@@ -245,8 +247,7 @@ async fn a_watched_tokens_file_is_taken_when_it_changes() {
     )
     .unwrap();
     std::fs::rename(&next, &path).unwrap();
-    // Polled every 20 ms; the generous bound only matters on a loaded machine.
-    tokio::time::timeout(10 * SECOND, async {
+    tokio::time::timeout(SECOND, async {
         while status(&server, "/documents", "old").await != StatusCode::UNAUTHORIZED {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
