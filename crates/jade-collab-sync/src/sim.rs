@@ -1,13 +1,14 @@
 //! A deterministic in-memory network: one sequencer, N replicas, and FIFO
 //! queues in both directions whose delivery the caller schedules. Property
-//! tests drive it with random schedules to explore message interleavings.
+//! tests drive it with random schedules to explore message interleavings,
+//! checkpoints, reconnects and server restarts.
 
 use std::collections::VecDeque;
 
 use crate::protocol::{Downstream, Submission};
 use crate::{
-    Document, Lane, Materializer, NoMaterializer, Rejection, Replica, Sequencer, SubmitOutcome,
-    SyncError,
+    Checkpoint, Document, Lane, Materializer, NoMaterializer, Record, Rejection, Replica,
+    Sequencer, SubmitOutcome, SyncError,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -38,6 +39,8 @@ pub struct Simulation<D: Document, M = NoMaterializer> {
     clients: Vec<Replica<D>>,
     up: Vec<VecDeque<Submission<D::Op>>>,
     down: Vec<VecDeque<Downstream<D::Op>>>,
+    /// What a durable server would have journaled since the last checkpoint.
+    journal: Vec<Record<D::Op>>,
     stats: Stats,
 }
 
@@ -49,18 +52,25 @@ impl<D: Document> Simulation<D, NoMaterializer> {
 
 impl<D: Document, M: Materializer<D>> Simulation<D, M> {
     pub fn with_materializer(document: D, materializer: M, clients: usize) -> Self {
-        let mut server = Sequencer::with_materializer(document, materializer);
-        let clients: Vec<Replica<D>> = (0..clients)
-            .map(|_| Replica::from_welcome(server.join()))
-            .collect();
-        let n = clients.len();
-        Self {
+        let server = Sequencer::with_materializer(document, materializer);
+        let mut sim = Self {
             server,
-            clients,
-            up: vec![VecDeque::new(); n],
-            down: vec![VecDeque::new(); n],
+            clients: Vec::new(),
+            up: vec![VecDeque::new(); clients],
+            down: vec![VecDeque::new(); clients],
+            journal: Vec::new(),
             stats: Stats::default(),
-        }
+        };
+        sim.clients = (0..clients).map(|_| sim.join()).collect();
+        sim
+    }
+
+    fn join(&mut self) -> Replica<D> {
+        let welcome = self.server.join();
+        self.journal.push(Record::Joined {
+            replica: welcome.replica,
+        });
+        Replica::from_welcome(welcome)
     }
 
     pub fn server(&self) -> &Sequencer<D, M> {
@@ -75,8 +85,57 @@ impl<D: Document, M: Materializer<D>> Simulation<D, M> {
         &mut self.clients[index]
     }
 
+    pub fn client_count(&self) -> usize {
+        self.clients.len()
+    }
+
     pub fn stats(&self) -> &Stats {
         &self.stats
+    }
+
+    /// The records since the last [`Simulation::checkpoint`] (or since the
+    /// start), in the order they happened.
+    pub fn journal(&self) -> &[Record<D::Op>] {
+        &self.journal
+    }
+
+    /// Checkpoints and compacts the server, as a durable server does every
+    /// so often; the journal starts over.
+    pub fn checkpoint(&mut self) -> Checkpoint<D> {
+        let checkpoint = self.server.checkpoint();
+        self.server.compact();
+        self.journal.clear();
+        checkpoint
+    }
+
+    /// Every connection drops and comes back: messages in flight are lost,
+    /// each replica resumes and resends what is still pending. A replica
+    /// that can no longer resume joins again as a new one.
+    pub fn reconnect(&mut self) -> Result<(), SyncError> {
+        for client in 0..self.clients.len() {
+            self.up[client].clear();
+            self.down[client].clear();
+            let replica = &self.clients[client];
+            match self.server.resume(replica.id(), replica.seq()) {
+                Ok(resume) => {
+                    let replica = &mut self.clients[client];
+                    replica.resume(resume)?;
+                    self.up[client].extend(replica.pending_submissions());
+                }
+                Err(SyncError::Compacted { .. } | SyncError::UnknownReplica(_)) => {
+                    self.clients[client] = self.join();
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    /// The server goes down and `server` — restored from its checkpoint and
+    /// journal — takes its place; every client reconnects.
+    pub fn restart(&mut self, server: Sequencer<D, M>) -> Result<(), SyncError> {
+        self.server = server;
+        self.reconnect()
     }
 
     /// A local edit on `client`, queued for the server.
@@ -94,6 +153,7 @@ impl<D: Document, M: Materializer<D>> Simulation<D, M> {
         let lane = D::lane(&submission.op);
         let from = self.clients[client].id();
         let outcome = self.server.submit(from, submission);
+        self.journal.extend(outcome.record(from));
         match &outcome {
             SubmitOutcome::Committed(_) => {
                 self.stats.committed[slot(lane)] += 1;
