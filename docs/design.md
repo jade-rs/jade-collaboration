@@ -1129,15 +1129,14 @@ Not yet:
   text boxes inside text boxes or notes, and their geometry.
 * Access: reloading tokens on SIGHUP is Unix-only (the file is still polled
   everywhere); the audit log is a plain file that is never rotated.
-* Performance: RGA lookups are linear and paragraph positions are recomputed
-  by walking the model on each operation; sequenced formatting, comment,
+* Performance: the RGA is indexed (§4), but paragraph positions are still
+  recomputed by walking the model on each operation; sequenced formatting, comment,
   note and text box operations are preflighted on a copy of the jade document; marks are
   realised on a fresh copy of the base document every time the file is
   written (one jade command per run of one value), and their coverage is
   recomputed by a sweep over the story (`O((n + m) log m)`) when asked;
   jade's xlsx editor rereads the workbook on every write. Fine for the first
   milestone, not for large documents.
-* pptx in the server (the crate is ready: a `PptxModel` and a `JadePptx`
-  materializer with `open` / `export`), tables and formatting in slides,
-  hidden slides, layouts, pictures and grouping. jade's pptx writer rewrites
-  and re-reads the package on every edit.
+* pptx tables and formatting in slides, hidden slides, layouts, pictures
+  and grouping. jade's pptx writer rewrites and re-reads the package on
+  every edit.
