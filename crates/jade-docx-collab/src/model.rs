@@ -586,7 +586,8 @@ pub enum DocxOp {
     },
     /// Sequenced. Deletes `mark`, joining its paragraph with the next one.
     /// Refused while a table, or a text box or footnote the paragraph
-    /// places, follows the paragraph.
+    /// places, follows the paragraph, and while the paragraph ends with a
+    /// text box or note reference (jade's join drops it).
     JoinParagraph { story: StoryId, mark: Id },
     /// Sequenced. A new empty table in the body.
     InsertTable {
@@ -1440,6 +1441,20 @@ impl DocxModel {
             if paragraphs.get(p + 1).map(|q| q.story) != Some(story_id) {
                 return Err(reject(
                     "a text box or a note sits between the paragraphs; they cannot be joined",
+                ));
+            }
+        }
+        // jade's join starts at the paragraph's rendered end, before a
+        // trailing note reference or text box, and drops it.
+        if let Some(p) = ordinal {
+            let paragraph = &paragraphs[p];
+            if paragraph
+                .anchors
+                .last()
+                .is_some_and(|a| a.offset == paragraph.text.len())
+            {
+                return Err(reject(
+                    "a paragraph ending with a text box or note reference cannot be joined with the next",
                 ));
             }
         }
