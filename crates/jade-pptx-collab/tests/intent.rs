@@ -325,6 +325,9 @@ fn intents_have_a_stable_wire_format() {
         r#"{"type":"insert_paragraph_break","slide":1,"target":{"shape":2},"paragraph":0,"offset":0}"#,
         r#"{"type":"replace_range","slide":1,"target":"notes","start_paragraph":0,"start_offset":0,"end_paragraph":0,"end_offset":0,"text":""}"#,
         r#"{"type":"set_slide_hidden","slide":2,"hidden":true}"#,
+        r#"{"type":"format_text","slide":1,"shape":2,"start_paragraph":0,"start_offset":0,"end_paragraph":0,"end_offset":1,"format":{"attribute":"bold","value":true}}"#,
+        r#"{"type":"format_text","slide":1,"shape":2,"start_paragraph":0,"start_offset":0,"end_paragraph":0,"end_offset":1,"format":{"attribute":"size","hundredths":2400}}"#,
+        r#"{"type":"align_paragraphs","slide":1,"shape":2,"start_paragraph":0,"end_paragraph":1,"alignment":"center"}"#,
     ] {
         let intent: PptxIntent =
             serde_json::from_str(json).unwrap_or_else(|e| panic!("{json}: {e}"));
@@ -370,5 +373,102 @@ fn slides_are_hidden_and_shown_by_number() {
             }
         ),
         Err(IntentError::NoSuchSlide(3))
+    );
+}
+
+#[test]
+fn formatting_by_shape_id_and_byte_offsets() {
+    use jade_pptx_collab::{Alignment, CharFormat, StoryId};
+    let mut model = PptxModel::from_texts(&[&["日本語", "a\nb\n"]]);
+    let ops = run(
+        &mut model,
+        PptxIntent::FormatText {
+            slide: 1,
+            shape: 2,
+            start_paragraph: 0,
+            start_offset: 3,
+            end_paragraph: 0,
+            end_offset: 9,
+            format: CharFormat::Bold { value: true },
+        },
+    )
+    .unwrap();
+    assert!(matches!(ops.as_slice(), [PptxOp::Mark { .. }]));
+    let slide = &model.slides()[0];
+    let story = StoryId::Shape {
+        slide: slide.id,
+        shape: slide.shapes[0].id,
+    };
+    let chars = model.paragraphs(story).unwrap()[0].chars.clone();
+    let marked = model.char_formats(story).unwrap();
+    assert!(!marked.contains_key(&chars[0]));
+    assert_eq!(marked[&chars[1]], [CharFormat::Bold { value: true }]);
+    assert_eq!(marked[&chars[2]], [CharFormat::Bold { value: true }]);
+
+    // An empty range formats nothing; notes and bad values are refused.
+    let empty = PptxIntent::FormatText {
+        slide: 1,
+        shape: 2,
+        start_paragraph: 0,
+        start_offset: 3,
+        end_paragraph: 0,
+        end_offset: 3,
+        format: CharFormat::Bold { value: true },
+    };
+    assert_eq!(run(&mut model, empty), Err(IntentError::NothingToFormat));
+    let bad = PptxIntent::FormatText {
+        slide: 1,
+        shape: 2,
+        start_paragraph: 0,
+        start_offset: 0,
+        end_paragraph: 0,
+        end_offset: 3,
+        format: CharFormat::Color { color: "red".into() },
+    };
+    assert!(matches!(run(&mut model, bad), Err(IntentError::InvalidFormat(_))));
+
+    // Alignment of every paragraph, the empty last one included.
+    let ops = run(
+        &mut model,
+        PptxIntent::AlignParagraphs {
+            slide: 1,
+            shape: 3,
+            start_paragraph: 1,
+            end_paragraph: 2,
+            alignment: Alignment::Right,
+        },
+    )
+    .unwrap();
+    let story = StoryId::Shape {
+        slide: slide.id,
+        shape: slide.shapes[1].id,
+    };
+    let marks: Vec<_> = model
+        .paragraphs(story)
+        .unwrap()
+        .iter()
+        .filter_map(|p| p.mark)
+        .collect();
+    assert_eq!(
+        ops,
+        [PptxOp::AlignParagraphs {
+            story,
+            from: Some(marks[0]),
+            to: Some(marks[1]),
+            alignment: Alignment::Right,
+        }]
+    );
+    assert_eq!(
+        run(
+            &mut model,
+            PptxIntent::AlignParagraphs {
+                slide: 1,
+                shape: 3,
+                start_paragraph: 1,
+                end_paragraph: 3,
+                alignment: Alignment::Right,
+            }
+        ),
+        Err(IntentError::NoSuchParagraph(3))
     );
 }

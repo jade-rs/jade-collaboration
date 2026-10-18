@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use jade_collab_core::id::Id;
 use jade_pptx_collab::intent::{resolve, PptxIntent, Target};
 use jade_pptx_collab::{
-    Geometry, GeometryEdit, JadePptx, PptxModel, PptxOp, ShapeRef, SlideView, StoryId,
+    Alignment, CharFormat, Geometry, GeometryEdit, JadePptx, PptxModel, PptxOp, ShapeRef,
+    SlideView, StoryId,
 };
 
 pub fn fixtures() -> PathBuf {
@@ -123,7 +124,7 @@ pub fn generate(view: &PptxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
     let slide = &slides[slide_index];
     let stories = stories(view);
     let words = ["x", "日本", "é", "Lorem ", "😀", "a\tb", "ab"];
-    match choice % 18 {
+    match choice % 21 {
         // Typing at a random caret, through the index-addressed intent API.
         0..=4 => {
             let (number, target, story) = stories[pick(stories.len(), 8)];
@@ -248,7 +249,7 @@ pub fn generate(view: &PptxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
             stamp: ids(1),
             hidden: pick(2, 14) == 0,
         }),
-        _ => {
+        16 => {
             let deletable: Vec<_> = slide.shapes.iter().filter(|s| s.deletable).collect();
             if deletable.is_empty() {
                 return None;
@@ -257,6 +258,262 @@ pub fn generate(view: &PptxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
                 slide: slide.id,
                 shape: deletable[pick(deletable.len(), 14)].id,
             })
+        }
+        // Character formatting over a random range of a shape's text.
+        18..=19 => {
+            let shapes: Vec<_> = stories(view)
+                .into_iter()
+                .filter_map(|(number, target, story)| match target {
+                    Target::Shape(shape) => Some((number, shape, story)),
+                    Target::Notes => None,
+                })
+                .collect();
+            if shapes.is_empty() {
+                return None;
+            }
+            let (number, shape, story) = shapes[pick(shapes.len(), 8)];
+            let paragraphs = view.paragraphs(story)?;
+            let (a, b) = (pick(paragraphs.len(), 14), pick(paragraphs.len(), 18));
+            let (first, last) = (a.min(b), a.max(b));
+            let start = boundaries(&paragraphs[first].text);
+            let end = boundaries(&paragraphs[last].text);
+            let (mut start, mut end) = (start[pick(start.len(), 22)], end[pick(end.len(), 26)]);
+            if first == last && start > end {
+                std::mem::swap(&mut start, &mut end);
+            }
+            let formats = [
+                CharFormat::Bold { value: true },
+                CharFormat::Bold { value: false },
+                CharFormat::Italic { value: true },
+                CharFormat::Underline { value: true },
+                CharFormat::Size {
+                    hundredths: 800 + 100 * pick(40, 30) as u32,
+                },
+                CharFormat::Font {
+                    typeface: ["Arial", "Georgia"][pick(2, 30)].into(),
+                },
+                CharFormat::EastAsianFont {
+                    typeface: "Yu Gothic".into(),
+                },
+                CharFormat::Color {
+                    color: ["#FF0000", "#0070c0"][pick(2, 30)].into(),
+                },
+            ];
+            let intent = PptxIntent::FormatText {
+                slide: number,
+                shape,
+                start_paragraph: first,
+                start_offset: start,
+                end_paragraph: last,
+                end_offset: end,
+                format: formats[pick(formats.len(), 34)].clone(),
+            };
+            resolve(view, &intent, ids).ok()?.into_iter().next()
+        }
+        // Aligning a few paragraphs of a shape.
+        _ => {
+            let shapes: Vec<_> = stories(view)
+                .into_iter()
+                .filter_map(|(number, target, story)| match target {
+                    Target::Shape(shape) => Some((number, shape, story)),
+                    Target::Notes => None,
+                })
+                .collect();
+            if shapes.is_empty() {
+                return None;
+            }
+            let (number, shape, story) = shapes[pick(shapes.len(), 8)];
+            let count = view.paragraphs(story)?.len();
+            let (a, b) = (pick(count, 14), pick(count, 18));
+            let alignments = [
+                Alignment::Left,
+                Alignment::Center,
+                Alignment::Right,
+                Alignment::Justify,
+                Alignment::Distributed,
+            ];
+            let intent = PptxIntent::AlignParagraphs {
+                slide: number,
+                shape,
+                start_paragraph: a.min(b),
+                end_paragraph: a.max(b),
+                alignment: alignments[pick(alignments.len(), 22)],
+            };
+            resolve(view, &intent, ids).ok()?.into_iter().next()
+        }
+    }
+}
+
+/// The character attributes a mark can set, as jade's reader reports a
+/// run's (stated values: an attribute the run does not state is `None`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RunLook {
+    pub bold: Option<bool>,
+    pub italic: Option<bool>,
+    pub underline: Option<bool>,
+    pub size: Option<f32>,
+    pub color: Option<String>,
+    pub font: Option<String>,
+    pub east_asian_font: Option<String>,
+}
+
+impl RunLook {
+    fn of(run: &jade_pptx_reader::TextRun) -> Self {
+        Self {
+            bold: run.bold_stated,
+            italic: run.italic_stated,
+            underline: run.underline_stated,
+            size: run.size_pt,
+            color: run.color.as_ref().map(|c| format!("{c:?}")),
+            font: run.font.clone(),
+            east_asian_font: run.east_asian_font.clone(),
+        }
+    }
+
+    /// Whether this attribute shows `format`'s value.
+    fn shows(&self, format: &CharFormat) -> bool {
+        match format {
+            CharFormat::Bold { value } => self.bold == Some(*value),
+            CharFormat::Italic { value } => self.italic == Some(*value),
+            CharFormat::Underline { value } => self.underline == Some(*value),
+            CharFormat::Size { hundredths } => self.size == Some(*hundredths as f32 / 100.0),
+            CharFormat::Font { typeface } => self.font.as_deref() == Some(typeface),
+            CharFormat::EastAsianFont { typeface } => {
+                self.east_asian_font.as_deref() == Some(typeface)
+            }
+            CharFormat::Color { color } => {
+                self.color == Some(format!("{:?}", jade_pptx_reader::Color::Srgb(color[1..].to_ascii_uppercase())))
+            }
+        }
+    }
+
+    /// The same attribute as `format` sets, read from `self`.
+    fn attribute(&self, format: &CharFormat) -> String {
+        match format {
+            CharFormat::Bold { .. } => format!("{:?}", self.bold),
+            CharFormat::Italic { .. } => format!("{:?}", self.italic),
+            CharFormat::Underline { .. } => format!("{:?}", self.underline),
+            CharFormat::Size { .. } => format!("{:?}", self.size),
+            CharFormat::Font { .. } => format!("{:?}", self.font),
+            CharFormat::EastAsianFont { .. } => format!("{:?}", self.east_asian_font),
+            CharFormat::Color { .. } => format!("{:?}", self.color),
+        }
+    }
+}
+
+/// Every attribute a mark can set, as one value each.
+pub fn every_attribute() -> [CharFormat; 7] {
+    [
+        CharFormat::Bold { value: true },
+        CharFormat::Italic { value: true },
+        CharFormat::Underline { value: true },
+        CharFormat::Size { hundredths: 100 },
+        CharFormat::Font {
+            typeface: String::new(),
+        },
+        CharFormat::EastAsianFont {
+            typeface: String::new(),
+        },
+        CharFormat::Color {
+            color: "#000000".into(),
+        },
+    ]
+}
+
+fn find_text<'a>(
+    items: &'a [jade_pptx_reader::ShapeItem],
+    id: u32,
+) -> Option<&'a jade_pptx_reader::TextBody> {
+    items.iter().find_map(|item| match item {
+        jade_pptx_reader::ShapeItem::Shape(s) if s.id == Some(id) => s.text.as_ref(),
+        jade_pptx_reader::ShapeItem::Group(g) => find_text(&g.children, id),
+        _ => None,
+    })
+}
+
+/// Each character of shape `id`'s text on slide `index`, paragraphs
+/// separated by `\n`, with how its run looks.
+pub fn looks(deck: &jade_pptx_reader::Deck, index: usize, id: u32) -> Vec<(char, RunLook)> {
+    let Some(body) = find_text(&deck.slides[index].content.shapes, id) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (k, paragraph) in body.paragraphs.iter().enumerate() {
+        if k > 0 {
+            out.push(('\n', RunLook::default()));
+        }
+        for run in &paragraph.runs {
+            let look = RunLook::of(run);
+            out.extend(run.text.chars().map(|c| (c, look.clone())));
+        }
+    }
+    out
+}
+
+/// The file jade writes for the model shows the marks: every character a
+/// mark of an attribute covers has that mark's value, and every attribute
+/// no mark sets is as in jade's base file (the server's document, which
+/// never sees a mark).
+pub fn assert_formatted(model: &PptxModel, jade: &JadePptx, context: &str) {
+    let base = jade_pptx_reader::read_deck(jade.bytes()).unwrap();
+    let written = jade.export(model).unwrap_or_else(|e| panic!("{context}: {e}"));
+    let formatted = jade_pptx_reader::read_deck(&written).unwrap();
+    for (index, slide) in model.slides().iter().enumerate() {
+        for shape in &slide.shapes {
+            let Some(text) = &shape.text else { continue };
+            if !shape.editable {
+                continue;
+            }
+            let story = StoryId::Shape {
+                slide: slide.id,
+                shape: shape.id,
+            };
+            let id = jade.file_id(ShapeRef {
+                slide: slide.id,
+                shape: shape.id,
+                number: shape.number,
+            });
+            let before = looks(&base, index, id);
+            let after = looks(&formatted, index, id);
+            let shown: String = after.iter().map(|(c, _)| *c).collect();
+            assert_eq!(&shown, text, "text of shape {id} on slide {index} {context}");
+            assert_eq!(before.len(), after.len(), "{context}");
+            let marked = model.char_formats(story).unwrap();
+            let chars = model
+                .paragraphs(story)
+                .unwrap()
+                .into_iter()
+                .enumerate()
+                .flat_map(|(k, p)| {
+                    (k > 0)
+                        .then_some(None)
+                        .into_iter()
+                        .chain(p.chars.into_iter().map(Some))
+                })
+                .collect::<Vec<_>>();
+            for (k, c) in chars.into_iter().enumerate() {
+                let Some(c) = c else { continue };
+                let formats = marked.get(&c).cloned().unwrap_or_default();
+                for attribute in every_attribute() {
+                    let mark = formats
+                        .iter()
+                        .find(|f| std::mem::discriminant(*f) == std::mem::discriminant(&attribute));
+                    match mark {
+                        Some(format) => assert!(
+                            after[k].1.shows(format),
+                            "character {k} of shape {id} on slide {index} should show \
+                             {format:?} but looks {:?} {context}",
+                            after[k].1
+                        ),
+                        None => assert_eq!(
+                            after[k].1.attribute(&attribute),
+                            before[k].1.attribute(&attribute),
+                            "character {k} of shape {id} on slide {index}: {attribute:?} \
+                             is not jade's own {context}"
+                        ),
+                    }
+                }
+            }
         }
     }
 }
