@@ -152,6 +152,19 @@ impl<D: Document, M: Materializer<D>> Simulation<D, M> {
         Ok(())
     }
 
+    /// The server commits `op` itself, as the document's origin
+    /// ([`Sequencer::commit_origin`]), and broadcasts it.
+    pub fn commit_origin(&mut self, op: D::Op) -> Result<(), Rejection> {
+        let lane = D::lane(&op);
+        let committed = self.server.commit_origin(op)?;
+        self.stats.committed[slot(lane)] += 1;
+        self.journal.push(Record::Committed(committed.clone()));
+        for queue in &mut self.down {
+            queue.push_back(Downstream::Committed(committed.clone()));
+        }
+        Ok(())
+    }
+
     /// Delivers `client`'s oldest submission to the server.
     pub fn deliver_up(&mut self, client: usize) -> bool {
         let Some(submission) = self.up[client].pop_front() else {

@@ -26,7 +26,7 @@ fn the_server_commits_origin_operations_into_the_log() {
     assert_eq!(committed.origin, ReplicaId::ORIGIN);
     assert_eq!(committed.seq, 1);
     assert_eq!(server.seq(), 1);
-    assert_eq!(server.log(), [committed.clone()]);
+    assert_eq!(server.log(), std::slice::from_ref(&committed));
     assert_eq!(server.processed_client_seq(a), 0, "no replica's submission");
     // One the model refuses is not committed.
     assert!(server.commit_origin(origin_row(500)).is_err());
