@@ -284,7 +284,8 @@ pub(crate) struct Comment {
     pub(crate) content: CommentContent,
     pub(crate) resolved: bool,
     pub(crate) deleted: bool,
-    /// jade's `w:id` for a comment loaded from the file.
+    /// jade's `w:id`: the file's for a comment loaded from it, the one jade
+    /// gave for a comment made in the session (once the server says so).
     pub(crate) file_id: Option<String>,
 }
 
@@ -294,8 +295,9 @@ pub struct CommentView {
     pub id: Id,
     /// The root of its thread; `None` for a root.
     pub parent: Option<Id>,
-    /// jade's `w:id` when the comment came with the file. jade numbers the
-    /// comments made in the session itself; the model names them by `id`.
+    /// jade's `w:id`: the file's, or for a comment made in the session the
+    /// number jade gave it (`None` until the server's derived
+    /// [`DocxOp::Numbered`] arrives).
     pub file_id: Option<String>,
     /// (story, first, last character) for a root made in the session.
     pub anchor: Option<(StoryId, Id, Id)>,
@@ -613,6 +615,19 @@ pub enum DocxOp {
     /// Sequenced. Replaces a live comment's text (root or reply); the last
     /// replacement in log order wins.
     UpdateComment { comment: Id, text: String },
+    /// Sequenced, derived: the number (`w:id`) jade gave a comment or note
+    /// made in the session. Only the server commits these, right after the
+    /// operation that made it.
+    Numbered { item: Numbered, file_id: String },
+}
+
+/// Something jade numbers itself when it is made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Numbered {
+    Comment { id: Id },
+    Footnote { id: Id },
+    Endnote { id: Id },
 }
 
 /// An operation's consequence in jade terms: paragraphs by jade's story
@@ -729,6 +744,11 @@ pub enum DocxEffect {
     UpdateComment {
         comment: Id,
         text: String,
+    },
+    /// jade gave `item` the number `file_id` (already done in jade).
+    Numbered {
+        item: Numbered,
+        file_id: String,
     },
 }
 
@@ -1733,7 +1753,7 @@ impl DocxModel {
             .collect()
     }
 
-    /// jade's `w:id` of a comment that came with the file.
+    /// jade's `w:id` of a comment: the file's, or the number jade gave it.
     pub fn comment_file_id(&self, id: Id) -> Option<&str> {
         self.comments.get(&id)?.file_id.as_deref()
     }
@@ -1860,6 +1880,44 @@ impl DocxModel {
         }])
     }
 
+    /// Records the number jade gave `item`; only the server says so.
+    fn numbered(
+        &mut self,
+        item: Numbered,
+        file_id: &str,
+        ctx: &ApplyContext,
+    ) -> Result<Vec<DocxEffect>, Rejection> {
+        if ctx.origin != ReplicaId::ORIGIN {
+            return Err(reject("only the server records the numbers jade gives"));
+        }
+        if file_id.is_empty() {
+            return Err(reject("jade's number cannot be empty"));
+        }
+        match item {
+            Numbered::Comment { id } => {
+                let comment = self
+                    .comments
+                    .get_mut(&id)
+                    .ok_or_else(|| reject(format!("comment {id} does not exist")))?;
+                comment.file_id = Some(file_id.to_string());
+            }
+            Numbered::Footnote { id } | Numbered::Endnote { id } => {
+                let notes = match item {
+                    Numbered::Footnote { .. } => &mut self.footnotes,
+                    _ => &mut self.endnotes,
+                };
+                let note = notes
+                    .get_mut(&id)
+                    .ok_or_else(|| reject(format!("note {id} does not exist")))?;
+                note.file_id = file_id.to_string();
+            }
+        }
+        Ok(vec![DocxEffect::Numbered {
+            item,
+            file_id: file_id.to_string(),
+        }])
+    }
+
     fn delete_comment(&mut self, comment: Id) -> Result<Vec<DocxEffect>, Rejection> {
         self.live_comment(comment)?;
         self.delete_thread(comment);
@@ -1929,11 +1987,12 @@ impl Document for DocxModel {
             | DocxOp::ReplyToComment { .. }
             | DocxOp::ResolveComment { .. }
             | DocxOp::DeleteComment { .. }
-            | DocxOp::UpdateComment { .. } => Lane::Sequenced,
+            | DocxOp::UpdateComment { .. }
+            | DocxOp::Numbered { .. } => Lane::Sequenced,
         }
     }
 
-    fn apply(&mut self, op: &DocxOp, _ctx: &ApplyContext) -> Result<Vec<DocxEffect>, Rejection> {
+    fn apply(&mut self, op: &DocxOp, ctx: &ApplyContext) -> Result<Vec<DocxEffect>, Rejection> {
         match op {
             DocxOp::InsertText {
                 story,
@@ -1994,6 +2053,7 @@ impl Document for DocxModel {
             }
             DocxOp::DeleteComment { comment } => self.delete_comment(*comment),
             DocxOp::UpdateComment { comment, text } => self.update_comment(*comment, text),
+            DocxOp::Numbered { item, file_id } => self.numbered(*item, file_id, ctx),
         }
     }
 

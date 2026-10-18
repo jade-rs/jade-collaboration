@@ -12,33 +12,46 @@ use jade_docx_document_core::word_document::{DocxExportError, ParagraphStory, Wo
 use jade_docx_document_core::Options;
 use jade_docx_headless_api::{HeadlessCommand, HeadlessEditRequest, HeadlessTableCellSelection};
 
-use crate::model::{DocxEffect, DocxModel, DocxOp, FormatChange};
+use crate::model::{DocxEffect, DocxModel, DocxOp, FormatChange, Numbered};
 
 /// The server's jade document. Not `Send` (jade shares parsed parts through
 /// `Rc`), so a server keeps one per document on its own thread.
+#[derive(Clone)]
 pub struct JadeDocx {
     word: WordDocument,
-    /// jade's `w:id` of each comment made in the session. jade numbers new
-    /// comments itself (reusing freed numbers), so the materializer records
-    /// the number each one got rather than predicting it.
-    comments: BTreeMap<Id, String>,
+    /// The number jade gave each comment (and note) made since the document
+    /// was loaded. jade numbers them itself, reusing freed numbers, so the
+    /// materializer records what it got rather than predicting it, and the
+    /// server commits it to the model as a derived [`DocxOp::Numbered`] —
+    /// which is how a restored server, whose jade has just read the file,
+    /// still knows them.
+    numbered: BTreeMap<Numbered, String>,
+    /// Numbers learnt while realising the current operation, not yet derived.
+    fresh: Vec<(Numbered, String)>,
 }
 
 impl JadeDocx {
     pub fn new(word: WordDocument) -> Self {
         Self {
             word,
-            comments: BTreeMap::new(),
+            numbered: BTreeMap::new(),
+            fresh: Vec::new(),
         }
     }
 
-    /// jade's `w:id` of the model's comment `id`: the number jade gave it, or
-    /// the one it had in the file.
+    /// jade's `w:id` of the model's comment `id`: the one it had in the file
+    /// or the number jade gave it.
     pub fn comment_id(&self, model: &DocxModel, id: Id) -> Option<String> {
-        self.comments
-            .get(&id)
-            .cloned()
-            .or_else(|| model.comment_file_id(id).map(str::to_string))
+        model
+            .comment_file_id(id)
+            .map(str::to_string)
+            .or_else(|| self.numbered.get(&Numbered::Comment { id }).cloned())
+    }
+
+    /// Records the number jade gave `item`.
+    fn learn(&mut self, item: Numbered, file_id: String) {
+        self.numbered.insert(item, file_id.clone());
+        self.fresh.push((item, file_id));
     }
 
     pub fn load(bytes: &[u8]) -> Result<Self, String> {
@@ -195,10 +208,7 @@ impl JadeDocx {
         if effects.is_empty() {
             return Ok(());
         }
-        let mut trial = JadeDocx {
-            word: self.word.clone(),
-            comments: self.comments.clone(),
-        };
+        let mut trial = self.clone();
         trial
             .materialize(&after, effects, &ctx)
             .map_err(|e| Rejection::new(format!("jade cannot apply this: {e}")))
@@ -611,6 +621,17 @@ impl JadeDocx {
                 comment_id: self.jade_comment(model, comment)?,
                 text,
             },
+            DocxEffect::Numbered { item, file_id } => {
+                // jade numbered it when it was made; on a replayed log it
+                // must have given the same number again.
+                self.fresh.retain(|(fresh, _)| *fresh != item);
+                return match self.numbered.insert(item, file_id.clone()) {
+                    Some(known) if known != file_id => Err(format!(
+                        "jade numbered {item:?} {known}, the log says {file_id}"
+                    )),
+                    _ => Ok(()),
+                };
+            }
         };
         self.run(command)
     }
@@ -629,6 +650,14 @@ fn next_paragraph(at: &ParagraphStory) -> ParagraphStory {
 }
 
 impl Materializer<DocxModel> for JadeDocx {
+    /// The numbers jade gave what `cause` made, for the model to record.
+    fn derived(&mut self, _: &DocxModel, _cause: &DocxOp) -> Vec<DocxOp> {
+        std::mem::take(&mut self.fresh)
+            .into_iter()
+            .map(|(item, file_id)| DocxOp::Numbered { item, file_id })
+            .collect()
+    }
+
     fn admit(&self, model: &DocxModel, op: &DocxOp) -> Result<(), Rejection> {
         if matches!(
             op,
@@ -694,7 +723,8 @@ impl Materializer<DocxModel> for JadeDocx {
                     .filter(|key| !before.contains(*key));
                 match (new.next(), new.next()) {
                     (Some(key), None) => {
-                        self.comments.insert(comment, key.clone());
+                        let key = key.clone();
+                        self.learn(Numbered::Comment { id: comment }, key);
                     }
                     _ => return Err(format!("{description}: jade made no single new comment")),
                 }
