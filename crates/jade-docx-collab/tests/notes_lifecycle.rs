@@ -537,3 +537,57 @@ fn text_typed_between_two_anchors_brought_together_is_written() {
     let (again, _) = reloaded(&jade);
     assert_eq!(layouts(&again), layouts(&model));
 }
+
+/// A paragraph that ends with a note reference or a text box cannot be
+/// joined with the next: jade's join starts before the trailing anchor
+/// (its rendered paragraph end) and drops it. The model refuses, on every
+/// replica; found by the agreement property test once an endnote could be
+/// put into an empty paragraph.
+#[test]
+fn a_paragraph_ending_with_an_anchor_is_not_joined() {
+    let (mut model, mut jade) = open("jade-core/hello.docx");
+    edit(
+        &mut model,
+        &mut jade,
+        IntentOp::InsertParagraphBreak {
+            paragraph: 0,
+            offset: "Hello\u{c}".len(),
+            count: 1,
+        },
+    );
+    edit(
+        &mut model,
+        &mut jade,
+        IntentOp::InsertEndnote {
+            paragraph: 1,
+            offset: 0,
+            text: String::new(),
+        },
+    );
+    let number = model
+        .note_id(model.paragraphs().last().unwrap().story)
+        .unwrap()
+        .to_string();
+    assert_eq!(layout(&model, 1), format!("[{number}]"));
+    let join = DocxOp::JoinParagraph {
+        story: StoryId::Body,
+        mark: model.paragraphs()[1].mark.unwrap(),
+    };
+    let before = model.clone();
+    assert!(model.apply(&join, &ctx()).is_err());
+    assert_eq!(model, before);
+    // Joining the paragraph before it is fine: the reference leads the
+    // joined paragraph.
+    let mark = model.paragraphs()[0].mark.unwrap();
+    commit(
+        &mut model,
+        &mut jade,
+        DocxOp::JoinParagraph {
+            story: StoryId::Body,
+            mark,
+        },
+    );
+    assert_eq!(layout(&model, 0), format!("Hello\u{c}[{number}]"));
+    let (again, _) = reloaded(&jade);
+    assert_eq!(layouts(&again), layouts(&model));
+}
