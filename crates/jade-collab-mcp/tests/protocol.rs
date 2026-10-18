@@ -273,6 +273,8 @@ async fn advertised_edits_match_the_intent_apis() {
             "insert_endnote",
             "delete_footnote",
             "delete_endnote",
+            "insert_text_box",
+            "delete_text_box",
             "merge_table_cells",
             "unmerge_table_cells"
         ]

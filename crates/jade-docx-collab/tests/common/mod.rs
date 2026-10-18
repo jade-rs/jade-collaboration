@@ -175,7 +175,7 @@ pub fn generate(view: &DocxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
     let paragraphs = view.paragraphs();
     let pick = |n: usize, salt: u32| ((choice >> salt) as usize) % n.max(1);
     let words = ["x", "日本", "é", "Lorem ", "  ", "ab"];
-    match choice % 34 {
+    match choice % 36 {
         // Typing at a random caret, through the index-addressed intent API.
         0..=4 => {
             let p = pick(paragraphs.len(), 8);
@@ -272,7 +272,7 @@ pub fn generate(view: &DocxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
             let table = editable[pick(editable.len(), 8)];
             let row = table.rows[pick(table.rows.len(), 12)];
             let column = table.columns[pick(table.columns.len(), 16)];
-            let op = match choice % 34 {
+            let op = match choice % 36 {
                 11 => GridOp::InsertRow {
                     id: ids(1),
                     after: (pick(3, 20) != 0).then_some(row),
@@ -403,7 +403,7 @@ pub fn generate(view: &DocxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
         // A new footnote or endnote at a random caret, or where a text box
         // or note reference already sits.
         30..=32 => {
-            let (p, offset) = if choice % 34 == 32 {
+            let (p, offset) = if choice % 36 == 32 {
                 let anchored: Vec<(usize, usize)> = paragraphs
                     .iter()
                     .enumerate()
@@ -455,6 +455,45 @@ pub fn generate(view: &DocxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
                 _ => unreachable!("filtered"),
             })
         }
+        // A new text box at a random caret.
+        34 => {
+            let p = pick(paragraphs.len(), 8);
+            let text = &paragraphs[p].text;
+            let boundaries: Vec<usize> = text
+                .char_indices()
+                .map(|(i, _)| i)
+                .chain([text.len()])
+                .collect();
+            let op = IntentOp::InsertTextBox {
+                paragraph: p,
+                offset: boundaries[pick(boundaries.len(), 16)],
+                text: ["", "box", "箱"][pick(3, 24)].to_string(),
+                width_px: None,
+                height_px: None,
+            };
+            resolve(view, &op, ids).ok()?.into_iter().next()
+        }
+        // Deleting a text box some paragraph places.
+        35 => {
+            let boxes: Vec<(usize, usize)> = paragraphs
+                .iter()
+                .enumerate()
+                .flat_map(|(p, q)| {
+                    let count = q
+                        .anchors
+                        .iter()
+                        .filter(|a| matches!(a.story, StoryId::TextBox { .. }))
+                        .count();
+                    (0..count).map(move |k| (p, k))
+                })
+                .collect();
+            let &(paragraph, text_box) = boxes.get(pick(boxes.len(), 8))?;
+            let op = IntentOp::DeleteTextBox {
+                paragraph,
+                text_box,
+            };
+            resolve(view, &op, ids).ok()?.into_iter().next()
+        }
         _ => {
             let comments = view.comments();
             if comments.is_empty() {
@@ -488,7 +527,7 @@ fn around_anchor(
     let anchor = &paragraph.anchors[a];
     // Characters before the anchor.
     let before = paragraph.text[..anchor.offset].chars().count();
-    match choice % 34 {
+    match choice % 36 {
         25 => {
             let op = IntentOp::InsertText {
                 paragraph: p,
