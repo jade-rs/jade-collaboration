@@ -97,8 +97,38 @@ impl Placement {
 /// A footnote or endnote: its `w:id` and its text.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Note {
+    /// Empty for a note made in the session until the server says which
+    /// number jade gave it ([`DocxOp::Numbered`]).
     pub(crate) file_id: String,
     pub(crate) story: Story,
+    /// Deleted notes stay, invisible, so a concurrent edit of their text
+    /// still applies.
+    #[serde(default)]
+    pub(crate) deleted: bool,
+}
+
+/// Which kind of note.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoteKind {
+    Footnote,
+    Endnote,
+}
+
+impl NoteKind {
+    fn placement(self, id: Id) -> Placement {
+        match self {
+            Self::Footnote => Placement::Footnote(id),
+            Self::Endnote => Placement::Endnote(id),
+        }
+    }
+
+    pub(crate) fn numbered(self, id: Id) -> Numbered {
+        match self {
+            Self::Footnote => Numbered::Footnote { id },
+            Self::Endnote => Numbered::Endnote { id },
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -615,6 +645,27 @@ pub enum DocxOp {
     /// Sequenced. Replaces a live comment's text (root or reply); the last
     /// replacement in log order wins.
     UpdateComment { comment: Id, text: String },
+    /// Sequenced. A new footnote or endnote, as jade's `insert_footnote` /
+    /// `insert_endnote` makes one: its reference is an anchor atom `id`
+    /// placed after `parent` in `story` (the body or a table cell), and the
+    /// note is a new story keyed by `id` holding one paragraph with a tab
+    /// and `text` (what jade writes into a new note), its characters
+    /// `id.offset(1)`, `id.offset(2)`, …. Refused where jade cannot put the
+    /// reference (in a text box or a note) and where a text box or note
+    /// reference already sits: jade types only before or after all the
+    /// anchors at an offset, and concurrent typing at the caret could land
+    /// between the new reference and the old one.
+    InsertNote {
+        kind: NoteKind,
+        story: StoryId,
+        parent: Option<Id>,
+        id: Id,
+        #[serde(default)]
+        text: String,
+    },
+    /// Sequenced. Deletes a footnote or endnote: every reference to it and
+    /// its story.
+    DeleteNote { kind: NoteKind, note: Id },
     /// Sequenced, derived: the number (`w:id`) jade gave a comment or note
     /// made in the session. Only the server commits these, right after the
     /// operation that made it.
@@ -745,6 +796,22 @@ pub enum DocxEffect {
         comment: Id,
         text: String,
     },
+    /// A new note `note` at `offset` of `paragraph`, after `anchors` of its
+    /// text boxes and note references (all those before the offset; none
+    /// sits at it).
+    InsertNote {
+        kind: NoteKind,
+        note: Id,
+        paragraph: ParagraphStory,
+        offset: usize,
+        anchors: usize,
+        text: String,
+    },
+    /// Notes are named by model id; the model knows jade's number.
+    DeleteNote {
+        kind: NoteKind,
+        note: Id,
+    },
     /// jade gave `item` the number `file_id` (already done in jade).
     Numbered {
         item: Numbered,
@@ -869,7 +936,7 @@ impl DocxModel {
         let by_file_id = |notes: &BTreeMap<Id, Note>, skip: &dyn Fn(&Id) -> bool| {
             let mut rest: Vec<(&str, Id)> = notes
                 .iter()
-                .filter(|(id, _)| !skip(id))
+                .filter(|(id, note)| !note.deleted && !skip(id))
                 .map(|(id, note)| (note.file_id.as_str(), *id))
                 .collect();
             rest.sort();
@@ -888,7 +955,7 @@ impl DocxModel {
         let mut endnotes = std::mem::take(&mut out.endnotes_referenced);
         endnotes.extend(by_file_id(&self.endnotes, &|id| endnotes.contains(id)));
         for id in endnotes {
-            if let Some(note) = self.endnotes.get(&id) {
+            if let Some(note) = self.endnotes.get(&id).filter(|n| !n.deleted) {
                 self.walk_story(
                     Root::Endnote(id),
                     StoryId::Endnote { id },
@@ -995,7 +1062,7 @@ impl DocxModel {
         for anchor in &anchors {
             if let StoryId::Footnote { id } = anchor.story {
                 if out.footnotes_listed.insert(id) {
-                    if let Some(note) = self.footnotes.get(&id) {
+                    if let Some(note) = self.footnotes.get(&id).filter(|n| !n.deleted) {
                         let root = Root::Footnote(id);
                         self.walk_story(root, anchor.story, &note.story, out, &mut 0);
                     }
@@ -1090,6 +1157,14 @@ impl DocxModel {
             _ => None,
         }
         .map(|note| note.file_id.as_str())
+    }
+
+    /// The live note of `kind` jade numbers `file_id`.
+    pub fn note_by_file_id(&self, kind: NoteKind, file_id: &str) -> Option<Id> {
+        self.notes(kind)
+            .iter()
+            .find(|(_, note)| !note.deleted && note.file_id == file_id)
+            .map(|(id, _)| *id)
     }
 
     /// The table cell position (table, row, column) whose `w:tc` shows
@@ -1943,6 +2018,144 @@ impl DocxModel {
         }
     }
 
+    fn notes(&self, kind: NoteKind) -> &BTreeMap<Id, Note> {
+        match kind {
+            NoteKind::Footnote => &self.footnotes,
+            NoteKind::Endnote => &self.endnotes,
+        }
+    }
+
+    fn notes_mut(&mut self, kind: NoteKind) -> &mut BTreeMap<Id, Note> {
+        match kind {
+            NoteKind::Footnote => &mut self.footnotes,
+            NoteKind::Endnote => &mut self.endnotes,
+        }
+    }
+
+    /// Every story's RGA, deleted ones included.
+    fn flows_mut(&mut self) -> impl Iterator<Item = &mut Rga<Atom>> {
+        std::iter::once(&mut self.body.flow)
+            .chain(
+                self.tables
+                    .values_mut()
+                    .flat_map(|t| t.stories.values_mut().map(|s| &mut s.flow)),
+            )
+            .chain(self.text_boxes.values_mut().map(|s| &mut s.flow))
+            .chain(self.footnotes.values_mut().map(|n| &mut n.story.flow))
+            .chain(self.endnotes.values_mut().map(|n| &mut n.story.flow))
+    }
+
+    fn insert_note(
+        &mut self,
+        kind: NoteKind,
+        story: StoryId,
+        parent: Option<Id>,
+        id: Id,
+        text: &str,
+    ) -> Result<Vec<DocxEffect>, Rejection> {
+        if !matches!(
+            story,
+            StoryId::Body | StoryId::Cell { .. } | StoryId::Split { .. }
+        ) {
+            return Err(reject(
+                "jade puts footnotes and endnotes in body paragraphs and table cells only",
+            ));
+        }
+        if text.chars().any(|c| c.is_control() && c != '\t') {
+            return Err(reject(
+                "a note's text cannot hold line breaks or control characters",
+            ));
+        }
+        if self.footnotes.contains_key(&id) || self.endnotes.contains_key(&id) {
+            return Err(reject(format!("note {id} already exists")));
+        }
+        let host = self.editable_story(story)?;
+        let mut flow = host.flow.clone();
+        let placement = kind.placement(id);
+        flow.insert(id, parent, Atom::Anchor(placement))?;
+        // jade puts a new reference before the anchors already at its
+        // offset and types only before or after all of them: text typed at
+        // this caret concurrently could land between the new reference and
+        // an old one, which jade cannot write. So no other anchor may sit
+        // right next to it.
+        let index = flow.visible_index(id).expect("just inserted");
+        let neighbours = [
+            index.checked_sub(1).and_then(|i| flow.visible_id_at(i)),
+            flow.visible_id_at(index + 1),
+        ];
+        let anchor = |id: Option<Id>| {
+            matches!(
+                id.and_then(|id| flow.get(id)).map(|n| &n.value),
+                Some(Atom::Anchor(_))
+            )
+        };
+        if neighbours.into_iter().any(anchor) {
+            return Err(reject(
+                "a note cannot go where a text box or note reference already sits",
+            ));
+        }
+        let host = std::mem::replace(&mut self.story_mut(story).expect("checked").flow, flow);
+        let located = self.paragraphs().into_iter().find_map(|p| {
+            let at = p.anchors.iter().position(|a| a.id == id)?;
+            Some((p.at.clone(), p.anchors[at].offset, at))
+        });
+        let Some((paragraph, offset, anchors)) = located else {
+            self.story_mut(story).expect("checked").flow = host;
+            return Err(reject("the note's paragraph is gone"));
+        };
+        let mut note = Story::empty_paragraph();
+        let initial: Vec<Atom> = std::iter::once('\t')
+            .chain(text.chars())
+            .map(Atom::Char)
+            .collect();
+        let count = initial.len() as u64;
+        note.flow
+            .insert_run(id.offset(1), None, initial)
+            .expect("a new story takes any ids");
+        self.notes_mut(kind).insert(
+            id,
+            Note {
+                file_id: String::new(),
+                story: note,
+                deleted: false,
+            },
+        );
+        self.observe([id.offset(count)]);
+        Ok(vec![DocxEffect::InsertNote {
+            kind,
+            note: id,
+            paragraph,
+            offset,
+            anchors,
+            text: text.to_string(),
+        }])
+    }
+
+    fn delete_note(&mut self, kind: NoteKind, note: Id) -> Result<Vec<DocxEffect>, Rejection> {
+        match self.notes(kind).get(&note) {
+            Some(entry) if !entry.deleted => {}
+            Some(_) => return Err(reject(format!("note {note} was deleted"))),
+            None => return Err(reject(format!("{kind:?} {note} does not exist"))),
+        }
+        self.notes_mut(kind)
+            .get_mut(&note)
+            .expect("checked")
+            .deleted = true;
+        let placement = Atom::Anchor(kind.placement(note));
+        for flow in self.flows_mut() {
+            let references: Vec<Id> = flow
+                .iter()
+                .filter(|n| !n.deleted && n.value == placement)
+                .map(|n| n.id)
+                .collect();
+            for id in references {
+                flow.delete(id).expect("listed");
+            }
+        }
+        self.drop_comments_in_removed_cells();
+        Ok(vec![DocxEffect::DeleteNote { kind, note }])
+    }
+
     /// jade removes the comments anchored in table cells it deletes; so does
     /// the model, after any operation that removes cells.
     fn drop_comments_in_removed_cells(&mut self) {
@@ -1988,6 +2201,8 @@ impl Document for DocxModel {
             | DocxOp::ResolveComment { .. }
             | DocxOp::DeleteComment { .. }
             | DocxOp::UpdateComment { .. }
+            | DocxOp::InsertNote { .. }
+            | DocxOp::DeleteNote { .. }
             | DocxOp::Numbered { .. } => Lane::Sequenced,
         }
     }
@@ -2053,6 +2268,14 @@ impl Document for DocxModel {
             }
             DocxOp::DeleteComment { comment } => self.delete_comment(*comment),
             DocxOp::UpdateComment { comment, text } => self.update_comment(*comment, text),
+            DocxOp::InsertNote {
+                kind,
+                story,
+                parent,
+                id,
+                text,
+            } => self.insert_note(*kind, *story, *parent, *id, text),
+            DocxOp::DeleteNote { kind, note } => self.delete_note(*kind, *note),
             DocxOp::Numbered { item, file_id } => self.numbered(*item, file_id, ctx),
         }
     }

@@ -246,6 +246,22 @@ fn edits() -> Value {
                     "comment_id": string("The comment's id."),
                     "text": string("The new text: no line breaks, nor whitespace at either end."),
                 }), &["comment_id", "text"]),
+                edit("insert_footnote", "docx: add a footnote at a caret of a body paragraph or table cell (before any text box or note reference already at that offset). Its paragraph is listed after the one that first references it; its text starts with a tab after the number, as Word's does.", json!({
+                    "paragraph": paragraph(),
+                    "offset": offset(),
+                    "text": string("The note's text (no line breaks); default empty."),
+                }), &["paragraph", "offset"]),
+                edit("insert_endnote", "docx: add an endnote at a caret of a body paragraph or table cell, like insert_footnote; endnotes are listed after everything else.", json!({
+                    "paragraph": paragraph(),
+                    "offset": offset(),
+                    "text": string("The note's text (no line breaks); default empty."),
+                }), &["paragraph", "offset"]),
+                edit("delete_footnote", "docx: delete a footnote and every reference to it.", json!({
+                    "footnote_id": string("The footnote's number (`note` in read_document's anchors and stories)."),
+                }), &["footnote_id"]),
+                edit("delete_endnote", "docx: delete an endnote and every reference to it.", json!({
+                    "endnote_id": string("The endnote's number (`note` in read_document's anchors and stories)."),
+                }), &["endnote_id"]),
                 edit("merge_table_cells", "docx: merge a rectangle of a top-level table's cells; the top-left cell shows their content, row by row.", json!({
                     "table": integer("The table's index (read_document lists them)."),
                     "top_row": integer("First row, zero-based."),

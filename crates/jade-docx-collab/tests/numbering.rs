@@ -211,9 +211,9 @@ fn a_restored_server_still_addresses_the_notes_made_before() {
     let mut server = Sequencer::with_materializer(model, jade);
     let replica = server.join().replica;
     let (footnote, endnote) = (Id::new(1_000, replica), Id::new(1_100, replica));
-    for (client_seq, kind, id) in [
-        (1, NoteKind::Footnote, footnote),
-        (2, NoteKind::Endnote, endnote),
+    for (client_seq, kind, id, after) in [
+        (1, NoteKind::Footnote, footnote, 1),
+        (2, NoteKind::Endnote, endnote, 3),
     ] {
         let outcome = submit(
             &mut server,
@@ -222,7 +222,7 @@ fn a_restored_server_still_addresses_the_notes_made_before() {
             DocxOp::InsertNote {
                 kind,
                 story: StoryId::Body,
-                parent: Some(p[0].chars[1]),
+                parent: Some(p[0].chars[after]),
                 id,
                 text: "note".into(),
             },

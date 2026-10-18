@@ -16,6 +16,6 @@ pub use jade::JadeDocx;
 pub use load::LoadError;
 pub use model::{
     Anchor, AnchorView, Atom, CommentContent, CommentView, DocxEffect, DocxModel, DocxOp,
-    FormatChange, Numbered, Paragraph, ParagraphAlignment, ParagraphStory, Placement, StoryId,
-    TableView,
+    FormatChange, NoteKind, Numbered, Paragraph, ParagraphAlignment, ParagraphStory, Placement,
+    StoryId, TableView,
 };

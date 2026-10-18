@@ -8,11 +8,13 @@ use jade_collab_sync::{ApplyContext, Document, Materializer, Rejection};
 use jade_docx_document_core::document::{BodyElement, Note, Table};
 use jade_docx_document_core::headless_api::apply_headless_commands_to_document;
 use jade_docx_document_core::selection::TextPosition;
-use jade_docx_document_core::word_document::{DocxExportError, ParagraphStory, WordDocument};
+use jade_docx_document_core::word_document::{
+    DocxExportError, ParagraphAnchorKind, ParagraphStory, WordDocument,
+};
 use jade_docx_document_core::Options;
 use jade_docx_headless_api::{HeadlessCommand, HeadlessEditRequest, HeadlessTableCellSelection};
 
-use crate::model::{DocxEffect, DocxModel, DocxOp, FormatChange, Numbered};
+use crate::model::{DocxEffect, DocxModel, DocxOp, FormatChange, NoteKind, Numbered, StoryId};
 
 /// The server's jade document. Not `Send` (jade shares parsed parts through
 /// `Rc`), so a server keeps one per document on its own thread.
@@ -46,6 +48,18 @@ impl JadeDocx {
             .comment_file_id(id)
             .map(str::to_string)
             .or_else(|| self.numbered.get(&Numbered::Comment { id }).cloned())
+    }
+
+    /// The `w:id`s of jade's notes of `kind`.
+    fn note_ids(&self, kind: NoteKind) -> BTreeSet<String> {
+        self.word
+            .document
+            .as_ref()
+            .map(|d| match kind {
+                NoteKind::Footnote => d.footnotes.keys().cloned().collect(),
+                NoteKind::Endnote => d.endnotes.keys().cloned().collect(),
+            })
+            .unwrap_or_default()
     }
 
     /// Records the number jade gave `item`.
@@ -621,6 +635,82 @@ impl JadeDocx {
                 comment_id: self.jade_comment(model, comment)?,
                 text,
             },
+            DocxEffect::InsertNote {
+                kind,
+                note,
+                paragraph,
+                offset,
+                anchors,
+                text,
+            } => {
+                let s = self.surface(&paragraph)?;
+                let offset = self.rendered_after(s, offset, anchors)?;
+                let before = self.note_ids(kind);
+                let command = match kind {
+                    NoteKind::Footnote => HeadlessCommand::InsertFootnote {
+                        paragraph: s,
+                        offset,
+                        text,
+                    },
+                    NoteKind::Endnote => HeadlessCommand::InsertEndnote {
+                        paragraph: s,
+                        offset,
+                        text,
+                    },
+                };
+                self.run(command)?;
+                let mut new = self
+                    .note_ids(kind)
+                    .into_iter()
+                    .filter(|k| !before.contains(k));
+                return match (new.next(), new.next()) {
+                    (Some(key), None) => {
+                        self.learn(kind.numbered(note), key);
+                        Ok(())
+                    }
+                    _ => Err("jade made no single new note".to_string()),
+                };
+            }
+            DocxEffect::DeleteNote { kind, note } => {
+                let story = match kind {
+                    NoteKind::Footnote => StoryId::Footnote { id: note },
+                    NoteKind::Endnote => StoryId::Endnote { id: note },
+                };
+                let key = model
+                    .note_id(story)
+                    .filter(|k| !k.is_empty())
+                    .ok_or_else(|| format!("note {note} has no jade number"))?
+                    .to_string();
+                self.run(match kind {
+                    NoteKind::Footnote => HeadlessCommand::DeleteFootnote {
+                        footnote_id: key.clone(),
+                    },
+                    NoteKind::Endnote => HeadlessCommand::DeleteEndnote {
+                        endnote_id: key.clone(),
+                    },
+                })?;
+                // jade removes the references it knows of; one it left
+                // (in a text box, say) would leave the model behind.
+                let left = (0..self.word.paragraph_count()).any(|s| {
+                    self.word
+                        .paragraph_anchors(s)
+                        .iter()
+                        .any(|a| match &a.kind {
+                            ParagraphAnchorKind::Footnote { note_id } => {
+                                kind == NoteKind::Footnote && *note_id == key
+                            }
+                            ParagraphAnchorKind::Endnote { note_id } => {
+                                kind == NoteKind::Endnote && *note_id == key
+                            }
+                            ParagraphAnchorKind::TextBox { .. } => false,
+                        })
+                });
+                return if left {
+                    Err(format!("jade kept a reference to {kind:?} {key}"))
+                } else {
+                    Ok(())
+                };
+            }
             DocxEffect::Numbered { item, file_id } => {
                 // jade numbered it when it was made; on a replayed log it
                 // must have given the same number again.
@@ -667,6 +757,8 @@ impl Materializer<DocxModel> for JadeDocx {
                 | DocxOp::ResolveComment { .. }
                 | DocxOp::DeleteComment { .. }
                 | DocxOp::UpdateComment { .. }
+                | DocxOp::InsertNote { .. }
+                | DocxOp::DeleteNote { .. }
         ) {
             return self.preflight(model, op);
         }

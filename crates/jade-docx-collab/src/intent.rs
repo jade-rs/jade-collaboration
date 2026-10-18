@@ -29,7 +29,8 @@ use jade_docx_headless_api::{HeadlessCommand, HeadlessDeleteDirection};
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    CommentContent, DocxModel, DocxOp, FormatChange, Paragraph, ParagraphAlignment, StoryId,
+    CommentContent, DocxModel, DocxOp, FormatChange, NoteKind, Paragraph, ParagraphAlignment,
+    StoryId,
 };
 
 fn one() -> usize {
@@ -122,6 +123,28 @@ pub enum IntentOp {
         comment_id: String,
         text: String,
     },
+    /// A new footnote at a caret of a body paragraph or table cell, before
+    /// any text box or note reference at that offset (as jade inserts one);
+    /// its text starts with a tab, as jade writes it.
+    InsertFootnote {
+        paragraph: usize,
+        offset: usize,
+        #[serde(default)]
+        text: String,
+    },
+    InsertEndnote {
+        paragraph: usize,
+        offset: usize,
+        #[serde(default)]
+        text: String,
+    },
+    /// Deletes a footnote (by its `w:id`) and every reference to it.
+    DeleteFootnote {
+        footnote_id: String,
+    },
+    DeleteEndnote {
+        endnote_id: String,
+    },
     /// Merges the rectangle of a top-level table's cells (zero-based rows and
     /// columns, as `read_document` lists them).
     MergeTableCells {
@@ -157,6 +180,8 @@ pub enum IntentError {
     InvalidFormat(String),
     #[error("no comment {0:?}")]
     NoSuchComment(String),
+    #[error("no footnote or endnote {0:?}")]
+    NoSuchNote(String),
     #[error("no top-level table {0}")]
     NoSuchTable(usize),
     #[error("cell ({row}, {column}) is outside the table or starts no merge")]
@@ -401,6 +426,28 @@ impl TryFrom<HeadlessCommand> for IntentOp {
             HeadlessCommand::UpdateComment { comment_id, text } => {
                 Ok(Self::UpdateComment { comment_id, text })
             }
+            HeadlessCommand::InsertFootnote {
+                paragraph,
+                offset,
+                text,
+            } => Ok(Self::InsertFootnote {
+                paragraph,
+                offset,
+                text,
+            }),
+            HeadlessCommand::InsertEndnote {
+                paragraph,
+                offset,
+                text,
+            } => Ok(Self::InsertEndnote {
+                paragraph,
+                offset,
+                text,
+            }),
+            HeadlessCommand::DeleteFootnote { footnote_id } => {
+                Ok(Self::DeleteFootnote { footnote_id })
+            }
+            HeadlessCommand::DeleteEndnote { endnote_id } => Ok(Self::DeleteEndnote { endnote_id }),
             other => Err(UnsupportedCommand {
                 command_name: other.name(),
                 lane,
@@ -749,6 +796,46 @@ pub fn resolve(
             comment: comment(view, comment_id)?,
             text: text.clone(),
         }]),
+        IntentOp::InsertFootnote {
+            paragraph,
+            offset,
+            text,
+        }
+        | IntentOp::InsertEndnote {
+            paragraph,
+            offset,
+            text,
+        } => {
+            let at = caret(&paragraphs, *paragraph, *offset)?;
+            let kind = match op {
+                IntentOp::InsertFootnote { .. } => NoteKind::Footnote,
+                _ => NoteKind::Endnote,
+            };
+            // The reference, then the note's tab and text.
+            let id = ids(2 + text.chars().count() as u64);
+            Ok(vec![DocxOp::InsertNote {
+                kind,
+                story: at.story,
+                parent: at.parent,
+                id,
+                text: text.clone(),
+            }])
+        }
+        IntentOp::DeleteFootnote {
+            footnote_id: file_id,
+        }
+        | IntentOp::DeleteEndnote {
+            endnote_id: file_id,
+        } => {
+            let kind = match op {
+                IntentOp::DeleteFootnote { .. } => NoteKind::Footnote,
+                _ => NoteKind::Endnote,
+            };
+            let note = view
+                .note_by_file_id(kind, file_id)
+                .ok_or_else(|| IntentError::NoSuchNote(file_id.clone()))?;
+            Ok(vec![DocxOp::DeleteNote { kind, note }])
+        }
         IntentOp::MergeTableCells {
             table,
             top_row,
