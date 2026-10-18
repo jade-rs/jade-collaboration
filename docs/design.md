@@ -212,6 +212,32 @@ grid's validity predicate (all regions alive, well-formed and pairwise
 non-overlapping) is checked by the sequencer for every structural operation;
 Lean proves that the grid's `apply` keeps it (`Grid.apply_preserves_valid`).
 
+**Rows and columns through merged regions** behave as in Word and Excel, and
+as jade does in both formats (pinned by probe tests that drive jade's own
+commands, `jade_table_merges.rs` and the xlsx merge tests):
+
+* a row (column) inserted *strictly inside* a merge — after its top row or
+  a row below it, before or at its bottom row — joins it: the merge grows;
+  one inserted above its top or below its bottom does not;
+* deleting a line takes it out of every merge: deleting a merge's top or
+  bottom (left or right) line moves that edge inward to the next alive line,
+  deleting an inner line shrinks it;
+* a merge left with fewer than two cells is dropped — deleting the last line
+  it had on an axis, or collapsing it to a single cell, which is then an
+  ordinary cell.
+
+The grid needs no special case for this: a merge is named by its corner
+lines, so a line inserted between the corners belongs to it, and deletion
+normalizes each merge to the first and last alive lines between its corners
+(the corners are what `Grid::merge_at`, the merge covering a cell, reads).
+Lean pins the behaviour down on the cells a merge covers
+(`Grid.insertRow_covers`, `insertCol_covers`: corners kept, every other line
+in or out as before, the new line inside exactly when inserted after a
+merge line other than its last; `deleteRow_covers`, `deleteCol_covers`: a
+surviving merge covers exactly its old alive cells minus the deleted line,
+and a merge is dropped exactly when fewer than two cells are left;
+`mergeAt_spec`: in a valid grid one merge at most covers a cell).
+
 **Merged cells in docx.** A table keeps every story it ever held, by
 identity, and separately *which stories each cell position shows* (jade's
 `w:tc` there). Merging (sequenced, `MergeCells`) changes only the latter, as
@@ -222,8 +248,16 @@ go. Unmerging (`UnmergeCells`) keeps what the merged cell shows and gives the
 cells it frees new empty stories. Because stories never move, text typed
 into any cell's story commutes with merging and unmerging — the property the
 client fast path needs (Lean: `CellCommute.cell_edit_comm_grid`; property
-test `merges_commute_with_cell_text`). Rows and columns may not be inserted
-or deleted through a merged region. Tables whose merges come from the file
+test `merges_commute_with_cell_text`). Rows and columns go through merged
+cells as the grid says (above), and the layout follows jade's `w:tc`: a new
+line's cells a merge covers get a story that no position shows (the new
+row's cell in the merge's left column is an empty follower, as Word's
+`w:vMerge` continuation is); deleting a merge's top row deletes what the
+merged cell shows, which lives in that row's `w:tc`, and the follower below
+becomes the merged cell; deleting its left column keeps the `w:tc`, one
+column narrower, so what the merged cell and its followers show moves to
+the next column. Stories still never move, so these commute with cell
+text too (`structure_through_merges_commutes_with_cell_text`). Tables whose merges come from the file
 (`w:gridSpan`, `w:vMerge`) load unlocked; ragged or nested tables stay
 structurally read-only. A jade-core bug surfaced here — a merge wrote an
 empty paragraph into each follower's XML but not into the model, so a save
@@ -309,8 +343,10 @@ won the same attributes.
 
 jade reports a merged cell's format at the merge's anchor, so the model
 loads the file's merges into the sheet grid, which moves them exactly as
-jade does (a line inserted inside joins the merge, a deleted corner moves
-to the next line). Formatting a covered cell is kept and shows once a
+jade does (the rules above: a line inserted inside joins the merge, a
+deleted corner moves to the next line, a single cell is no merge — jade's
+reference shifter drops a range that shrinks to one cell). The agreement
+tests compare every sheet's merged ranges with jade's. Formatting a covered cell is kept and shows once a
 deletion makes it the anchor, as in jade. Notes and formats in an Excel
 table's header or totals row are safe — jade leaves the header text and
 column name alone when only the format or the note changes — so unlike
@@ -483,7 +519,10 @@ Tests are written first. Three layers:
    `jade_collab_core::grid::Grid` that behaves exactly like the Rust code
    (same accept/reject decisions, same resulting state) with
    `apply_preserves_valid` — every accepted row/column/merge operation keeps
-   the table valid — and `check_iff_valid` for the executable checker; cell
+   the table valid — and `check_iff_valid` for the executable checker; rows
+   and columns go through merged regions as in Word and Excel, stated on the
+   cells each merge covers (`insertRow_covers`, `insertCol_covers`,
+   `deleteRow_covers`, `deleteCol_covers`, `mergeAt_spec`); cell
    edits commute with every grid operation; a live table's anchor mark always
    exists and is visible, and convergent text operations never change
    whether a join or table operation is accepted. The proofs also sharpened
@@ -494,12 +533,16 @@ Tests are written first. Three layers:
    its view whenever a remote convergent operation does not apply directly.
    The Lean model is also an executable oracle (`lake build grid-oracle`); a
    property test feeds it and the Rust grid the same random operations and
-   compares every decision and the final state (CI job `lean-oracle`).
+   compares every decision, the final state and which merge covers every
+   alive cell (`mergeAt` against `Grid::merge_at`; CI job `lean-oracle`).
 2. **Property-based tests** (`proptest`) — the implementation against the
    specification (RGA differential test), convergence of random concurrent
    histories across N replicas under random message scheduling, grid
-   invariants under random structural operations, docx/xlsx/pptx model ↔
-   jade agreement after random edit sequences, a restarted server
+   invariants under random structural operations and the covered cells of
+   every merge following Word's rules under them, docx/xlsx/pptx model ↔
+   jade agreement after random edit sequences (docx tables compared cell by
+   cell and xlsx merged ranges compared, with generators biased to rows and
+   columns through merged cells), a restarted server
    indistinguishable from one that kept running and resuming within its
    kept tail exactly as one that never checkpointed, the journal reading
    back whatever was appended, checkpointed and torn and being synced as its
@@ -625,8 +668,9 @@ untouched.
 ## 9. Status and next steps
 
 Working: the two-lane protocol over WebSockets; docx text, paragraph
-split/join, table insertion/deletion and row/column structure on simple
-tables, text in any table cell; text of footnotes, endnotes and text boxes
+split/join, table insertion/deletion and row/column structure (through
+merged cells too, as Word does), merging and unmerging cells, text in any
+table cell; text of footnotes, endnotes and text boxes
 (§4; notes also split and joined), their anchors following splits, joins
 and deletions as jade moves them; docx formatting (character and paragraph)
 and comments (add, reply, resolve, delete; also comments loaded from the
@@ -657,7 +701,7 @@ Not yet:
 * xlsx borders, whole-row/column formats, conditional formats and threaded
   comments; note authors are not modelled (jade records `jade`).
 * docx structure of ragged and nested tables (their text is editable),
-  rows/columns through merged regions, tracked changes; creating and
+  tracked changes; creating and
   deleting notes and text boxes; splitting or joining a text box's
   paragraphs (jade does not write them); comments in notes; the concurrent
   orders around anchors jade cannot realise (§4).
