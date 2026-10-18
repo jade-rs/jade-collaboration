@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use common::{
     assert_comments_agree, assert_same_order, assert_stories_agree, assert_tables_agree,
-    char_styles, commit, generate, jade_comments, jade_core, open, paragraph_formats,
-    paragraph_snapshot, surface, CharStyle,
+    char_styles, commit, generate, generate_through_merges, jade_comments, jade_core, open,
+    paragraph_formats, paragraph_snapshot, surface, CharStyle,
 };
 use jade_collab_core::id::{Id, ReplicaId};
 use jade_collab_sync::{ApplyContext, Document, Lane, Materializer};
@@ -322,6 +322,72 @@ proptest! {
         assert_same_order(&model, &reloaded, &format!("{name} against the reloaded file"));
         prop_assert_eq!(anchor_layout(&reloaded_model), anchor_layout(&model));
         prop_assert_eq!(jade_comments(&reloaded).len(), model.comments().len());
+    }
+}
+
+/// Fixtures whose tables have merged cells, and one without a table (a 3 × 3
+/// table is inserted first).
+const MERGE_FIXTURES: &[&str] = &[
+    "jade-core/hello.docx",
+    "merged-table-over-page.docx",
+    "table-complex-merged-continuations.docx",
+    "table-complex-staggered-merges.docx",
+    "table-legacy-hmerge.docx",
+];
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// Rows and columns inserted and deleted through merged cells — above,
+    /// inside and below merges, with merges, unmerges and typing in between —
+    /// keep the model and jade in agreement cell by cell after every
+    /// operation, and the file jade writes reads back as the same tables.
+    #[test]
+    fn rows_and_columns_through_merges_agree_with_jade(
+        fixture_index in 0..MERGE_FIXTURES.len(),
+        choices in prop::collection::vec(any::<u64>(), 1..30),
+    ) {
+        let name = MERGE_FIXTURES[fixture_index];
+        let (mut model, mut jade) = open(name);
+        let mut next = 1_000_000u64;
+        let mut ids = |n: u64| {
+            let id = Id::new(next, ReplicaId(1));
+            next += n;
+            id
+        };
+        if model.tables().iter().all(|t| t.locked) {
+            let first = ids(7);
+            commit(&mut model, &mut jade, DocxOp::InsertTable {
+                anchor: jade_docx_collab::Anchor::Start,
+                id: first,
+                rows: (1..=3).map(|k| first.offset(k)).collect(),
+                columns: (4..=6).map(|k| first.offset(k)).collect(),
+            });
+        }
+        assert_agree(&model, &jade, "on load");
+        let mut applied = 0;
+        for (step, choice) in choices.into_iter().enumerate() {
+            let Some(op) = generate_through_merges(&model, choice, &mut ids) else { continue };
+            let ctx = ApplyContext { origin: ReplicaId(1), base_seq: 0, seq: Some(step as u64 + 1) };
+            if DocxModel::lane(&op) == Lane::Sequenced && jade.admit(&model, &op).is_err() {
+                continue;
+            }
+            let before = model.clone();
+            match model.apply(&op, &ctx) {
+                Ok(effect) => {
+                    jade.materialize(&model, effect, &ctx)
+                        .unwrap_or_else(|e| panic!("{name}: jade refused {op:?}: {e}"));
+                    assert_agree(&model, &jade, &format!("{name} after {op:?}"));
+                    applied += 1;
+                }
+                Err(_) => prop_assert_eq!(&model, &before, "a rejected op changed the model"),
+            }
+        }
+        let reloaded = JadeDocx::load(&jade.export().unwrap()).unwrap();
+        let reloaded_model = DocxModel::from_word_document(reloaded.word()).unwrap();
+        assert_tables_agree(&reloaded_model, &reloaded, &format!("{name} reloaded"));
+        assert_tables_agree(&model, &reloaded, &format!("{name} against the reloaded file"));
+        prop_assert!(applied > 0 || model.tables().iter().all(|t| t.locked));
     }
 }
 

@@ -435,8 +435,7 @@ fn a_grown_merge_unmerges_into_fresh_cells() {
         .model
         .paragraphs()
         .into_iter()
-        .filter(|p| matches!(p.story, StoryId::Split { .. }))
-        .last()
+        .rfind(|p| matches!(p.story, StoryId::Split { .. }))
         .expect("a freed cell");
     let typed = s.reserve(2);
     s.step(DocxOp::InsertText {
@@ -510,5 +509,51 @@ proptest! {
         merged_last.apply(&merge, &ctx).unwrap();
         prop_assert_eq!(merged_first.paragraph_texts(), merged_last.paragraph_texts());
         prop_assert_eq!(merged_first, merged_last);
+    }
+
+    /// Rows and columns through a merge commute with text typed into any
+    /// cell, covered ones included: stories never move, only which position
+    /// shows them (Lean: `CellCommute.cell_edit_comm_grid`).
+    #[test]
+    fn structure_through_merges_commutes_with_cell_text(
+        cells in prop::collection::vec((0usize..3, 0usize..3), 1..5),
+        which in 0usize..8,
+    ) {
+        let (s, table, rows, columns) = merged_session();
+        let fresh = Id::new(8_000_000, ReplicaId(4));
+        let op = match which {
+            0 => GridOp::InsertRow { id: fresh, after: Some(rows[0]) },
+            1 => GridOp::InsertColumn { id: fresh, after: Some(columns[0]) },
+            2 => GridOp::InsertRow { id: fresh, after: Some(rows[1]) },
+            3 => GridOp::DeleteRow { id: rows[0] },
+            4 => GridOp::DeleteRow { id: rows[1] },
+            5 => GridOp::DeleteColumn { id: columns[0] },
+            6 => GridOp::DeleteColumn { id: columns[1] },
+            _ => GridOp::InsertColumn { id: fresh, after: None },
+        };
+        let structure = DocxOp::Table { table, op };
+        let edits: Vec<DocxOp> = cells
+            .iter()
+            .enumerate()
+            .map(|(k, (r, c))| DocxOp::InsertText {
+                story: StoryId::Cell { table, row: rows[*r], column: columns[*c] },
+                parent: None,
+                first: Id::new(9_000_000 + k as u64 * 10, ReplicaId(2)),
+                text: format!("e{k}"),
+            })
+            .collect();
+        let ctx = ApplyContext { origin: ReplicaId(2), base_seq: 0, seq: None };
+        let mut structure_first = s.model.clone();
+        structure_first.apply(&structure, &ctx).unwrap();
+        for e in &edits {
+            structure_first.apply(e, &ctx).unwrap();
+        }
+        let mut structure_last = s.model.clone();
+        for e in &edits {
+            structure_last.apply(e, &ctx).unwrap();
+        }
+        structure_last.apply(&structure, &ctx).unwrap();
+        prop_assert_eq!(structure_first.paragraph_texts(), structure_last.paragraph_texts());
+        prop_assert_eq!(structure_first, structure_last);
     }
 }

@@ -516,6 +516,106 @@ pub fn generate(view: &DocxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
     }
 }
 
+/// An operation on an editable top-level table that goes through its merged
+/// cells most of the time: a row or column inserted just above, inside or
+/// just below a merge, or deleted from one; a new merge of up to 3 × 3
+/// cells; an unmerge; or typing into a cell. `None` when there is no
+/// editable table.
+pub fn generate_through_merges(
+    view: &DocxModel,
+    choice: u64,
+    ids: &mut dyn FnMut(u64) -> Id,
+) -> Option<DocxOp> {
+    let pick = |n: usize, salt: u32| ((choice >> salt) as usize) % n.max(1);
+    let tables = view.tables();
+    let editable: Vec<(usize, &jade_docx_collab::TableView)> = tables
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| !t.locked)
+        .collect();
+    let &(index, table) = editable.get(pick(editable.len(), 8))?;
+    // A merge's span on one axis, widened by one line before it, or the
+    // whole axis when there is no merge (or now and then anyway).
+    let merge = (pick(4, 12) != 0)
+        .then(|| table.merges.get(pick(table.merges.len(), 14)))
+        .flatten();
+    let line = |rows: bool, salt: u32| -> Option<usize> {
+        let n = if rows {
+            table.rows.len()
+        } else {
+            table.columns.len()
+        };
+        match merge {
+            Some(&(top, left, bottom, right)) => {
+                let (first, last) = if rows { (top, bottom) } else { (left, right) };
+                let from = first.saturating_sub(1);
+                let k = from + pick(last - from + 1, salt);
+                // `None` stands for "insert at the start" (before line 0).
+                (!(first == 0 && k == from && pick(2, salt + 5) == 0)).then_some(k)
+            }
+            None => Some(pick(n, salt)),
+        }
+    };
+    let op = match choice % 10 {
+        0 | 1 => GridOp::InsertRow {
+            id: ids(1),
+            after: line(true, 20).map(|k| table.rows[k]),
+        },
+        2 | 3 => GridOp::InsertColumn {
+            id: ids(1),
+            after: line(false, 20).map(|k| table.columns[k]),
+        },
+        4 => GridOp::DeleteRow {
+            id: table.rows[line(true, 20).unwrap_or(0)],
+        },
+        5 => GridOp::DeleteColumn {
+            id: table.columns[line(false, 20).unwrap_or(0)],
+        },
+        6 | 7 => {
+            let top = pick(table.rows.len(), 20);
+            let left = pick(table.columns.len(), 24);
+            let op = IntentOp::MergeTableCells {
+                table: index,
+                top_row: top,
+                left_column: left,
+                bottom_row: (top + pick(3, 28)).min(table.rows.len() - 1),
+                right_column: (left + pick(3, 32)).min(table.columns.len() - 1),
+            };
+            return resolve(view, &op, ids).ok()?.into_iter().next();
+        }
+        8 => {
+            let &(row, column, _, _) = merge?;
+            let op = IntentOp::UnmergeTableCells {
+                table: index,
+                row,
+                column,
+            };
+            return resolve(view, &op, ids).ok()?.into_iter().next();
+        }
+        _ => {
+            // Typing at the start of a cell of this table.
+            let paragraphs = view.paragraphs();
+            let cells: Vec<usize> = paragraphs
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| view.cell_of(p.story).is_some_and(|(t, _, _)| t == table.id))
+                .map(|(k, _)| k)
+                .collect();
+            let p = *cells.get(pick(cells.len(), 20))?;
+            let op = IntentOp::InsertText {
+                paragraph: p,
+                offset: 0,
+                text: ["m", "表"][pick(2, 30)].to_string(),
+            };
+            return resolve(view, &op, ids).ok()?.into_iter().next();
+        }
+    };
+    Some(DocxOp::Table {
+        table: table.id,
+        op,
+    })
+}
+
 /// An edit at a random anchor (a text box or a note reference): typing or
 /// splitting at its offset, deleting the characters on both sides of it,
 /// emptying its paragraph up to it, or joining its paragraph with the next
