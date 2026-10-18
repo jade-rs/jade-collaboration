@@ -6,7 +6,7 @@
 
 mod common;
 
-use common::{assert_stories_agree, commit, open};
+use common::{assert_same_order, commit, open};
 use jade_collab_core::id::{Id, ReplicaId};
 use jade_collab_sync::{ApplyContext, Document, Lane, Materializer};
 use jade_docx_collab::intent::{resolve, IntentOp};
@@ -39,7 +39,13 @@ fn fresh(replica: u64) -> impl FnMut(u64) -> Id {
 
 /// Resolves `intent` against `model` and commits the operations it makes.
 fn edit(model: &mut DocxModel, jade: &mut JadeDocx, intent: IntentOp) -> Vec<DocxOp> {
-    let ops = resolve(model, &intent, &mut fresh(1)).expect("the intent resolves");
+    let mut next = model.max_lamport() + 1;
+    let mut ids = |n: u64| {
+        let id = Id::new(next, ReplicaId(1));
+        next += n;
+        id
+    };
+    let ops = resolve(model, &intent, &mut ids).expect("the intent resolves");
     for op in &ops {
         commit(model, jade, op.clone());
     }
@@ -77,7 +83,7 @@ fn layout(model: &DocxModel, paragraph: usize) -> String {
 fn reloaded(jade: &JadeDocx) -> (DocxModel, JadeDocx) {
     let jade = JadeDocx::load(&jade.export().unwrap()).unwrap();
     let model = DocxModel::from_word_document(jade.word()).unwrap();
-    assert_stories_agree(&model, &jade, "after reloading");
+    assert_same_order(&model, &jade, "after reloading");
     (model, jade)
 }
 
@@ -136,7 +142,7 @@ fn notes_and_text_boxes_load_as_stories_in_jade_order() {
             paragraph: 0
         }
     );
-    assert_stories_agree(&model, &jade, "on load");
+    assert_same_order(&model, &jade, "on load");
     // Each placed story is an anchor atom of its host's RGA.
     let anchors = &model.paragraphs()[HOST].anchors;
     assert_eq!(anchors.len(), 3);
@@ -490,6 +496,37 @@ fn comments_go_in_text_boxes_but_not_in_notes() {
     };
     assert!(model.apply(&op, &ctx()).is_err());
     assert_eq!(model, before);
+}
+
+/// jade's comment splits the host paragraph's runs without relisting its
+/// text box; the materializer has jade relist it, so the box stays editable.
+#[test]
+fn a_comment_on_a_text_box_host_keeps_the_box_editable() {
+    let (mut model, mut jade) = open("textbox.docx");
+    let host = model.paragraphs()[0].clone();
+    commit(
+        &mut model,
+        &mut jade,
+        DocxOp::AddComment {
+            story: StoryId::Body,
+            start: host.chars[1],
+            end: host.chars[3],
+            id: Id::new(5_000_000, ReplicaId(1)),
+            content: CommentContent::new("host"),
+        },
+    );
+    edit(
+        &mut model,
+        &mut jade,
+        IntentOp::InsertText {
+            paragraph: 1,
+            offset: 5,
+            text: " box".into(),
+        },
+    );
+    assert_eq!(model.paragraph_texts(), ["Hello", "Hello box", "World"]);
+    let (again, _) = reloaded(&jade);
+    assert_eq!(layouts(&again), layouts(&model));
 }
 
 /// Text typed at an anchor while someone splits there: whichever reaches

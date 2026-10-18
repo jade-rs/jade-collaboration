@@ -5,7 +5,9 @@
 
 mod common;
 
-use common::{assert_comments_agree, assert_stories_agree, generate, jade_comments, open};
+use common::{
+    assert_comments_agree, assert_same_order, assert_stories_agree, generate, jade_comments, open,
+};
 use jade_collab_sync::sim::Simulation;
 use jade_docx_collab::{DocxModel, JadeDocx};
 use proptest::prelude::*;
@@ -75,9 +77,9 @@ proptest! {
         assert_stories_agree(server.document(), server.materializer(), "after the session");
         assert_comments_agree(server.document(), server.materializer(), "after the session");
         let reloaded = JadeDocx::load(&server.materializer().export().unwrap()).unwrap();
-        prop_assert_eq!(reloaded.paragraph_texts(), server.document().paragraph_texts());
+        assert_same_order(server.document(), &reloaded, "against the reloaded file");
         let reloaded_model = DocxModel::from_word_document(reloaded.word()).unwrap();
-        assert_stories_agree(&reloaded_model, &reloaded, "after reloading");
+        assert_same_order(&reloaded_model, &reloaded, "after reloading");
         prop_assert_eq!(jade_comments(&reloaded).len(), server.document().comments().len());
     }
 }

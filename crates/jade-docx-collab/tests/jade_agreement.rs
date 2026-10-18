@@ -9,8 +9,8 @@ mod common;
 use std::collections::{BTreeMap, BTreeSet};
 
 use common::{
-    assert_comments_agree, assert_stories_agree, char_styles, commit, generate, jade_comments,
-    jade_core, open, paragraph_formats, paragraph_snapshot, CharStyle,
+    assert_comments_agree, assert_same_order, assert_stories_agree, char_styles, commit, generate,
+    jade_comments, jade_core, open, paragraph_formats, paragraph_snapshot, surface, CharStyle,
 };
 use jade_collab_core::id::{Id, ReplicaId};
 use jade_collab_sync::{ApplyContext, Document, Lane, Materializer};
@@ -58,6 +58,7 @@ fn every_fixture_loads_into_an_agreeing_model() {
         let model = DocxModel::from_word_document(jade.word())
             .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         assert_agree(&model, &jade, &path.display().to_string());
+        assert_same_order(&model, &jade, &path.display().to_string());
         checked += 1;
     }
     assert!(checked > 50, "only {checked} fixtures were checked");
@@ -292,13 +293,11 @@ proptest! {
                             .filter(|(_, c)| before.range_chars(*story, *start, *end).unwrap().contains(c))
                             .map(|(ch, _)| ch)
                             .collect();
-                        let surfaces = jade.paragraph_surfaces();
                         let story_surfaces: BTreeSet<usize> = model
                             .paragraphs()
                             .iter()
-                            .enumerate()
-                            .filter(|(_, p)| p.story == *story)
-                            .map(|(n, _)| surfaces[n])
+                            .filter(|p| p.story == *story)
+                            .map(|p| surface(&jade, p))
                             .collect();
                         let comment = jade_comments(&jade).into_iter().find(|c| c.id == key).unwrap();
                         let anchored: String = comment
@@ -317,8 +316,8 @@ proptest! {
         // notes and text boxes where the model has them.
         let reloaded = JadeDocx::load(&jade.export().unwrap()).unwrap();
         let reloaded_model = DocxModel::from_word_document(reloaded.word()).unwrap();
-        assert_stories_agree(&reloaded_model, &reloaded, &format!("{name} reloaded"));
-        prop_assert_eq!(reloaded.paragraph_texts(), model.paragraph_texts());
+        assert_same_order(&reloaded_model, &reloaded, &format!("{name} reloaded"));
+        assert_same_order(&model, &reloaded, &format!("{name} against the reloaded file"));
         prop_assert_eq!(anchor_layout(&reloaded_model), anchor_layout(&model));
         prop_assert_eq!(jade_comments(&reloaded).len(), model.comments().len());
     }
