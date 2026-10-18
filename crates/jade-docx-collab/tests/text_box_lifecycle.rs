@@ -393,3 +393,38 @@ fn a_text_box_goes_after_a_note_reference() {
     let (again, _) = reloaded(&jade);
     assert_eq!(layouts(&again), layouts(&model));
 }
+
+/// jade's reply re-anchors on its root's text the way `add_comment` does,
+/// splitting the runs there without relisting the paragraph's text boxes;
+/// the materializer has jade relist them after a reply too (found by the
+/// agreement property test once a text box could be put into a commented
+/// paragraph).
+#[test]
+fn a_reply_keeps_the_text_boxes_of_its_paragraph_listed() {
+    let (mut model, mut jade) = open("comment.docx");
+    // At the end of the comment's range, "Hello comment".
+    edit(&mut model, &mut jade, insert_text_box(0, 13, "箱"));
+    edit(
+        &mut model,
+        &mut jade,
+        IntentOp::ReplyToComment {
+            comment_id: "0".into(),
+            text: "reply".into(),
+            author: None,
+            initials: None,
+            date: None,
+        },
+    );
+    edit(
+        &mut model,
+        &mut jade,
+        IntentOp::InsertText {
+            paragraph: 1,
+            offset: "箱".len(),
+            text: "!".into(),
+        },
+    );
+    assert_eq!(model.paragraph_texts(), ["Hello comment", "箱!"]);
+    let (again, _) = reloaded(&jade);
+    assert_eq!(layouts(&again), layouts(&model));
+}

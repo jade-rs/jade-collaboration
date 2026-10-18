@@ -183,7 +183,7 @@ fn assert_formatted(
                     formats_after[ordinal], formats_before[ordinal],
                     "untouched paragraph {ordinal} changed {context}"
                 );
-                for c in &paragraph.chars {
+                for c in paragraph.chars.iter().filter(|c| styles_before[c].resolved) {
                     assert_eq!(
                         styles_after[c], styles_before[c],
                         "a character of untouched paragraph {ordinal} changed {context}"
@@ -204,7 +204,8 @@ fn assert_formatted(
                 shows(change, after),
                 "{c} in range lacks {change:?}: {after:?} {context}"
             );
-        } else {
+        } else if styles_before.get(c).is_none_or(|before| before.resolved) {
+            // (A run jade has not resolved yet may be resolved by any edit.)
             assert_eq!(
                 Some(after),
                 styles_before.get(c),

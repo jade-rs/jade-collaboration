@@ -695,6 +695,11 @@ fn random_range(
 pub struct CharStyle {
     pub style: HeadlessRunStyle,
     pub highlight: Option<String>,
+    /// Whether jade's run has properties at all. jade leaves the runs of a
+    /// shape it inserts without the defaults it resolves when it reads a
+    /// file (the document's font size, say) until some later edit resolves
+    /// them; the file is the same either way.
+    pub resolved: bool,
 }
 
 fn query(jade: &JadeDocx, query: HeadlessQuery) -> HeadlessQueryResult {
@@ -742,14 +747,15 @@ pub fn char_styles(model: &DocxModel, jade: &JadeDocx) -> BTreeMap<Id, CharStyle
                 snapshot.text
             );
             let mut start = 0;
-            let highlight = runs
+            let properties = runs
                 .iter()
                 .find(|r| {
                     let found = start <= offset && offset < start + r.text.len();
                     start += r.text.len();
                     found
                 })
-                .and_then(|r| r.properties.as_ref())
+                .and_then(|r| r.properties.as_ref());
+            let highlight = properties
                 .and_then(|p| p.highlight.as_deref())
                 .map(str::to_string);
             out.insert(
@@ -757,6 +763,7 @@ pub fn char_styles(model: &DocxModel, jade: &JadeDocx) -> BTreeMap<Id, CharStyle
                 CharStyle {
                     style: run.style.clone(),
                     highlight,
+                    resolved: properties.is_some(),
                 },
             );
             offset += c.len_utf8();
