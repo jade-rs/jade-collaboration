@@ -252,7 +252,9 @@ impl<H: Hosted> Hosting<H> {
                 let (store, stored) =
                     DocumentStore::open::<H::Doc, H::Op>(dir, H::FORMAT, options)?;
                 let materializer = H::load(&stored.file, &stored.checkpoint.document)?;
-                let mut sequencer = Sequencer::restore(stored.checkpoint, materializer);
+                let mut sequencer =
+                    Sequencer::restore_with_tail(stored.checkpoint, stored.tail, materializer)
+                        .map_err(|e| e.to_string())?;
                 for (index, record) in stored.journal.into_iter().enumerate() {
                     sequencer
                         .replay(record)
@@ -276,8 +278,11 @@ impl<H: Hosted> Hosting<H> {
             // journal keeps everything until then.
             match H::export(self.sequencer.materializer()) {
                 Ok(file) => {
-                    store.checkpoint(&self.sequencer.checkpoint(), &file)?;
-                    self.sequencer.compact();
+                    let keep = store.keep_tail();
+                    let log = self.sequencer.log();
+                    let tail = &log[log.len().saturating_sub(keep)..];
+                    store.checkpoint(&self.sequencer.checkpoint(), tail, &file)?;
+                    self.sequencer.compact_keeping(keep);
                 }
                 Err(error) => eprintln!("cannot checkpoint: {error}"),
             }

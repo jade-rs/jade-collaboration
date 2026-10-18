@@ -35,6 +35,11 @@ enum Cli {
         /// With --data, take a checkpoint after this many journal records.
         #[arg(long, value_name = "N", requires = "data")]
         checkpoint_every: Option<u64>,
+        /// With --data, keep this many committed operations from before each
+        /// checkpoint, so replicas that far behind can still resume
+        /// (default 1000).
+        #[arg(long, value_name = "N", requires = "data")]
+        keep_tail: Option<usize>,
         /// Require a bearer token on every request. The file is a JSON
         /// object: {"<token>": {"name": "alice", "role": "editor"|"viewer"}}.
         #[arg(long, value_name = "FILE")]
@@ -258,6 +263,7 @@ struct ServeOptions {
     save: bool,
     data: Option<PathBuf>,
     checkpoint_every: Option<u64>,
+    keep_tail: Option<usize>,
     tokens: Option<PathBuf>,
     files: Vec<PathBuf>,
 }
@@ -268,6 +274,7 @@ async fn serve(options: ServeOptions) -> Result<(), String> {
         save,
         data,
         checkpoint_every,
+        keep_tail,
         tokens,
         files,
     } = options;
@@ -281,6 +288,9 @@ async fn serve(options: ServeOptions) -> Result<(), String> {
             let mut storage = StorageOptions::default();
             if let Some(n) = checkpoint_every {
                 storage.checkpoint_every = n.max(1);
+            }
+            if let Some(n) = keep_tail {
+                storage.keep_tail = n;
             }
             let server = Server::with_storage_options(dir, storage).map_err(|e| e.to_string())?;
             for (name, _) in server.documents() {
@@ -335,6 +345,7 @@ async fn main() -> ExitCode {
             save,
             data,
             checkpoint_every,
+            keep_tail,
             tokens,
             files,
         } => {
@@ -343,6 +354,7 @@ async fn main() -> ExitCode {
                 save,
                 data,
                 checkpoint_every,
+                keep_tail,
                 tokens,
                 files,
             })

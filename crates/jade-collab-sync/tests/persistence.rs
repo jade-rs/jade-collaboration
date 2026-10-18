@@ -178,7 +178,12 @@ fn a_kept_tail_lets_replicas_just_behind_a_checkpoint_resume() {
     let b = server.join().replica;
     for (client_seq, ch) in ['v', 'w', 'x', 'y'].into_iter().enumerate() {
         let client_seq = client_seq as u64 + 1;
-        submit(&mut server, b, client_seq, insert(4 + client_seq, b, None, ch));
+        submit(
+            &mut server,
+            b,
+            client_seq,
+            insert(4 + client_seq, b, None, ch),
+        );
     }
     let full = server.log().to_vec();
     server.compact_keeping(2);
@@ -215,8 +220,8 @@ fn a_checkpoint_restores_with_its_tail() {
     let tail: Vec<Committed<ToyOp>> = through_json(&full[1..].to_vec());
     server.compact_keeping(2);
 
-    let restored = Sequencer::restore_with_tail(checkpoint.clone(), tail.clone(), NoMaterializer)
-        .unwrap();
+    let restored =
+        Sequencer::restore_with_tail(checkpoint.clone(), tail.clone(), NoMaterializer).unwrap();
     assert_eq!(restored.log_start(), 1);
     assert_eq!(restored.log(), server.log());
     assert_eq!(restored.checkpoint(), server.checkpoint());
@@ -251,11 +256,20 @@ fn a_checkpoint_restores_with_its_tail() {
 /// that did not restart but whose clients reconnected at the same moment.
 #[derive(Clone, Debug)]
 enum Step {
-    Local { client: usize, choice: u64 },
-    Up { client: usize },
-    Down { client: usize },
+    Local {
+        client: usize,
+        choice: u64,
+    },
+    Up {
+        client: usize,
+    },
+    Down {
+        client: usize,
+    },
     /// Checkpoint, keeping this many committed operations before it.
-    Checkpoint { keep: usize },
+    Checkpoint {
+        keep: usize,
+    },
     Restart,
 }
 
@@ -495,7 +509,15 @@ fn a_replica_within_the_kept_tail_resumes_on_reconnect() {
     let behind = sim.client(0).id();
     for ch in ['x', 'y'] {
         let id = sim.client_mut(1).next_id();
-        sim.local(1, ToyOp::Insert { id, parent: None, ch }).unwrap();
+        sim.local(
+            1,
+            ToyOp::Insert {
+                id,
+                parent: None,
+                ch,
+            },
+        )
+        .unwrap();
         sim.deliver_up(1);
         sim.deliver_down(1).unwrap();
     }

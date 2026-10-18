@@ -2,7 +2,7 @@
 //! storage directory, named after the document:
 //!
 //! ```text
-//! <dir>/<name>/snapshot-<n>.json   {"format": "docx", "checkpoint": <Checkpoint>}
+//! <dir>/<name>/snapshot-<n>.json   {"format": "docx", "checkpoint": <Checkpoint>, "tail": [<Committed>…]}
 //! <dir>/<name>/snapshot-<n>.docx   the file jade exported at the checkpoint
 //! <dir>/<name>/log-<n>.jsonl       one journal `Record` per line, after it
 //! ```
@@ -10,6 +10,8 @@
 //! `<n>` counts checkpoints. The checkpoint holds the model itself, not just
 //! the file: model ids are minted when a file is loaded, so a model derived
 //! again from the exported file would not match the ids every replica holds.
+//! The tail is the last committed operations before the checkpoint, kept so
+//! that replicas slightly behind it can still resume.
 //! A record is appended (and handed to the operating system) before anyone
 //! hears of it, so no replica can be ahead of the disk. A new checkpoint is
 //! complete once its `.json` is renamed into place; older generations are
@@ -19,6 +21,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use jade_collab_sync::protocol::Committed;
 use jade_collab_sync::{Checkpoint, Record};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -31,31 +34,42 @@ pub struct StorageOptions {
     /// Take a checkpoint (a new snapshot, and an empty journal) after this
     /// many journal records — joins, commits and rejections.
     pub checkpoint_every: u64,
+    /// Keep this many committed operations from before each checkpoint, in
+    /// memory and in the snapshot, so that a replica at most this far
+    /// behind can always resume instead of joining again.
+    pub keep_tail: usize,
 }
 
 impl Default for StorageOptions {
     fn default() -> Self {
         Self {
             checkpoint_every: 1000,
+            keep_tail: 1000,
         }
     }
 }
 
 #[derive(Serialize)]
-struct SnapshotOut<'a, D> {
+struct SnapshotOut<'a, D, Op> {
     format: Format,
     checkpoint: &'a Checkpoint<D>,
+    tail: &'a [Committed<Op>],
 }
 
 #[derive(Deserialize)]
-struct SnapshotIn<D> {
+struct SnapshotIn<D, Op> {
     format: Format,
     checkpoint: Checkpoint<D>,
+    /// Absent in snapshots written before tails were kept.
+    #[serde(default = "Vec::new")]
+    tail: Vec<Committed<Op>>,
 }
 
 /// What a document directory holds, read back.
 pub(crate) struct Stored<D, Op> {
     pub checkpoint: Checkpoint<D>,
+    /// The committed operations right before the checkpoint.
+    pub tail: Vec<Committed<Op>>,
     pub file: Vec<u8>,
     pub journal: Vec<Record<Op>>,
 }
@@ -136,11 +150,12 @@ fn sync_dir(dir: &Path) -> Result<(), String> {
 /// Writes checkpoint number `generation` and returns its (empty) journal,
 /// open for appending. The `.json` goes last: until it is in place the
 /// previous generation stays the newest complete one.
-fn write_generation<D: Serialize>(
+fn write_generation<D: Serialize, Op: Serialize>(
     dir: &Path,
     format: Format,
     generation: u64,
     checkpoint: &Checkpoint<D>,
+    tail: &[Committed<Op>],
     file: &[u8],
 ) -> Result<File, String> {
     write_atomically(&dir.join(snapshot_file(generation, format)), file)?;
@@ -148,8 +163,12 @@ fn write_generation<D: Serialize>(
     let log = File::create(&log_path)
         .and_then(|log| log.sync_all().map(|()| log))
         .map_err(|e| error(&log_path, e))?;
-    let json =
-        serde_json::to_vec(&SnapshotOut { format, checkpoint }).expect("checkpoints serialize");
+    let json = serde_json::to_vec(&SnapshotOut {
+        format,
+        checkpoint,
+        tail,
+    })
+    .expect("checkpoints serialize");
     write_atomically(&dir.join(snapshot_json(generation)), &json)?;
     sync_dir(dir)?;
     Ok(log)
@@ -168,7 +187,7 @@ impl DocumentStore {
             return Err(format!("{} already holds a document", dir.display()));
         }
         fs::create_dir_all(&dir).map_err(|e| error(&dir, e))?;
-        let log = write_generation(&dir, format, 1, checkpoint, file)?;
+        let log = write_generation::<D, ()>(&dir, format, 1, checkpoint, &[], file)?;
         Ok(Self {
             dir,
             format,
@@ -190,7 +209,7 @@ impl DocumentStore {
             .ok_or_else(|| format!("{} holds no snapshot", dir.display()))?;
         let json_path = dir.join(snapshot_json(generation));
         let json = fs::read(&json_path).map_err(|e| error(&json_path, e))?;
-        let snapshot: SnapshotIn<D> =
+        let snapshot: SnapshotIn<D, Op> =
             serde_json::from_slice(&json).map_err(|e| error(&json_path, e))?;
         if snapshot.format != format {
             return Err(error(
@@ -239,6 +258,7 @@ impl DocumentStore {
             store,
             Stored {
                 checkpoint: snapshot.checkpoint,
+                tail: snapshot.tail,
                 file,
                 journal,
             },
@@ -258,15 +278,21 @@ impl DocumentStore {
         Ok(self.records >= self.options.checkpoint_every)
     }
 
-    /// Replaces the snapshot with `checkpoint` and `file` and starts an
-    /// empty journal.
-    pub fn checkpoint<D: Serialize>(
+    /// How many committed operations to keep before each checkpoint.
+    pub fn keep_tail(&self) -> usize {
+        self.options.keep_tail
+    }
+
+    /// Replaces the snapshot with `checkpoint`, the `tail` of the log kept
+    /// before it, and `file`, and starts an empty journal.
+    pub fn checkpoint<D: Serialize, Op: Serialize>(
         &mut self,
         checkpoint: &Checkpoint<D>,
+        tail: &[Committed<Op>],
         file: &[u8],
     ) -> Result<(), String> {
         let generation = self.generation + 1;
-        self.log = write_generation(&self.dir, self.format, generation, checkpoint, file)?;
+        self.log = write_generation(&self.dir, self.format, generation, checkpoint, tail, file)?;
         self.generation = generation;
         self.records = 0;
         self.remove_older_generations()
@@ -357,7 +383,7 @@ mod tests {
         ) {
             let root = tempfile::tempdir().unwrap();
             let dir = root.path().join("doc.docx");
-            let options = StorageOptions { checkpoint_every, keep_tail, ..StorageOptions::default() };
+            let options = StorageOptions { checkpoint_every, keep_tail };
             let mut checkpoints = 0;
             let mut expected_checkpoint = checkpoint(checkpoints);
             let mut store = DocumentStore::create(
@@ -429,12 +455,9 @@ mod tests {
         let json = serde_json::json!({"format": "docx", "checkpoint": checkpoint(3)});
         fs::write(dir.join(snapshot_json(1)), json.to_string()).unwrap();
         fs::write(dir.join(snapshot_file(1, Format::Docx)), b"file").unwrap();
-        let (_, stored) = DocumentStore::open::<String, String>(
-            dir,
-            Format::Docx,
-            StorageOptions::default(),
-        )
-        .unwrap();
+        let (_, stored) =
+            DocumentStore::open::<String, String>(dir, Format::Docx, StorageOptions::default())
+                .unwrap();
         assert_eq!(stored.checkpoint, checkpoint(3));
         assert!(stored.tail.is_empty());
     }

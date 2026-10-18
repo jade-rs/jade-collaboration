@@ -134,11 +134,53 @@ impl<D: Document, M: Materializer<D>> Sequencer<D, M> {
         }
     }
 
+    /// [`Sequencer::restore`], with the `tail` of the log that was kept
+    /// before the checkpoint (see [`Sequencer::compact_keeping`]): replicas
+    /// within it can resume. The tail must end at the checkpoint, without
+    /// gaps.
+    pub fn restore_with_tail(
+        checkpoint: Checkpoint<D>,
+        tail: Vec<Committed<D::Op>>,
+        materializer: M,
+    ) -> Result<Self, SyncError> {
+        let journal = |reason: String| SyncError::Journal { reason };
+        let start = checkpoint
+            .seq
+            .checked_sub(tail.len() as u64)
+            .ok_or_else(|| {
+                journal(format!(
+                    "a tail of {} operations cannot end at log position {}",
+                    tail.len(),
+                    checkpoint.seq
+                ))
+            })?;
+        for (expected, committed) in (start + 1..).zip(&tail) {
+            if committed.seq != expected {
+                return Err(journal(format!(
+                    "the tail holds log position {} where {expected} belongs",
+                    committed.seq
+                )));
+            }
+        }
+        let mut sequencer = Self::restore(checkpoint, materializer);
+        sequencer.log_start = start;
+        sequencer.log = tail;
+        Ok(sequencer)
+    }
+
     /// Drops the log up to the current position, once a checkpoint of it is
     /// safe. Replicas that are further behind can no longer resume.
     pub fn compact(&mut self) {
-        self.log_start = self.seq();
-        self.log.clear();
+        self.compact_keeping(0);
+    }
+
+    /// Like [`Sequencer::compact`], but keeps the last `keep` committed
+    /// operations (or as many as there are), so that a replica at most
+    /// `keep` operations behind can always still resume.
+    pub fn compact_keeping(&mut self, keep: usize) {
+        let dropped = self.log.len().saturating_sub(keep);
+        self.log.drain(..dropped);
+        self.log_start += dropped as u64;
     }
 
     /// Applies a journaled record, as the sequencer did when it was

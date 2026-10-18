@@ -205,7 +205,6 @@ async fn checkpoints_bound_the_log_and_replicas_behind_them_must_rejoin() {
     let options = StorageOptions {
         checkpoint_every: 3,
         keep_tail: 0,
-        ..StorageOptions::default()
     };
     let server = Server::with_storage_options(dir.path(), options).unwrap();
     server.open("hello.docx", fixture("hello.docx")).unwrap();
@@ -273,7 +272,6 @@ async fn replicas_just_behind_a_checkpoint_resume_from_the_kept_tail() {
     let options = StorageOptions {
         checkpoint_every: 3,
         keep_tail: 4,
-        ..StorageOptions::default()
     };
     let server = Server::with_storage_options(dir.path(), options).unwrap();
     server.open("hello.docx", fixture("hello.docx")).unwrap();
