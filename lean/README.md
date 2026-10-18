@@ -9,7 +9,7 @@ Lean 4 proofs of the properties `docs/design.md` §7 lists for the
 
 ```sh
 cd lean
-lake build
+lake build            # the proofs and the grid-oracle executable
 ```
 
 The toolchain is pinned in `lean-toolchain` (`leanprover/lean4:v4.34.0`).
@@ -64,3 +64,108 @@ descending `(lamport, replica, value)` order and tombstones filtered out.
 - `quiescent_view_eq_server`, `quiescent_converges`: with nothing pending and
   the server's log fully folded into the confirmed state, the client's view
   equals the server's state.
+
+### `JadeCollab/Grid.lean`: the table grid (`jade_collab_core::grid::Grid`)
+
+A line-for-line model of `Grid` with `Nat` identifiers. `apply : Grid → Op →
+Option Grid` takes the same accept/reject decisions as `Grid::apply` and leaves
+the same state: an inserted row goes to `position(after) + 1` (or `0`), a new
+merge is pushed at the end, `Unmerge` removes the first merge with that
+top-left, and a deletion tombstones the line and then normalizes every merge
+(corners moved to the first/last alive line between them, merges with fewer
+than two alive cells dropped). `Valid` is exactly what `check_invariants`
+checks: identifiers unique per axis, an alive row and column, every merge
+passing `check_merge`, and no merge overlapping an earlier one (on raw
+positions).
+
+- `apply_preserves_valid : Valid g → apply g op = some g' → Valid g'`: every
+  accepted operation keeps the invariant. Insertions shift positions
+  monotonically (`pos_insertAt`, `sh_le_sh`), so `overlaps` is unchanged and
+  alive-cell counts only grow (`cnt_insertAt`). Normalization after a deletion
+  only shrinks a merge inside its old rectangle onto alive corners
+  (`normalizeOne_spec`), and sub-rectangles of disjoint rectangles stay
+  disjoint (`overlaps_normalizeOne`). Columns are handled as the rows of the
+  transposed grid (`apply_insertCol`, `apply_deleteCol`, `Valid.tr`).
+- `apply_rejects_unchanged`: a rejected operation leaves the sequencer's state
+  as it was (`apply_accepts` is the other case).
+- `grid_sequenced_valid`, `grid_replicas_valid`: any log of grid operations
+  folded by the sequencer (`Sequencer.step apply`), in any number of chunks,
+  leaves a valid grid.
+- `check_iff_valid`: the executable `check` (the loops of `check_invariants`)
+  decides `Valid`.
+- `sanity_*`: the unit tests of `crates/jade-collab-core/tests/grid.rs`,
+  evaluated by `decide` (insert after an anchor, deleted rows still anchor
+  inserts, last row/column kept, overlapping and malformed merges rejected,
+  deleting an anchor row shrinks a merge and a one-cell merge disappears,
+  unmerge, the naive union of two merges is invalid).
+
+### `JadeCollab/CellCommute.lean`: cell contents are convergent
+
+A table is a grid plus contents for every `(row, column)` pair; a cell edit
+(any function of the old contents) is accepted iff the row and the column exist,
+alive or deleted.
+
+- `apply_ids`: grid operations never remove identifiers; the only ones they
+  add are the row or column an insertion creates.
+- `cell_edit_comm_grid`: a cell edit valid where it was made commutes with
+  every grid operation — applying it before or after gives the same result,
+  both rejected or both the same table.
+- `cell_edit_after_grid_iff`: the edit is accepted after a grid operation iff
+  before, unless that operation created the edited row or column
+  (`cell_edit_needs_existing_row` shows the side condition is needed).
+  `grid_after_cell_edit`: a grid operation's outcome does not depend on cell
+  edits.
+- `step_comm_edit_grid`: the sequencer steps of a valid cell edit and any grid
+  operation commute. `cell_edit_in_deleted_row`: an edit to a cell of a
+  deleted row still lands.
+
+### `JadeCollab/Anchor.lean`: tables stay anchored to visible marks
+
+A story of characters and paragraph marks (with tombstones) and tables
+anchored after a mark or at the story start. Convergent: insert a character,
+insert a mark (split), delete a character (never a mark). Sequenced: join
+(delete a mark, refused while a live table hangs off it), insert a table after
+a visible mark, delete a table.
+
+- `apply_preserves_anchored`, `anchored_sequenced`: every live table's anchor
+  mark exists and is visible, after any accepted operation and any sequenced
+  log.
+- `convergent_preserves_sequenced_validity`: a convergent operation never
+  changes whether a join, a table insertion or a table deletion is accepted,
+  as long as the sequenced operation does not name the mark the convergent one
+  creates (`join_needs_existing_mark` shows why that side condition is
+  needed). `join_blocked_by_table` is a concrete run of the guard.
+
+## `grid-oracle`
+
+`lake build` also builds `.lake/build/bin/grid-oracle` (`GridOracle.lean`),
+which runs the same `apply` and `check` as `Grid.lean` on a line protocol, for
+differential testing against the Rust `Grid`:
+
+```
+rows <id> <id> ...                 initial rows, all alive, in order
+cols <id> <id> ...                 initial columns
+ir <id> <after|->                  InsertRow (`-`: at the top)
+dr <id>                            DeleteRow
+ic <id> <after|->                  InsertColumn (`-`: at the left)
+dc <id>                            DeleteColumn
+m <top> <left> <bottom> <right>    Merge
+u <top> <left>                     Unmerge
+```
+
+It prints `ok` or `err` per operation, then `rows <id>:<1|0> ...` and
+`cols <id>:<1|0> ...` (every line ever inserted, in order, with its alive
+flag), `merges <top>,<left>,<bottom>,<right> ...` (in list order; the bare word
+when there are none) and `valid` or `invalid`. A malformed line is reported on
+stderr with exit code 2.
+
+```sh
+$ printf 'rows 1 2 3\ncols 101\nm 1 101 3 101\ndr 1\ndr 3\n' | lake exe grid-oracle
+ok
+ok
+ok
+rows 1:0 2:1 3:0
+cols 101:1
+merges
+valid
+```
