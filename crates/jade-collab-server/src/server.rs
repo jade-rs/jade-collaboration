@@ -380,6 +380,22 @@ async fn connection(socket: WebSocket, commands: mpsc::Sender<Command>, grant: O
                     Err(_) => break,
                 }
             }
+            ClientMessage::Presence { state } => match replica {
+                Some(replica) => {
+                    let command = Command::Presence {
+                        replica,
+                        name: grant.as_ref().map(|grant| grant.name.clone()),
+                        state,
+                        outbox: outbox.clone(),
+                    };
+                    if commands.send(command).is_err() {
+                        break;
+                    }
+                }
+                None => say(ServerMessage::Error {
+                    message: "join or resume before sending presence".into(),
+                }),
+            },
             ClientMessage::Submit(submission) => match replica {
                 // Answered here: a viewer's operation never reaches the
                 // document, and its replica has nothing of its own in the log.

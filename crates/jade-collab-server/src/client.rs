@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use futures_util::stream::{SplitSink, SplitStream};
@@ -34,9 +35,18 @@ pub enum ClientError {
     Closed,
 }
 
+/// What another replica shares about itself.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Presence {
+    /// Its token's name, on a server with tokens.
+    pub name: Option<String>,
+    pub state: serde_json::Value,
+}
+
 struct Shared<D: Document> {
     replica: Mutex<Replica<D>>,
     events: Mutex<Vec<ReplicaEvent<D::Op>>>,
+    presence: Mutex<BTreeMap<ReplicaId, Presence>>,
     error: Mutex<Option<String>>,
     changed: Notify,
 }
@@ -199,6 +209,7 @@ where
         let shared = Arc::new(Shared {
             replica: Mutex::new(replica),
             events: Mutex::new(events),
+            presence: Mutex::new(BTreeMap::new()),
             error: Mutex::new(None),
             changed: Notify::new(),
         });
@@ -239,6 +250,19 @@ where
                 Downstream::Committed(decode_committed(committed)?)
             }
             ServerMessage::Rejected(rejected) => Downstream::Rejected(rejected),
+            ServerMessage::Presence {
+                replica,
+                name,
+                state,
+            } => {
+                let presence = Presence { name, state };
+                shared.presence.lock().unwrap().insert(replica, presence);
+                return Ok(());
+            }
+            ServerMessage::PresenceLeft { replica } => {
+                shared.presence.lock().unwrap().remove(&replica);
+                return Ok(());
+            }
             ServerMessage::Error { message } => return Err(ClientError::Protocol(message)),
             other => return Err(ClientError::Protocol(format!("unexpected {other:?}"))),
         };
@@ -288,12 +312,12 @@ where
         std::mem::take(&mut *self.shared.events.lock().unwrap())
     }
 
-    async fn wait_until(&self, done: impl Fn(&Replica<D>) -> bool) -> Result<(), ClientError> {
+    async fn wait_until(&self, done: impl Fn(&Shared<D>) -> bool) -> Result<(), ClientError> {
         loop {
             let notified = self.shared.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if done(&self.shared.replica.lock().unwrap()) {
+            if done(&self.shared) {
                 return Ok(());
             }
             if let Some(error) = self.shared.error.lock().unwrap().clone() {
@@ -303,14 +327,38 @@ where
         }
     }
 
+    /// Shares `state` with the other replicas, replacing what this one
+    /// shared before. Ephemeral: never logged, gone when the connection is.
+    pub fn set_presence(&self, state: serde_json::Value) {
+        let message = serde_json::to_string(&ClientMessage::Presence { state })
+            .expect("client messages serialize");
+        let _ = self.outgoing.send(message);
+    }
+
+    /// What the other replicas currently share.
+    pub fn presence(&self) -> BTreeMap<ReplicaId, Presence> {
+        self.shared.presence.lock().unwrap().clone()
+    }
+
+    /// Waits until the others' presence satisfies `done`.
+    pub async fn wait_for_presence(
+        &self,
+        done: impl Fn(&BTreeMap<ReplicaId, Presence>) -> bool,
+    ) -> Result<(), ClientError> {
+        self.wait_until(|shared| done(&shared.presence.lock().unwrap()))
+            .await
+    }
+
     /// Waits until the server has answered every local operation.
     pub async fn settle(&self) -> Result<(), ClientError> {
-        self.wait_until(|replica| replica.pending_len() == 0).await
+        self.wait_until(|shared| shared.replica.lock().unwrap().pending_len() == 0)
+            .await
     }
 
     /// Waits until the replica has received the log up to `seq`.
     pub async fn wait_for_seq(&self, seq: u64) -> Result<(), ClientError> {
-        self.wait_until(|replica| replica.seq() >= seq).await
+        self.wait_until(|shared| shared.replica.lock().unwrap().seq() >= seq)
+            .await
     }
 
     /// Closes the connection and hands back the replica, pending operations

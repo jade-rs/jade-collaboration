@@ -35,6 +35,14 @@ pub(crate) enum Command {
         replica: ReplicaId,
         submission: Submission<Value>,
     },
+    /// Carries the connection's outbox, so a late update from a replica's
+    /// old connection does not override its newer one.
+    Presence {
+        replica: ReplicaId,
+        name: Option<String>,
+        state: Value,
+        outbox: Outbox,
+    },
     /// A connection closed. Carries its outbox so a late `Leave` from an old
     /// connection does not unsubscribe the replica's newer one.
     Leave {
@@ -252,6 +260,15 @@ impl<H: Hosted> Hosting<H> {
 
     fn serve(&mut self, inbox: mpsc::Receiver<Command>) -> Result<(), String> {
         let mut subscribers: BTreeMap<ReplicaId, Outbox> = BTreeMap::new();
+        // Ephemeral: in memory only, gone when the connection is.
+        let mut presence: BTreeMap<ReplicaId, ServerMessage> = BTreeMap::new();
+        let others = |subscribers: &BTreeMap<ReplicaId, Outbox>, replica, json: String| {
+            for (other, outbox) in subscribers {
+                if *other != replica {
+                    let _ = outbox.send(json.clone());
+                }
+            }
+        };
         while let Ok(command) = inbox.recv() {
             match command {
                 Command::Join { outbox, reply } => {
@@ -269,6 +286,9 @@ impl<H: Hosted> Hosting<H> {
                     // Sent from this thread before any later commit, so the
                     // replica starts exactly at `seq`.
                     let _ = outbox.send(message.to_json());
+                    for message in presence.values() {
+                        let _ = outbox.send(message.to_json());
+                    }
                     subscribers.insert(welcome.replica, outbox);
                     let _ = reply.send(welcome.replica);
                 }
@@ -284,6 +304,14 @@ impl<H: Hosted> Hosting<H> {
                             missed: resume.missed.into_iter().map(committed_json).collect(),
                         };
                         let _ = outbox.send(message.to_json());
+                        // Whatever the replica's old connection showed is stale.
+                        if presence.remove(&replica).is_some() {
+                            let left = ServerMessage::PresenceLeft { replica }.to_json();
+                            others(&subscribers, replica, left);
+                        }
+                        for message in presence.values() {
+                            let _ = outbox.send(message.to_json());
+                        }
                         subscribers.insert(replica, outbox);
                         let _ = reply.send(Ok(()));
                     }
@@ -333,12 +361,36 @@ impl<H: Hosted> Hosting<H> {
                         SubmitOutcome::Duplicate => {}
                     }
                 }
-                Command::Leave { replica, outbox } => {
+                Command::Presence {
+                    replica,
+                    name,
+                    state,
+                    outbox,
+                } => {
                     if subscribers
                         .get(&replica)
                         .is_some_and(|current| current.same_channel(&outbox))
                     {
+                        let message = ServerMessage::Presence {
+                            replica,
+                            name,
+                            state,
+                        };
+                        others(&subscribers, replica, message.to_json());
+                        presence.insert(replica, message);
+                    }
+                }
+                Command::Leave { replica, outbox } => {
+                    // A subscriber whose outbox failed was dropped already;
+                    // its `Leave` still ends its presence.
+                    let current = subscribers
+                        .get(&replica)
+                        .is_none_or(|current| current.same_channel(&outbox));
+                    if current {
                         subscribers.remove(&replica);
+                        presence.remove(&replica);
+                        let left = ServerMessage::PresenceLeft { replica }.to_json();
+                        others(&subscribers, replica, left);
                     }
                 }
                 Command::Export { reply } => {

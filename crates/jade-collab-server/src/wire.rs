@@ -47,6 +47,11 @@ pub enum ClientMessage {
         seq: u64,
     },
     Submit(Submission<Value>),
+    /// Ephemeral state for the others to see (a cursor, a selection, …);
+    /// replaces this replica's previous presence. Never logged.
+    Presence {
+        state: Value,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -64,6 +69,19 @@ pub enum ServerMessage {
     },
     Committed(Committed<Value>),
     Rejected(Rejected),
+    /// Another replica's presence; `name` is its token's name, if the server
+    /// has tokens.
+    Presence {
+        replica: ReplicaId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        state: Value,
+    },
+    /// Another replica's connection closed (or it reconnected): its presence
+    /// is gone.
+    PresenceLeft {
+        replica: ReplicaId,
+    },
     /// The server cannot resume the replica (it never joined, or its log
     /// position was compacted into a checkpoint); join again.
     Rejoin {

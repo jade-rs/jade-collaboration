@@ -302,3 +302,95 @@ proptest! {
         });
     }
 }
+
+mod raw {
+    //! A bare socket speaking the wire protocol, to hold a replica's old
+    //! connection open while it resumes on a new one.
+    use futures_util::{SinkExt, StreamExt};
+    use jade_collab_server::wire::{ClientMessage, ServerMessage};
+    use tokio_tungstenite::tungstenite::Message;
+
+    pub struct Raw(
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    );
+
+    impl Raw {
+        pub async fn open(url: &str) -> Self {
+            Raw(tokio_tungstenite::connect_async(url).await.unwrap().0)
+        }
+
+        pub async fn send(&mut self, message: &ClientMessage) {
+            let text = serde_json::to_string(message).unwrap();
+            self.0.send(Message::Text(text.into())).await.unwrap();
+        }
+
+        pub async fn receive(&mut self) -> ServerMessage {
+            loop {
+                if let Message::Text(text) = self.0.next().await.unwrap().unwrap() {
+                    return serde_json::from_str(&text).unwrap();
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resuming_on_a_new_connection_drops_the_old_connections_presence() {
+    use jade_collab_sync::protocol::Submission;
+    use jade_collab_sync::Document;
+
+    let (_server, url) = start(Server::new()).await;
+    let observer: Client<DocxModel> = Client::connect(&url, None).await.unwrap();
+    let mut old = raw::Raw::open(&url).await;
+    old.send(&ClientMessage::Join).await;
+    let ServerMessage::Welcome {
+        replica, snapshot, ..
+    } = old.receive().await
+    else {
+        panic!("expected a welcome");
+    };
+    old.send(&ClientMessage::Presence {
+        state: json!("old"),
+    })
+    .await;
+    until(&observer, |m| state_of(m, replica) == Some(&json!("old"))).await;
+
+    // The replica comes back on a new connection while the old one is
+    // still open: what the old one showed is gone.
+    let mut new = raw::Raw::open(&url).await;
+    new.send(&ClientMessage::Resume { replica, seq: 0 }).await;
+    assert!(matches!(new.receive().await, ServerMessage::Resumed { .. }));
+    until(&observer, |m| !m.contains_key(&replica)).await;
+
+    // A late update from the old connection is ignored. It is followed, on
+    // the same connection, by an operation; once that is in, the update
+    // has been handled.
+    old.send(&ClientMessage::Presence {
+        state: json!("stale"),
+    })
+    .await;
+    let model: DocxModel = serde_json::from_value(snapshot).unwrap();
+    let op = DocxOp::InsertText {
+        story: StoryId::Body,
+        parent: None,
+        first: jade_collab_core::id::Id::new(model.max_lamport() + 1, replica),
+        text: "x".into(),
+    };
+    old.send(&ClientMessage::Submit(Submission {
+        client_seq: 1,
+        base_seq: 0,
+        op: serde_json::to_value(op).unwrap(),
+    }))
+    .await;
+    tokio::time::timeout(Duration::from_secs(10), observer.wait_for_seq(1))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !observer.presence().contains_key(&replica),
+        "{:?}",
+        observer.presence()
+    );
+}
