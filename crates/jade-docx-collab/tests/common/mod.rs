@@ -145,9 +145,27 @@ pub fn commit(model: &mut DocxModel, jade: &mut JadeDocx, op: DocxOp) -> Vec<Doc
         .unwrap_or_else(|e| panic!("{op:?}: {e}"));
     jade.materialize(model, effect.clone(), &ctx)
         .unwrap_or_else(|e| panic!("{op:?}: {e}"));
+    derive(model, jade, &op);
     assert_stories_agree(model, jade, &format!("after {op:?}"));
     assert_comments_agree(model, jade, &format!("after {op:?}"));
     effect
+}
+
+/// Commits what the server derives after `cause` (the numbers jade gave
+/// what it made), as the sequencer does right after it.
+pub fn derive(model: &mut DocxModel, jade: &mut JadeDocx, cause: &DocxOp) {
+    let ctx = ApplyContext {
+        origin: jade_collab_core::id::ReplicaId::ORIGIN,
+        base_seq: 0,
+        seq: Some(1),
+    };
+    for op in jade.derived(model, cause) {
+        let effect = model
+            .apply(&op, &ctx)
+            .unwrap_or_else(|e| panic!("derived {op:?}: {e}"));
+        jade.materialize(model, effect, &ctx)
+            .unwrap_or_else(|e| panic!("derived {op:?}: {e}"));
+    }
 }
 
 /// Turns a random `choice` into an operation on `view`. `ids(n)` reserves `n`

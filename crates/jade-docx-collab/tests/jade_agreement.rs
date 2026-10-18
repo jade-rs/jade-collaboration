@@ -9,8 +9,9 @@ mod common;
 use std::collections::{BTreeMap, BTreeSet};
 
 use common::{
-    assert_comments_agree, assert_same_order, assert_stories_agree, char_styles, commit, generate,
-    jade_comments, jade_core, open, paragraph_formats, paragraph_snapshot, surface, CharStyle,
+    assert_comments_agree, assert_same_order, assert_stories_agree, char_styles, commit, derive,
+    generate, jade_comments, jade_core, open, paragraph_formats, paragraph_snapshot, surface,
+    CharStyle,
 };
 use jade_collab_core::id::{Id, ReplicaId};
 use jade_collab_sync::{ApplyContext, Document, Lane, Materializer};
@@ -267,6 +268,7 @@ proptest! {
                     let context = format!("{name} after {op:?}");
                     jade.materialize(&model, effect.clone(), &ctx)
                         .unwrap_or_else(|e| panic!("{name}: jade refused {op:?}: {e}"));
+                    derive(&mut model, &mut jade, &op);
                     assert_agree(&model, &jade, &context);
                     assert_comments_agree(&model, &jade, &context);
                     if let (Some(styles_before), Some(formats_before)) = (styles_before, formats_before) {
