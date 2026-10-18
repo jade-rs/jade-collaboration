@@ -10,7 +10,7 @@ use common::{assert_comments_agree, assert_stories_agree, open};
 use jade_collab_core::id::{Id, ReplicaId};
 use jade_collab_sync::protocol::Submission;
 use jade_collab_sync::{ApplyContext, Document, Sequencer, SubmitOutcome};
-use jade_docx_collab::{CommentContent, DocxModel, DocxOp, JadeDocx, Numbered, StoryId};
+use jade_docx_collab::{CommentContent, DocxModel, DocxOp, JadeDocx, NoteKind, Numbered, StoryId};
 
 fn submit(
     server: &mut Sequencer<DocxModel, JadeDocx>,
@@ -202,4 +202,80 @@ fn only_the_server_numbers() {
         DocxModel::lane(&number(comment)),
         jade_collab_sync::Lane::Sequenced
     );
+}
+
+#[test]
+fn a_restored_server_still_addresses_the_notes_made_before() {
+    let (model, jade) = open("jade-core/hello.docx");
+    let p = model.paragraphs();
+    let mut server = Sequencer::with_materializer(model, jade);
+    let replica = server.join().replica;
+    let (footnote, endnote) = (Id::new(1_000, replica), Id::new(1_100, replica));
+    for (client_seq, kind, id) in [
+        (1, NoteKind::Footnote, footnote),
+        (2, NoteKind::Endnote, endnote),
+    ] {
+        let outcome = submit(
+            &mut server,
+            replica,
+            client_seq,
+            DocxOp::InsertNote {
+                kind,
+                story: StoryId::Body,
+                parent: Some(p[0].chars[1]),
+                id,
+                text: "note".into(),
+            },
+        );
+        assert!(
+            matches!(outcome, SubmitOutcome::Committed(_)),
+            "{outcome:?}"
+        );
+        let derived = server.take_derived();
+        assert_eq!(derived.len(), 1, "{derived:?}");
+        assert!(matches!(
+            derived[0].op,
+            DocxOp::Numbered {
+                item: Numbered::Footnote { .. } | Numbered::Endnote { .. },
+                ..
+            }
+        ));
+    }
+    let mut server = restart(&server);
+    for (client_seq, op) in [
+        (
+            3,
+            DocxOp::InsertText {
+                story: StoryId::Footnote { id: footnote },
+                parent: Some(footnote.offset(5)),
+                first: Id::new(2_000, replica),
+                text: " typed".into(),
+            },
+        ),
+        (
+            4,
+            DocxOp::InsertText {
+                story: StoryId::Endnote { id: endnote },
+                parent: None,
+                first: Id::new(2_100, replica),
+                text: "E".into(),
+            },
+        ),
+        (
+            5,
+            DocxOp::DeleteNote {
+                kind: NoteKind::Footnote,
+                note: footnote,
+            },
+        ),
+    ] {
+        let outcome = submit(&mut server, replica, client_seq, op.clone());
+        assert!(
+            matches!(outcome, SubmitOutcome::Committed(_)),
+            "{op:?}: {outcome:?}"
+        );
+        assert_stories_agree(server.document(), server.materializer(), &format!("{op:?}"));
+    }
+    assert!(server.faults().is_empty(), "{:?}", server.faults());
+    assert_eq!(server.document().paragraph_texts()[2], "E\tnote");
 }

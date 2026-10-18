@@ -8,7 +8,7 @@ use jade_collab_core::id::Id;
 use jade_collab_sync::{ApplyContext, Document, Lane, Materializer};
 use jade_docx_collab::intent::{resolve, IntentOp};
 use jade_docx_collab::{
-    Anchor, CommentContent, DocxEffect, DocxModel, DocxOp, FormatChange, JadeDocx,
+    Anchor, CommentContent, DocxEffect, DocxModel, DocxOp, FormatChange, JadeDocx, NoteKind,
     ParagraphAlignment, StoryId,
 };
 use jade_docx_document_core::headless_api::execute_headless_queries_on_document;
@@ -175,7 +175,7 @@ pub fn generate(view: &DocxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
     let paragraphs = view.paragraphs();
     let pick = |n: usize, salt: u32| ((choice >> salt) as usize) % n.max(1);
     let words = ["x", "日本", "é", "Lorem ", "  ", "ab"];
-    match choice % 30 {
+    match choice % 34 {
         // Typing at a random caret, through the index-addressed intent API.
         0..=4 => {
             let p = pick(paragraphs.len(), 8);
@@ -272,7 +272,7 @@ pub fn generate(view: &DocxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
             let table = editable[pick(editable.len(), 8)];
             let row = table.rows[pick(table.rows.len(), 12)];
             let column = table.columns[pick(table.columns.len(), 16)];
-            let op = match choice % 30 {
+            let op = match choice % 34 {
                 11 => GridOp::InsertRow {
                     id: ids(1),
                     after: (pick(3, 20) != 0).then_some(row),
@@ -400,6 +400,61 @@ pub fn generate(view: &DocxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
         }
         // Edits right next to a text box or a note reference.
         25..=29 => around_anchor(view, &paragraphs, choice, ids),
+        // A new footnote or endnote at a random caret, or where a text box
+        // or note reference already sits.
+        30..=32 => {
+            let (p, offset) = if choice % 34 == 32 {
+                let anchored: Vec<(usize, usize)> = paragraphs
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(p, q)| q.anchors.iter().map(move |a| (p, a.offset)))
+                    .collect();
+                *anchored.get(pick(anchored.len(), 8))?
+            } else {
+                let p = pick(paragraphs.len(), 8);
+                let text = &paragraphs[p].text;
+                let boundaries: Vec<usize> = text
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .chain([text.len()])
+                    .collect();
+                (p, boundaries[pick(boundaries.len(), 16)])
+            };
+            let text = ["", "note", "注"][pick(3, 24)].to_string();
+            let op = if pick(3, 28) == 0 {
+                IntentOp::InsertEndnote {
+                    paragraph: p,
+                    offset,
+                    text,
+                }
+            } else {
+                IntentOp::InsertFootnote {
+                    paragraph: p,
+                    offset,
+                    text,
+                }
+            };
+            resolve(view, &op, ids).ok()?.into_iter().next()
+        }
+        // Deleting a footnote or endnote some paragraph references.
+        33 => {
+            let notes: Vec<StoryId> = paragraphs
+                .iter()
+                .flat_map(|p| p.anchors.iter().map(|a| a.story))
+                .filter(|s| !matches!(s, StoryId::TextBox { .. }))
+                .collect();
+            Some(match *notes.get(pick(notes.len(), 8))? {
+                StoryId::Footnote { id } => DocxOp::DeleteNote {
+                    kind: NoteKind::Footnote,
+                    note: id,
+                },
+                StoryId::Endnote { id } => DocxOp::DeleteNote {
+                    kind: NoteKind::Endnote,
+                    note: id,
+                },
+                _ => unreachable!("filtered"),
+            })
+        }
         _ => {
             let comments = view.comments();
             if comments.is_empty() {
@@ -433,7 +488,7 @@ fn around_anchor(
     let anchor = &paragraph.anchors[a];
     // Characters before the anchor.
     let before = paragraph.text[..anchor.offset].chars().count();
-    match choice % 30 {
+    match choice % 34 {
         25 => {
             let op = IntentOp::InsertText {
                 paragraph: p,

@@ -269,6 +269,10 @@ async fn advertised_edits_match_the_intent_apis() {
             "resolve_comment",
             "delete_comment",
             "update_comment",
+            "insert_footnote",
+            "insert_endnote",
+            "delete_footnote",
+            "delete_endnote",
             "merge_table_cells",
             "unmerge_table_cells"
         ]
