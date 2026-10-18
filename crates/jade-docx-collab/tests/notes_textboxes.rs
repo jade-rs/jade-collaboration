@@ -529,6 +529,48 @@ fn a_comment_on_a_text_box_host_keeps_the_box_editable() {
     assert_eq!(layouts(&again), layouts(&model));
 }
 
+/// Text typed after a reference that is alone in its paragraph, then
+/// formatted in part: jade keeps one reference (jade-core gives the text a
+/// run of its own; typed into the reference's run, a later split of that
+/// run copied the reference).
+#[test]
+fn text_after_a_lone_reference_keeps_one_reference_when_formatted() {
+    let (mut model, mut jade) = open("footnote.docx");
+    edit(
+        &mut model,
+        &mut jade,
+        IntentOp::InsertParagraphBreak {
+            paragraph: 0,
+            offset: 5,
+            count: 1,
+        },
+    );
+    assert_eq!(layout(&model, 1), "[1]");
+    edit(
+        &mut model,
+        &mut jade,
+        IntentOp::InsertText {
+            paragraph: 1,
+            offset: 0,
+            text: "Lorem".into(),
+        },
+    );
+    edit(
+        &mut model,
+        &mut jade,
+        IntentOp::Format {
+            start_paragraph: 1,
+            start_offset: 1,
+            end_paragraph: 1,
+            end_offset: 3,
+            change: jade_docx_collab::FormatChange::Italic { value: true },
+        },
+    );
+    assert_eq!(layout(&model, 1), "[1]Lorem");
+    let (again, _) = reloaded(&jade);
+    assert_eq!(layouts(&again), layouts(&model));
+}
+
 /// Text typed at an anchor while someone splits there: whichever reaches
 /// the server first, and whichever is newer, every replica orders the two
 /// the same way and jade ends up with the same document — even when the
