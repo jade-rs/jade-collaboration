@@ -195,3 +195,18 @@ fn rejects_ranges_outside_the_sheet() {
     )
     .is_err());
 }
+
+#[test]
+fn merge_and_sheet_intents() {
+    let mut model = XlsxModel::blank(&[("S", 4, 4)]);
+    apply(&mut model, r#"{"type":"merge_cells","sheet":"S","range":"A1:B2"}"#).unwrap();
+    assert!(apply(&mut model, r#"{"type":"merge_cells","sheet":"S","range":"B2:C3"}"#).is_err());
+    apply(&mut model, r#"{"type":"unmerge_cells","sheet":"S","range":"A1:B2"}"#).unwrap();
+    apply(&mut model, r#"{"type":"add_sheet","name":"T","after":"S"}"#).unwrap();
+    apply(&mut model, r#"{"type":"rename_sheet","sheet":"T","name":"Totals"}"#).unwrap();
+    apply(&mut model, r#"{"type":"move_sheet","sheet":"Totals","to":0}"#).unwrap();
+    let names: Vec<String> = model.sheets().into_iter().map(|s| s.name).collect();
+    assert_eq!(names, ["Totals", "S"]);
+    apply(&mut model, r#"{"type":"delete_sheet","sheet":"S"}"#).unwrap();
+    assert!(apply(&mut model, r#"{"type":"delete_sheet","sheet":"Totals"}"#).is_err());
+}
