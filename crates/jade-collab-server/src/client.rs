@@ -37,6 +37,10 @@ pub enum ClientError {
     /// closed the connection.
     #[error("{0}")]
     Revoked(String),
+    /// The client read too slowly and the server dropped the connection;
+    /// [`Client::resume`] catches up.
+    #[error("{0}")]
+    Overloaded(String),
 }
 
 /// What another replica shares about itself.
@@ -142,6 +146,7 @@ where
             } => Replica::new(replica, seq, decode(snapshot)?),
             ServerMessage::Error { message } => return Err(ClientError::Protocol(message)),
             ServerMessage::Revoked { message } => return Err(ClientError::Revoked(message)),
+            ServerMessage::Overloaded { message } => return Err(ClientError::Overloaded(message)),
             other => {
                 return Err(ClientError::Protocol(format!(
                     "expected a welcome, got {other:?}"
@@ -185,6 +190,7 @@ where
             ServerMessage::Rejoin { message } => return Err(ClientError::Rejoin(message)),
             ServerMessage::Error { message } => return Err(ClientError::Protocol(message)),
             ServerMessage::Revoked { message } => return Err(ClientError::Revoked(message)),
+            ServerMessage::Overloaded { message } => return Err(ClientError::Overloaded(message)),
             other => {
                 return Err(ClientError::Protocol(format!(
                     "expected resumed, got {other:?}"
@@ -277,6 +283,7 @@ where
             }
             ServerMessage::Error { message } => return Err(ClientError::Protocol(message)),
             ServerMessage::Revoked { message } => return Err(ClientError::Revoked(message)),
+            ServerMessage::Overloaded { message } => return Err(ClientError::Overloaded(message)),
             other => return Err(ClientError::Protocol(format!("unexpected {other:?}"))),
         };
         let event = shared.replica.lock().unwrap().receive(downstream)?;

@@ -14,12 +14,12 @@ use jade_xlsx_collab::{JadeXlsx, LoadOptions, XlsxModel};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
-use tokio::sync::{mpsc::UnboundedSender, oneshot};
+use tokio::sync::oneshot;
 
 use crate::storage::{DocumentStore, StorageOptions};
 use crate::wire::{Format, ServerMessage};
 
-pub(crate) type Outbox = UnboundedSender<String>;
+pub(crate) use crate::outbox::Outbox;
 
 pub(crate) enum Command {
     Join {
@@ -294,12 +294,11 @@ impl<H: Hosted> Hosting<H> {
         let mut subscribers: BTreeMap<ReplicaId, Outbox> = BTreeMap::new();
         // Ephemeral: in memory only, gone when the connection is.
         let mut presence: BTreeMap<ReplicaId, ServerMessage> = BTreeMap::new();
-        let others = |subscribers: &BTreeMap<ReplicaId, Outbox>, replica, json: String| {
-            for (other, outbox) in subscribers {
-                if *other != replica {
-                    let _ = outbox.send(json.clone());
-                }
-            }
+        // A subscriber that cannot take a message is gone or too far behind:
+        // it is dropped, and its connection closes.
+        let others = |subscribers: &mut BTreeMap<ReplicaId, Outbox>, replica, json: String| {
+            subscribers
+                .retain(|other, outbox| *other == replica || outbox.send(json.clone()).is_ok());
         };
         while let Ok(command) = inbox.recv() {
             match command {
@@ -339,7 +338,7 @@ impl<H: Hosted> Hosting<H> {
                         // Whatever the replica's old connection showed is stale.
                         if presence.remove(&replica).is_some() {
                             let left = ServerMessage::PresenceLeft { replica }.to_json();
-                            others(&subscribers, replica, left);
+                            others(&mut subscribers, replica, left);
                         }
                         for message in presence.values() {
                             let _ = outbox.send(message.to_json());
@@ -415,7 +414,7 @@ impl<H: Hosted> Hosting<H> {
                             name,
                             state,
                         };
-                        others(&subscribers, replica, message.to_json());
+                        others(&mut subscribers, replica, message.to_json());
                         presence.insert(replica, message);
                     }
                 }
@@ -429,7 +428,7 @@ impl<H: Hosted> Hosting<H> {
                         subscribers.remove(&replica);
                         presence.remove(&replica);
                         let left = ServerMessage::PresenceLeft { replica }.to_json();
-                        others(&subscribers, replica, left);
+                        others(&mut subscribers, replica, left);
                     }
                 }
                 Command::Export { reply } => {

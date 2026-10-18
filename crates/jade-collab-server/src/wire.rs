@@ -112,6 +112,12 @@ pub enum ServerMessage {
     Revoked {
         message: String,
     },
+    /// The connection fell too far behind: more was waiting to be sent to
+    /// it than the server keeps. The server closes the socket after this;
+    /// resume on a new one to catch up.
+    Overloaded {
+        message: String,
+    },
 }
 
 impl ServerMessage {

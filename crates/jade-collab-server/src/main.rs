@@ -73,6 +73,16 @@ enum Cli {
         /// that (default 20).
         #[arg(long, value_name = "N")]
         presence_per_second: Option<u32>,
+        /// Messages that may wait for one connection (default 1024); a
+        /// connection with more waiting reads too slowly and is closed with
+        /// `overloaded` (its replica resumes on a new one).
+        #[arg(long, value_name = "N")]
+        outgoing_limit: Option<usize>,
+        /// Append one JSON line per access to this file: sockets connected,
+        /// replicas joined, resumed and closed, requests refused, files
+        /// uploaded and downloaded — by token name, never by token.
+        #[arg(long, value_name = "FILE")]
+        audit_log: Option<PathBuf>,
         files: Vec<PathBuf>,
     },
     /// Print a document's current content as JSON.
@@ -303,6 +313,8 @@ struct ServeOptions {
     tokens: Option<PathBuf>,
     tokens_poll: u64,
     presence: PresenceLimits,
+    outgoing_limit: Option<usize>,
+    audit_log: Option<PathBuf>,
     files: Vec<PathBuf>,
 }
 
@@ -317,6 +329,8 @@ async fn serve(options: ServeOptions) -> Result<(), String> {
         tokens,
         tokens_poll,
         presence,
+        outgoing_limit,
+        audit_log,
         files,
     } = options;
     // Bound first, so `--addr host:0` works and the URLs printed are real.
@@ -345,7 +359,13 @@ async fn serve(options: ServeOptions) -> Result<(), String> {
         }
         None => Server::new(),
     };
-    let server = server.with_presence_limits(presence);
+    let mut server = server.with_presence_limits(presence);
+    if let Some(limit) = outgoing_limit {
+        server = server.with_outgoing_limit(limit);
+    }
+    if let Some(path) = audit_log {
+        server = server.with_audit_log(path).map_err(|e| e.to_string())?;
+    }
     let server = match &tokens {
         Some(path) => server.with_tokens(Tokens::load(path).map_err(|e| e.to_string())?),
         None => server,
@@ -425,6 +445,8 @@ async fn main() -> ExitCode {
             presence_max_bytes,
             presence_burst,
             presence_per_second,
+            outgoing_limit,
+            audit_log,
             files,
         } => {
             let defaults = PresenceLimits::default();
@@ -443,6 +465,8 @@ async fn main() -> ExitCode {
                 tokens,
                 tokens_poll,
                 presence,
+                outgoing_limit,
+                audit_log,
                 files,
             })
             .await

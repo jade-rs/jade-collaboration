@@ -622,6 +622,33 @@ connection itself, before the document's thread sees it, and only its sender
 gets `presence_rejected {reason}`; submissions go through the same loop
 untouched.
 
+### Slow connections
+
+The document's thread never waits on a connection. Each connection has a
+bounded queue of outgoing messages (1024 by default, `--outgoing-limit`);
+the thread offers each message without blocking, and a message that does not
+fit means the client reads too slowly. The thread then stops sending to that
+connection (it leaves the subscribers, so the others are not held up), and
+the connection says `overloaded {message}` and closes with 1013 (try again
+later). Its replica is not lost: it resumes on a new connection like after
+any disconnect and catches up from the log (or rejoins if what it missed was
+compacted). A test floods a client that reads nothing with presence and
+checks that the flooding client's operation still commits, that the slow one
+is told and closed without being sent everything, and that it resumes; a
+mutation that stops reporting the overflow fails it.
+
+### Audit log
+
+`--audit-log FILE` appends one JSON object per line for every access, each
+with `at` (milliseconds since the Unix epoch) and `event`: `connected`
+(document, token name, role), `joined` / `resumed` (the replica), `closed`
+(the replica and why: `client`, `revoked`, `overloaded`, `stopped`),
+`refused` (status 401 with the request path, or 403 with the document and
+token name), `uploaded` and `downloaded`. A token is recorded by its grant's
+name and never by itself, and request URLs are reduced to their path, since
+a socket may carry its token in the query; a test checks that no secret
+reaches the file.
+
 ## 9. Status and next steps
 
 Working: the two-lane protocol over WebSockets; docx text, paragraph
@@ -646,7 +673,8 @@ log compaction that keeps a tail for replicas slightly behind, and an
 optional fsync per journal record; bearer-token authentication with editor
 and viewer roles, per-document access and roles, and tokens rotated without a
 restart (revoked sockets are closed); presence, limited in size and rate per
-connection.
+connection; a bounded outgoing queue per connection (a client that reads too
+slowly is closed and resumes); an audit log of every access.
 
 Not yet:
 
@@ -661,10 +689,8 @@ Not yet:
   deleting notes and text boxes; splitting or joining a text box's
   paragraphs (jade does not write them); comments in notes; the concurrent
   orders around anchors jade cannot realise (§4).
-* Access and durability: a connection's outgoing queue is unbounded (a
-  client that stops reading makes it grow), there is no audit log of who
-  connected with which token, and reloading tokens on SIGHUP is Unix-only
-  (the file is still polled everywhere).
+* Access: reloading tokens on SIGHUP is Unix-only (the file is still polled
+  everywhere); the audit log is a plain file that is never rotated.
 * Performance: RGA lookups are linear and paragraph positions are recomputed
   by walking the model on each operation; formatting and comment operations
   are preflighted on a copy of the jade document; jade's xlsx editor rereads
