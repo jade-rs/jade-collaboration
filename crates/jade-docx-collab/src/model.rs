@@ -15,7 +15,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+mod index;
 mod tracked;
+
+use index::{IndexCache, Root, Skeleton, Slot};
 
 use jade_collab_core::grid::{Grid, GridOp, Merge};
 use jade_collab_core::id::{Id, ReplicaId};
@@ -311,6 +314,10 @@ pub struct DocxModel {
     #[serde(default, with = "pairs")]
     pub(crate) deleted: BTreeMap<Id, BTreeSet<Id>>,
     pub(crate) max_lamport: u64,
+    /// Where the paragraphs are ([`index`]); derived, never compared or
+    /// written.
+    #[serde(skip)]
+    pub(crate) index: IndexCache,
 }
 
 /// What a revision does.
@@ -1116,7 +1123,11 @@ pub enum DocxEffect {
 
 #[derive(Default)]
 struct Walk {
+    /// Whether paragraphs are listed with their text (otherwise only
+    /// `slots` and the tables are).
+    content: bool,
     paragraphs: Vec<Paragraph>,
+    slots: Vec<Slot>,
     tables: Vec<TableView>,
     /// Every visible table of the body, nested ones included, in pre-order.
     all_tables: Vec<Id>,
@@ -1127,19 +1138,8 @@ struct Walk {
     endnotes_referenced: Vec<Id>,
 }
 
-/// The story whose paragraphs share one numbering in jade's story
-/// positions: the body (table cells included), a text box (by its host body
-/// paragraph and its index among the host's text boxes) or a note.
-#[derive(Clone, Copy, Debug)]
-enum Root {
-    Body,
-    TextBox { host: usize, index: usize },
-    Footnote(Id),
-    Endnote(Id),
-}
-
 /// Where a visible atom is.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Located {
     ordinal: usize,
     /// UTF-8 bytes of its paragraph before it (a mark: the paragraph's length).
@@ -1215,11 +1215,70 @@ impl DocxModel {
             inserted: BTreeMap::new(),
             deleted: BTreeMap::new(),
             max_lamport: next - 1,
+            index: IndexCache::default(),
         }
     }
 
     fn walk(&self) -> Walk {
-        let mut out = Walk::default();
+        self.walk_with(true)
+    }
+
+    /// The skeleton of the walk, as kept ([`index`]).
+    fn skeleton(&self) -> &Skeleton {
+        self.index.get_or_build(|| self.build_skeleton())
+    }
+
+    fn build_skeleton(&self) -> Skeleton {
+        let walk = self.walk_with(false);
+        Skeleton::new(walk.slots, walk.all_tables)
+    }
+
+    /// Compares the kept paragraph index with one built from scratch and
+    /// every atom's place with the full walk's. For tests.
+    #[doc(hidden)]
+    pub fn check_index(&self) -> Result<(), String> {
+        let fresh = self.build_skeleton();
+        if let Some(kept) = self.index.get() {
+            if *kept != fresh {
+                return Err(format!(
+                    "the kept paragraph index differs from a rebuilt one:\nkept  {:?}\nfresh {:?}",
+                    kept.slots, fresh.slots
+                ));
+            }
+        }
+        let walk = self.walk();
+        let ats: Vec<ParagraphStory> = walk.paragraphs.iter().map(|p| p.at.clone()).collect();
+        let indexed: Vec<ParagraphStory> = fresh.slots.iter().map(|s| self.at_slot(s)).collect();
+        if ats != indexed {
+            return Err(format!(
+                "story positions differ: walk {ats:?}, index {indexed:?}"
+            ));
+        }
+        let mut every = BTreeSet::new();
+        for (_, story) in self.stories() {
+            every.extend(story.flow.iter().map(|n| n.id));
+        }
+        let by_walk = self.locate_by_walk(&walk.paragraphs, &every);
+        let indexed = self.locate(&every);
+        if by_walk != indexed {
+            let differ: Vec<_> = every
+                .iter()
+                .filter(|id| by_walk.get(id) != indexed.get(id))
+                .map(|id| (id, by_walk.get(id), indexed.get(id)))
+                .take(8)
+                .collect();
+            return Err(format!(
+                "atoms located differently (walk, index): {differ:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn walk_with(&self, content: bool) -> Walk {
+        let mut out = Walk {
+            content,
+            ..Walk::default()
+        };
         self.walk_story(Root::Body, StoryId::Body, &self.body, &mut out, &mut 0);
         // Footnotes no body paragraph referenced, then endnotes in order of
         // first reference, then the others — by w:id, as jade lists them.
@@ -1272,6 +1331,7 @@ impl DocxModel {
         let mut current = Paragraph::new(id);
         for node in story.flow.iter().filter(|n| !n.deleted) {
             match node.value {
+                Atom::Char(_) if !out.content => {}
                 Atom::Char(c) => {
                     current.text.push(c);
                     current.chars.push(node.id);
@@ -1299,37 +1359,30 @@ impl DocxModel {
     /// Lists `paragraph`, then — as jade does after a body paragraph — the
     /// text boxes it anchors and the footnotes it references first.
     fn emit(&self, root: Root, mut paragraph: Paragraph, out: &mut Walk, counter: &mut usize) {
-        let mut next = || {
-            *counter += 1;
-            *counter - 1
-        };
-        paragraph.at = match root {
+        let index = match root {
             Root::Body => {
                 out.body += 1;
-                ParagraphStory::Body {
-                    index: out.body - 1,
-                }
+                out.body - 1
             }
-            Root::TextBox { host, index } => ParagraphStory::TextBox {
-                host,
-                text_box: index,
-                paragraph: next(),
-            },
-            Root::Footnote(id) => ParagraphStory::Footnote {
-                note_id: self.footnotes[&id].file_id.clone(),
-                paragraph: next(),
-            },
-            Root::Endnote(id) => ParagraphStory::Endnote {
-                note_id: self.endnotes[&id].file_id.clone(),
-                paragraph: next(),
-            },
+            _ => {
+                *counter += 1;
+                *counter - 1
+            }
         };
-        let host = match paragraph.at {
-            ParagraphStory::Body { index } => Some(index),
-            _ => None,
+        let slot = Slot {
+            story: paragraph.story,
+            mark: paragraph.mark,
+            root,
+            index,
         };
-        let anchors = paragraph.anchors.clone();
-        out.paragraphs.push(paragraph);
+        let host = (root == Root::Body).then_some(index);
+        let anchors = std::mem::take(&mut paragraph.anchors);
+        if out.content {
+            paragraph.at = self.at_slot(&slot);
+            paragraph.anchors = anchors.clone();
+            out.paragraphs.push(paragraph);
+        }
+        out.slots.push(slot);
         if matches!(root, Root::Body | Root::TextBox { .. }) {
             for anchor in &anchors {
                 if let StoryId::Endnote { id } = anchor.story {
@@ -1506,11 +1559,154 @@ impl DocxModel {
         Ok(story)
     }
 
-    /// Where each requested visible atom is; a mark reports its paragraph's
-    /// end.
+    /// jade's story position of a paragraph of the skeleton.
+    fn at_slot(&self, slot: &Slot) -> ParagraphStory {
+        match slot.root {
+            Root::Body => ParagraphStory::Body { index: slot.index },
+            Root::TextBox { host, index } => ParagraphStory::TextBox {
+                host,
+                text_box: index,
+                paragraph: slot.index,
+            },
+            Root::Footnote(id) => ParagraphStory::Footnote {
+                note_id: self.footnotes[&id].file_id.clone(),
+                paragraph: slot.index,
+            },
+            Root::Endnote(id) => ParagraphStory::Endnote {
+                note_id: self.endnotes[&id].file_id.clone(),
+                paragraph: slot.index,
+            },
+        }
+    }
+
+    /// Where each requested visible atom of a visible paragraph is
+    /// (characters and marks; a mark reports its paragraph's end), found
+    /// story by story.
     fn locate(&self, ids: &BTreeSet<Id>) -> BTreeMap<Id, Located> {
         let mut found = BTreeMap::new();
-        for (ordinal, paragraph) in self.paragraphs().into_iter().enumerate() {
+        let mut left = ids.clone();
+        for (id, story) in self.stories() {
+            if left.is_empty() {
+                break;
+            }
+            let mine: BTreeSet<Id> = left
+                .iter()
+                .copied()
+                .filter(|a| story.flow.contains(*a))
+                .collect();
+            if mine.is_empty() {
+                continue;
+            }
+            left.retain(|a| !mine.contains(a));
+            self.locate_atoms(id, story, &mine, false, &mut found);
+        }
+        found
+    }
+
+    /// [`Self::locate`] for atoms of one story.
+    fn locate_in(&self, story: StoryId, ids: &BTreeSet<Id>) -> BTreeMap<Id, Located> {
+        let mut found = BTreeMap::new();
+        if let Some(entry) = self.story(story) {
+            self.locate_atoms(story, entry, ids, false, &mut found);
+        }
+        found
+    }
+
+    /// Finds the requested atoms of `story` paragraph by paragraph: from
+    /// the first one not yet found back to the previous visible mark, then
+    /// forward to the next, which names the paragraph. Costs the paragraphs
+    /// they are in, not the story. With `anchors`, anchor atoms are found
+    /// too (their offset, and the paragraph's anchors before them).
+    fn locate_atoms(
+        &self,
+        story_id: StoryId,
+        story: &Story,
+        ids: &BTreeSet<Id>,
+        anchors: bool,
+        found: &mut BTreeMap<Id, Located>,
+    ) {
+        let flow = &story.flow;
+        let mut positions: Vec<usize> = ids.iter().filter_map(|id| flow.position(*id)).collect();
+        if positions.is_empty() {
+            return;
+        }
+        positions.sort_unstable();
+        let skeleton = self.skeleton();
+        let opens =
+            |node: &jade_collab_core::rga::Node<Atom>| !node.deleted && node.value == Atom::Mark;
+        let mut next = 0;
+        while next < positions.len() {
+            let target = positions[next];
+            let mut position = target
+                - flow
+                    .nodes_before_rev(target)
+                    .take_while(|n| !opens(n))
+                    .count();
+            let (mut offset, mut before) = (0, 0);
+            let mut here: Vec<(Id, usize, usize, usize)> = Vec::new();
+            let mut end = None;
+            for node in flow.nodes_in(position..) {
+                let wanted = positions.get(next) == Some(&position);
+                if wanted {
+                    next += 1;
+                }
+                position += 1;
+                if node.deleted {
+                    continue;
+                }
+                match node.value {
+                    Atom::Char(c) => {
+                        if wanted {
+                            here.push((node.id, offset, c.len_utf8(), before));
+                        }
+                        offset += c.len_utf8();
+                    }
+                    Atom::Anchor(_) => {
+                        if wanted && anchors {
+                            here.push((node.id, offset, 0, before));
+                        }
+                        before += 1;
+                    }
+                    Atom::Mark => {
+                        if wanted {
+                            here.push((node.id, offset, 0, before));
+                        }
+                        end = Some(node.id);
+                        break;
+                    }
+                }
+            }
+            // The positions this paragraph held are all consumed; skip any
+            // left behind by a story whose paragraph is not listed.
+            while positions.get(next).is_some_and(|p| *p < position) {
+                next += 1;
+            }
+            let Some(ordinal) = skeleton.last(&(story_id, end)) else {
+                continue;
+            };
+            for (id, offset, len, anchors) in here {
+                found.insert(
+                    id,
+                    Located {
+                        ordinal,
+                        offset,
+                        len,
+                        anchors,
+                    },
+                );
+            }
+        }
+    }
+
+    /// The walk-based [`Self::locate`] the index replaces, kept as the
+    /// reference [`Self::check_index`] compares it with.
+    fn locate_by_walk(
+        &self,
+        paragraphs: &[Paragraph],
+        ids: &BTreeSet<Id>,
+    ) -> BTreeMap<Id, Located> {
+        let mut found = BTreeMap::new();
+        for (ordinal, paragraph) in paragraphs.iter().enumerate() {
             let mut offset = 0;
             for (c, id) in paragraph.text.chars().zip(&paragraph.chars) {
                 if ids.contains(id) {
@@ -1544,20 +1740,26 @@ impl DocxModel {
         found
     }
 
-    fn locate_one(&self, id: Id) -> Option<Located> {
-        self.locate(&BTreeSet::from([id])).get(&id).copied()
+    fn locate_one(&self, story: StoryId, id: Id) -> Option<Located> {
+        self.locate_in(story, &BTreeSet::from([id]))
+            .get(&id)
+            .copied()
     }
 
     /// jade's story position of the visible paragraph at `ordinal`.
     fn at(&self, ordinal: usize) -> ParagraphStory {
-        self.paragraphs()[ordinal].at.clone()
+        self.at_slot(&self.skeleton().slots[ordinal])
+    }
+
+    /// The story position of the visible paragraph at `ordinal`, if any.
+    pub(crate) fn paragraph_at(&self, ordinal: usize) -> Option<ParagraphStory> {
+        let slot = self.skeleton().slots.get(ordinal)?;
+        Some(self.at_slot(slot))
     }
 
     /// The ordinal of the visible paragraph `mark` ends.
     pub(crate) fn paragraph_ending_with(&self, story: StoryId, mark: Id) -> Option<usize> {
-        self.paragraphs()
-            .iter()
-            .position(|p| p.story == story && p.mark == Some(mark))
+        self.skeleton().first(&(story, Some(mark)))
     }
 
     /// The table's index among all visible tables of the body, nested ones
@@ -1565,7 +1767,7 @@ impl DocxModel {
     /// structure. The materializer maps it to jade's `table_order_index`
     /// (which also counts tables inside text boxes).
     fn table_order(&self, table: Id) -> Option<usize> {
-        self.walk().all_tables.iter().position(|t| *t == table)
+        self.skeleton().all_tables.iter().position(|t| *t == table)
     }
 
     fn observe(&mut self, ids: impl IntoIterator<Item = Id>) {
@@ -1593,7 +1795,7 @@ impl DocxModel {
         )?;
         self.observe([first.offset(count - 1)]);
         Ok(self
-            .locate_one(first)
+            .locate_one(story, first)
             .map(|at| DocxEffect::InsertText {
                 paragraph: self.at(at.ordinal),
                 offset: at.offset,
@@ -1620,7 +1822,7 @@ impl DocxModel {
                 Some(_) => {}
             }
         }
-        let effects = self.removal(&ids.iter().copied().collect());
+        let effects = self.removal_in(Some(story), &ids.iter().copied().collect());
         let flow = &mut self.story_mut(story).expect("checked").flow;
         for id in ids {
             flow.delete(*id)?;
@@ -1632,8 +1834,12 @@ impl DocxModel {
     /// adjacent characters — never across an anchor, so jade gets no range
     /// holding a text box's or a reference's run — in document order, as
     /// (paragraph ordinal, start, end, anchors before).
-    pub(crate) fn ranges(&self, ids: &BTreeSet<Id>) -> Vec<(usize, usize, usize, usize)> {
-        self.classified_ranges(ids, |_| false)
+    pub(crate) fn ranges(
+        &self,
+        story: Option<StoryId>,
+        ids: &BTreeSet<Id>,
+    ) -> Vec<(usize, usize, usize, usize)> {
+        self.classified_ranges(story, ids, |_| false)
             .into_iter()
             .map(|(_, range)| range)
             .collect()
@@ -1643,11 +1849,15 @@ impl DocxModel {
     #[allow(clippy::type_complexity)]
     fn classified_ranges(
         &self,
+        story: Option<StoryId>,
         ids: &BTreeSet<Id>,
         class: impl Fn(Id) -> bool,
     ) -> Vec<(bool, (usize, usize, usize, usize))> {
-        let mut spans: Vec<((usize, usize, usize, usize), bool)> = self
-            .locate(ids)
+        let located = match story {
+            Some(story) => self.locate_in(story, ids),
+            None => self.locate(ids),
+        };
+        let mut spans: Vec<((usize, usize, usize, usize), bool)> = located
             .iter()
             .filter(|(_, at)| at.len > 0)
             .map(|(id, at)| {
@@ -1679,13 +1889,13 @@ impl DocxModel {
     /// the end so earlier offsets stay valid. jade's text deletion leaves
     /// text a tracked deletion holds, so that text goes by accepting the
     /// deletion jade shows on it.
-    pub(crate) fn removal(&self, ids: &BTreeSet<Id>) -> Vec<DocxEffect> {
-        let paragraphs = self.paragraphs();
-        self.classified_ranges(ids, |id| self.tracked(id).deleted.is_some())
+    /// `story`, when given, holds every one of `ids`.
+    pub(crate) fn removal_in(&self, story: Option<StoryId>, ids: &BTreeSet<Id>) -> Vec<DocxEffect> {
+        self.classified_ranges(story, ids, |id| self.tracked(id).deleted.is_some())
             .into_iter()
             .rev()
             .map(|(deleted, (p, start, end, anchors))| {
-                let paragraph = paragraphs[p].at.clone();
+                let paragraph = self.at(p);
                 if deleted {
                     DocxEffect::RemoveDeletedRange {
                         paragraph,
@@ -1716,8 +1926,9 @@ impl DocxModel {
             .flow
             .insert(id, parent, Atom::Mark)?;
         self.observe([id]);
+        self.split_index(story, id);
         Ok(self
-            .locate_one(id)
+            .locate_one(story, id)
             .map(|at| DocxEffect::SplitParagraph {
                 paragraph: self.at(at.ordinal),
                 offset: at.offset,
@@ -1725,6 +1936,40 @@ impl DocxModel {
             })
             .into_iter()
             .collect())
+    }
+
+    /// Keeps the index after the new mark `mark` split a paragraph of
+    /// `story`: in place when the paragraph holds no text box or note
+    /// reference (whose stories would move with the halves), else by
+    /// dropping it.
+    fn split_index(&mut self, story: StoryId, mark: Id) {
+        let Some(mut skeleton) = self.index.take() else {
+            return;
+        };
+        let flow = &self.story(story).expect("split").flow;
+        let at = flow.position(mark).expect("inserted");
+        let mut anchored = false;
+        let mut end = None;
+        for node in flow.nodes_in(at + 1..).filter(|n| !n.deleted) {
+            match node.value {
+                Atom::Mark => {
+                    end = Some(node.id);
+                    break;
+                }
+                Atom::Anchor(_) => anchored = true,
+                Atom::Char(_) => {}
+            }
+        }
+        for node in flow.nodes_before_rev(at).filter(|n| !n.deleted) {
+            match node.value {
+                Atom::Mark => break,
+                Atom::Anchor(_) => anchored = true,
+                Atom::Char(_) => {}
+            }
+        }
+        if !anchored && skeleton.split(story, end, mark) {
+            self.index.put(skeleton);
+        }
     }
 
     fn join(&mut self, story_id: StoryId, mark: Id) -> Result<Vec<DocxEffect>, Rejection> {
@@ -1748,23 +1993,24 @@ impl DocxModel {
                 "a table separates the paragraphs; they cannot be joined",
             ));
         }
-        let paragraphs = self.paragraphs();
-        let ordinal = paragraphs
-            .iter()
-            .position(|p| p.story == story_id && p.mark == Some(mark));
+        let skeleton = self.skeleton();
+        let ordinal = skeleton.first(&(story_id, Some(mark)));
         // jade lists the text boxes a paragraph anchors and the footnotes it
         // references first between it and the next one, and cannot join
         // across them.
         if let Some(p) = ordinal {
-            if paragraphs.get(p + 1).map(|q| q.story) != Some(story_id) {
+            if skeleton.slots.get(p + 1).map(|q| q.story) != Some(story_id) {
                 return Err(reject(
                     "a text box or a note sits between the paragraphs; they cannot be joined",
                 ));
             }
         }
         let effect = ordinal.map(|p| DocxEffect::JoinParagraph {
-            paragraph: paragraphs[p].at.clone(),
-            offset: paragraphs[p].text.len(),
+            paragraph: self.at(p),
+            offset: self
+                .locate_one(story_id, mark)
+                .expect("a listed paragraph's mark is found")
+                .offset,
         });
         self.story_mut(story_id)
             .expect("checked")
@@ -1790,22 +2036,22 @@ impl DocxModel {
         if !rows.iter().chain(columns).all(|i| all.insert(*i)) {
             return Err(reject("table, row and column ids must be distinct"));
         }
-        let paragraphs = self.paragraphs();
+        let slots = &self.skeleton().slots;
         let effect = match anchor {
             Anchor::Start => {
-                let first = paragraphs
+                let first = slots
                     .iter()
                     .find(|p| p.story == StoryId::Body)
                     .ok_or_else(|| reject("the body has no paragraph"))?;
                 DocxEffect::InsertTable {
-                    paragraph: first.at.clone(),
+                    paragraph: self.at_slot(first),
                     above: true,
                     rows: rows.len(),
                     columns: columns.len(),
                 }
             }
             Anchor::After(mark) => {
-                let paragraph = paragraphs
+                let paragraph = slots
                     .iter()
                     .find(|p| p.story == StoryId::Body && p.mark == Some(mark))
                     .ok_or_else(|| {
@@ -1814,7 +2060,7 @@ impl DocxModel {
                         ))
                     })?;
                 DocxEffect::InsertTable {
-                    paragraph: paragraph.at.clone(),
+                    paragraph: self.at_slot(paragraph),
                     above: false,
                     rows: rows.len(),
                     columns: columns.len(),
@@ -2115,17 +2361,15 @@ impl DocxModel {
         if first > last {
             return Err(reject("the range starts after it ends"));
         }
-        let ids: BTreeSet<Id> = flow
-            .nodes_in(first..=last)
-            .filter(|n| !n.deleted)
-            .map(|n| n.id)
-            .collect();
-        // Only atoms of visible paragraphs (not of a deleted table's cells).
-        let located = self.locate(&ids);
+        // Only atoms of visible paragraphs (not of a deleted table's cells),
+        // and only characters and marks.
+        if !self.skeleton().lists(story) {
+            return Ok(Vec::new());
+        }
         Ok(flow
             .nodes_in(first..=last)
+            .filter(|n| !n.deleted && !matches!(n.value, Atom::Anchor(_)))
             .map(|n| n.id)
-            .filter(|id| located.contains_key(id))
             .collect())
     }
 
@@ -2151,14 +2395,13 @@ impl DocxModel {
     ) -> Result<Vec<DocxEffect>, Rejection> {
         change.validate().map_err(reject)?;
         let atoms = self.range_atoms(story, start, end)?;
-        let located = self.locate(&atoms.iter().copied().collect());
-        let paragraphs = self.paragraphs();
+        let located = self.locate_in(story, &atoms.iter().copied().collect());
         if change.is_paragraph_level() {
             let touched: BTreeSet<usize> = located.values().map(|at| at.ordinal).collect();
             return Ok(touched
                 .into_iter()
                 .map(|p| DocxEffect::FormatParagraph {
-                    paragraph: paragraphs[p].at.clone(),
+                    paragraph: self.at(p),
                     change: change.clone(),
                 })
                 .collect());
@@ -2176,7 +2419,7 @@ impl DocxModel {
         Ok(slices
             .into_iter()
             .map(|(p, (start, end))| DocxEffect::FormatText {
-                paragraph: paragraphs[p].at.clone(),
+                paragraph: self.at(p),
                 start,
                 end,
                 change: change.clone(),
@@ -2402,7 +2645,7 @@ impl DocxModel {
         let (Some(first), Some(last)) = (chars.first(), chars.last()) else {
             return Err(reject("the text to comment on was deleted"));
         };
-        let located = self.locate(&BTreeSet::from([*first, *last]));
+        let located = self.locate_in(story, &BTreeSet::from([*first, *last]));
         let (from, to) = (located[first], located[last]);
         let (start_paragraph, start_offset) = (self.at(from.ordinal), from.offset);
         let (end_paragraph, end_offset, len) = (self.at(to.ordinal), to.offset, to.len);
@@ -2600,18 +2843,21 @@ impl DocxModel {
         // It goes wherever its parent puts it, among the anchors at its
         // offset too: whether it is accepted must not depend on the text
         // around it, which concurrent convergent edits change.
-        let host = self.editable_story(story)?;
-        let mut flow = host.flow.clone();
-        flow.insert(id, parent, Atom::Anchor(placement))?;
-        let host = std::mem::replace(&mut self.story_mut(story).expect("checked").flow, flow);
-        let located = self.paragraphs().into_iter().find_map(|p| {
-            let at = p.anchors.iter().position(|a| a.id == id)?;
-            Some((p.at.clone(), p.anchors[at].offset, at))
-        });
-        located.ok_or_else(|| {
-            self.story_mut(story).expect("checked").flow = host;
-            reject("the paragraph is gone")
-        })
+        self.editable_story(story)?;
+        if !self.skeleton().lists(story) {
+            return Err(reject("the paragraph is gone"));
+        }
+        self.story_mut(story)
+            .expect("checked")
+            .flow
+            .insert(id, parent, Atom::Anchor(placement))?;
+        // Placing an anchor moves nothing before it: the index still finds
+        // its paragraph (and is dropped after the operation).
+        let mut found = BTreeMap::new();
+        let host = self.story(story).expect("checked");
+        self.locate_atoms(story, host, &BTreeSet::from([id]), true, &mut found);
+        let at = found[&id];
+        Ok((self.at(at.ordinal), at.offset, at.anchors))
     }
 
     /// Refuses text for a new note or text box that jade would not keep.
@@ -2770,7 +3016,9 @@ impl DocxModel {
     /// jade removes the comments anchored in table cells it deletes; so does
     /// the model, after any operation that removes cells.
     fn drop_comments_in_removed_cells(&mut self) {
-        let visible: BTreeSet<StoryId> = self.paragraphs().iter().map(|p| p.story).collect();
+        // Called after cells, notes or text boxes went: the index is stale.
+        self.index.invalidate();
+        let visible: BTreeSet<StoryId> = self.skeleton().slots.iter().map(|p| p.story).collect();
         let orphaned: Vec<Id> = self
             .comments
             .iter()
@@ -2828,6 +3076,39 @@ impl Document for DocxModel {
     }
 
     fn apply(&mut self, op: &DocxOp, ctx: &ApplyContext) -> Result<Vec<DocxEffect>, Rejection> {
+        let result = self.apply_op(op, ctx);
+        // What keeps every paragraph, text box and note where it was keeps
+        // the index; a split maintains it itself; anything else drops it.
+        let keeps = matches!(
+            op,
+            DocxOp::InsertText { .. }
+                | DocxOp::DeleteText { .. }
+                | DocxOp::SplitParagraph { .. }
+                | DocxOp::TrackInsertText { .. }
+                | DocxOp::TrackDeleteText { .. }
+                | DocxOp::Mark { .. }
+                | DocxOp::Format { .. }
+                | DocxOp::AddComment { .. }
+                | DocxOp::ReplyToComment { .. }
+                | DocxOp::ResolveComment { .. }
+                | DocxOp::UpdateComment { .. }
+                | DocxOp::DeleteComment { .. }
+                | DocxOp::SetTracking { .. }
+                | DocxOp::SetAuthor { .. }
+        );
+        if !keeps {
+            self.index.invalidate();
+        }
+        result
+    }
+
+    fn max_lamport(&self) -> u64 {
+        self.max_lamport
+    }
+}
+
+impl DocxModel {
+    fn apply_op(&mut self, op: &DocxOp, ctx: &ApplyContext) -> Result<Vec<DocxEffect>, Rejection> {
         match op {
             DocxOp::InsertText {
                 story,
@@ -2934,10 +3215,6 @@ impl Document for DocxModel {
             DocxOp::AcceptRevisions { revisions } => self.decide(revisions, true),
             DocxOp::RejectRevisions { revisions } => self.decide(revisions, false),
         }
-    }
-
-    fn max_lamport(&self) -> u64 {
-        self.max_lamport
     }
 }
 

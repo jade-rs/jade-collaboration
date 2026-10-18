@@ -1084,7 +1084,9 @@ impl Materializer<DocxModel> for JadeDocx {
             };
             // Between two paragraphs jade may list a text box's or a note's
             // paragraphs; it cannot join across them.
-            let at = model.paragraphs()[paragraph].at.clone();
+            let Some(at) = model.paragraph_at(paragraph) else {
+                return Ok(());
+            };
             if let (Ok(a), Ok(b)) = (self.surface(&at), self.surface(&next_paragraph(&at))) {
                 if a + 1 != b {
                     return Err(Rejection::new(

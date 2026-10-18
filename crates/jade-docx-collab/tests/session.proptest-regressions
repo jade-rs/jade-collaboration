@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc 98896d83666e9a52a6708ad5a9cca2a863ef8ab299219965fa2a0288bd787d1c # shrinks to fixture = "comment.docx", steps = [Local { client: 0, choice: 4546543508985377833 }, Local { client: 0, choice: 0 }]
 cc 8c29e088ac52a8a508055fd941f6d87c743c7c8fd08c76ee539c72af20a7b6b1 # shrinks to fixture = "footnote-table-textbox-order.docx", steps = [Local { client: 2, choice: 16291984833174489686 }, Local { client: 2, choice: 3388595971177366918 }]
+cc 927b00efab0d727d44546cc43cfef6b28750ba9b766d35de87ce0665dffef6cd # shrinks to fixture = "review-kinds.docx", steps = [Local { client: 0, choice: 3409272064295727527 }, Local { client: 0, choice: 10940820104596795738 }, Local { client: 2, choice: 11213926050139427797 }, Up { client: 0 }, Restart, Local { client: 0, choice: 7501074580749795718 }]

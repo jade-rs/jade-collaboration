@@ -179,19 +179,18 @@ impl DocxModel {
                 }
             }
         }
-        let mut effects = self.restoring(&taken);
-        effects.extend(self.deleting(&shown, revision));
+        let mut effects = self.restoring(Some(story), &taken);
+        effects.extend(self.deleting(Some(story), &shown, revision));
         Ok(effects)
     }
 
     /// jade gives back the deletion it shows on the visible characters
-    /// among `ids`.
-    fn restoring(&self, ids: &BTreeSet<Id>) -> Vec<DocxEffect> {
-        let paragraphs = self.paragraphs();
-        self.ranges(ids)
+    /// among `ids` (all of `story`'s, when it is given).
+    fn restoring(&self, story: Option<StoryId>, ids: &BTreeSet<Id>) -> Vec<DocxEffect> {
+        self.ranges(story, ids)
             .into_iter()
             .map(|(p, start, end, _)| DocxEffect::RestoreRange {
-                paragraph: paragraphs[p].at.clone(),
+                paragraph: self.at(p),
                 start,
                 end,
             })
@@ -200,13 +199,17 @@ impl DocxModel {
 
     /// jade shows the visible characters among `ids` as deleted by
     /// `revision`.
-    fn deleting(&self, ids: &BTreeSet<Id>, revision: Id) -> Vec<DocxEffect> {
-        let paragraphs = self.paragraphs();
+    fn deleting(
+        &self,
+        story: Option<StoryId>,
+        ids: &BTreeSet<Id>,
+        revision: Id,
+    ) -> Vec<DocxEffect> {
         let made = &self.revisions[&revision];
-        self.ranges(ids)
+        self.ranges(story, ids)
             .into_iter()
             .map(|(p, start, end, anchors)| DocxEffect::TrackDeleteRange {
-                paragraph: paragraphs[p].at.clone(),
+                paragraph: self.at(p),
                 start,
                 end,
                 anchors,
@@ -255,12 +258,22 @@ impl DocxModel {
                 .keys()
                 .map(|id| StoryId::TextBox { id: *id }),
         );
+        let mut structural = false;
         for story in stories {
             if left.is_empty() {
                 break;
             }
             let flow = &mut self.story_mut(story).expect("listed").flow;
-            left.retain(|id| flow.delete(*id).is_err());
+            left.retain(|id| {
+                structural |= flow
+                    .get(*id)
+                    .is_some_and(|n| !matches!(n.value, Atom::Char(_)));
+                flow.delete(*id).is_err()
+            });
+        }
+        if structural {
+            // Only characters are revisions; anything else moves paragraphs.
+            self.index.invalidate();
         }
     }
 
@@ -285,24 +298,23 @@ impl DocxModel {
             match (self.revisions[revision].kind, accept) {
                 (RevisionKind::Insertion, true) => {
                     let ids = self.inserted_by(*revision);
-                    let paragraphs = self.paragraphs();
-                    effects.extend(self.ranges(&ids).into_iter().map(|(p, start, end, _)| {
-                        DocxEffect::AcceptInsertionRange {
-                            paragraph: paragraphs[p].at.clone(),
+                    effects.extend(self.ranges(None, &ids).into_iter().map(
+                        |(p, start, end, _)| DocxEffect::AcceptInsertionRange {
+                            paragraph: self.at(p),
                             start,
                             end,
-                        }
-                    }));
+                        },
+                    ));
                     self.inserted.retain(|_, r| r != revision);
                 }
                 (RevisionKind::Insertion, false) => {
                     let ids = self.inserted_by(*revision);
-                    effects.extend(self.removal(&ids));
+                    effects.extend(self.removal_in(None, &ids));
                     self.remove_characters(&ids);
                 }
                 (RevisionKind::Deletion, true) => {
                     let ids = self.deleted_by(*revision);
-                    effects.extend(self.removal(&ids));
+                    effects.extend(self.removal_in(None, &ids));
                     self.remove_characters(&ids);
                 }
                 (RevisionKind::Deletion, false) => {
@@ -322,7 +334,7 @@ impl DocxModel {
                     }
                     // Where it was shown, jade gives the characters back and
                     // the next deletion in line, if any, takes them.
-                    effects.extend(self.restoring(&shown));
+                    effects.extend(self.restoring(None, &shown));
                     let mut next: BTreeMap<Id, BTreeSet<Id>> = BTreeMap::new();
                     for id in shown {
                         if let Some(by) = self.tracked(id).deleted {
@@ -330,7 +342,7 @@ impl DocxModel {
                         }
                     }
                     for (by, ids) in next {
-                        effects.extend(self.deleting(&ids, by));
+                        effects.extend(self.deleting(None, &ids, by));
                     }
                 }
             }

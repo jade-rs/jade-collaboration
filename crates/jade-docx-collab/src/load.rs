@@ -430,6 +430,7 @@ impl DocxModel {
             inserted: loader.inserted,
             deleted: loader.deleted,
             max_lamport: loader.next - 1,
+            index: Default::default(),
         })
     }
 }
