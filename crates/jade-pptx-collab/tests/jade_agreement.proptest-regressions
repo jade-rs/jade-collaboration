@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 31aee3d07c95116f543329e776577a505271b4f323355f70a852c8e8e7b8ffdf # shrinks to fixture = "inherited-deck.pptx", choices = [5434767435011087733, 8279858959657897718, 10908833392877506182, 2016379714233074140]

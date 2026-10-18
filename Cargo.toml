@@ -4,6 +4,7 @@ members = [
   "crates/jade-collab-sync",
   "crates/jade-docx-collab",
   "crates/jade-xlsx-collab",
+  "crates/jade-pptx-collab",
   "crates/jade-collab-server",
   "crates/jade-collab-mcp",
 ]

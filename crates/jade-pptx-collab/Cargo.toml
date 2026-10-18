@@ -1,0 +1,19 @@
+[package]
+name = "jade-pptx-collab"
+description = "Collaborative PPTX model: identifier-addressed slides, shapes and text over jade's pptx writer"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+
+[dependencies]
+jade-collab-core = { path = "../jade-collab-core" }
+jade-collab-sync = { path = "../jade-collab-sync" }
+jade-opc = { path = "../../jade-core/crates/jade-opc" }
+jade-pptx-reader = { path = "../../jade-core/crates/jade-pptx-reader" }
+jade-pptx-writer = { path = "../../jade-core/crates/jade-pptx-writer" }
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+serde_json.workspace = true

@@ -1,6 +1,6 @@
 # jade-collaboration design
 
-Real-time co-editing of `.docx` and `.xlsx` (later `.pptx`) by any mix of
+Real-time co-editing of `.docx`, `.xlsx` and `.pptx` by any mix of
 people and AI agents, on top of the jade engine
 ([jade-rs/jade-core](https://github.com/jade-rs/jade-core)).
 
@@ -253,14 +253,62 @@ inserted inside them. The model cannot predict that, so those cells are
 read-only and structure inside a table is refused — on every replica, from
 state loaded with the file, so the refusal never needs the server.
 
+### Presentations (`jade-pptx-collab`)
+
+A deck is an ordered list of slide identifiers. Every text body jade's pptx
+writer can edit — a shape's, a group child's, and each slide's speaker notes
+— is a story exactly like a docx story: an RGA of characters and paragraph
+marks, `\n` in jade's text being a mark. Each top-level shape's placement is
+five last-writer-wins registers (x, y, width, height in EMU; rotation in
+60000ths of a degree), so a move and a concurrent resize both survive and two
+moves converge on the newer stamp. Which attributes a shape lets change comes
+from its locks, read with the file; size is read-only under a locked aspect
+ratio, since per-attribute writes would break it.
+
+| Operation | Lane | Why |
+| --- | --- | --- |
+| insert / delete text, split paragraph | convergent | RGA |
+| set geometry | convergent | per-attribute LWW |
+| join paragraphs | sequenced | as in docx; jade keeps the first paragraph's properties, so every copy of the file must merge in the same order |
+| insert slide | sequenced | jade fills it with the placeholders of the layout of the slide it lands in front of, which depends on concurrent structure |
+| delete slide | sequenced | a deck keeps at least one slide: two concurrent deletions of the last two are each valid, together not |
+| move slide | sequenced | concurrent moves of one slide must land in one place; ordering is simpler than a move CRDT |
+| duplicate slide | sequenced | the copy holds the source as of the log position |
+| insert text box | sequenced | jade picks the file id from the ids in use, and may refuse a shape tree it cannot extend |
+| delete shape | sequenced | jade refuses shapes the slide depends on in ways only the file shows |
+
+Two things need care.
+
+* **Duplication must commute with convergent edits.** A copy keeps its
+  source's character and shape identifiers (stories are keyed by slide) and
+  the source remembers each copy's origin replica and log position. An edit
+  to the source whose author had not seen the duplication — another replica,
+  and `base_seq` before the duplication's position or the duplication still
+  tentative — is applied to the copy as well, transitively. That is the
+  result the author would have got had the edit been committed first, so the
+  edit and the duplication commute and a replica can still apply a remote
+  edit straight onto a view holding its own pending duplication.
+* **What jade puts on a new slide.** The model does not re-derive it: when a
+  deck is loaded, jade inserts a slide into a scratch copy for each layout in
+  use and the model records the placeholders (ids, empty text, inherited
+  placement) as that layout's template.
+
+Shape numbers are the file's `cNvPr id`s for every shape loaded or placed by
+a template. A text box made in the session gets the next number the model
+has not used on its slide; jade may give it another id (it reuses those of
+deleted shapes), and the materializer keeps the mapping.
+
 ## 5. Materialization into jade
 
 The server owns one jade document per room and applies, for every committed
-operation, the `HeadlessCommand`s (docx) or `HeadlessWorkbook` calls (xlsx)
-that realise it, computing paragraph indices and byte offsets from the model at
-that point of the log. jade addresses paragraphs by its flattened *paragraph
-surface* index; the model mirrors the body/table part of that enumeration and a
-test checks the two agree on real fixtures.
+operation, the `HeadlessCommand`s (docx), `HeadlessWorkbook` calls (xlsx) or
+jade-pptx-writer `EditSession` calls (pptx) that realise it, computing
+paragraph indices and byte offsets from the model at that point of the log.
+jade addresses paragraphs by its flattened *paragraph surface* index; the
+model mirrors the body/table part of that enumeration and a test checks the
+two agree on real fixtures. For pptx, effects name slides by position and
+text by paragraph and byte offset; the materializer turns those into jade's
+UTF-16 ranges on jade's own text.
 
 Clients do not need jade: an AI agent, a CLI or a test works on the model. A
 jade editor client additionally applies the same effects to its local
@@ -271,8 +319,12 @@ therefore **refuse a sequenced operation before it is applied**
 (`Materializer::admit`); the rejection travels back like any other. jade, for
 instance, lists a text box's or a note's paragraphs between two body
 paragraphs, and a range across them would delete those paragraphs, so the
-docx materializer refuses to join paragraphs across them. `admit` is never
-consulted for convergent operations — they must commit wherever they land.
+docx materializer refuses to join paragraphs across them; the pptx
+materializer dry-runs shape deletions, slide deletions and duplications and
+text-box insertions on the current file. `admit` is never consulted for
+convergent operations — they must commit wherever they land; the pptx model
+therefore refuses text and geometry jade would refuse (characters, the
+32-bit EMU range, locks) with jade's own validators, on every replica.
 
 Tables are matched to jade's `table_order_index` by identity: the model knows
 the body's table structure (nested tables included), jade's order also counts
@@ -297,6 +349,7 @@ jade's parsed body.
 | `jade-collab-sync` | `Document` trait, lanes, wire protocol, `Sequencer` (server core, with checkpoints, journal records and replay), `Replica` (client core), deterministic network simulator |
 | `jade-docx-collab` | docx model + operations, loading from a jade `WordDocument`, materialization to `HeadlessCommand`s, index-addressed intent API (migrated from jade-core) |
 | `jade-xlsx-collab` | xlsx model + operations, loading from / materializing into a jade `HeadlessWorkbook` |
+| `jade-pptx-collab` | pptx model + operations (slides, shape and notes text, geometry, text boxes), loading through jade's reader/writer, materialization through jade-pptx-writer's `EditSession`, slide-number / shape-id intent API |
 | `jade-collab-server` | WebSocket server (one actor thread per document, since jade documents are `!Send`), document storage, bearer tokens, presence relay, WebSocket client, `jade-collab` CLI |
 | `jade-collab-mcp` | MCP server (JSON-RPC over stdio): agents join documents as replicas through `Client` and edit with the intent APIs |
 
@@ -313,11 +366,11 @@ Tests are written first. Three layers:
 2. **Property-based tests** (`proptest`) — the implementation against the
    specification (RGA differential test), convergence of random concurrent
    histories across N replicas under random message scheduling, grid
-   invariants under random structural operations, docx/xlsx model ↔ jade
-   agreement after random edit sequences, a restarted server indistinguishable
-   from one that kept running, the journal reading back whatever was appended,
-   checkpointed and torn, only configured tokens being accepted, and presence
-   settling on everyone's latest state.
+   invariants under random structural operations, docx/xlsx/pptx model ↔
+   jade agreement after random edit sequences, a restarted server
+   indistinguishable from one that kept running, the journal reading back
+   whatever was appended, checkpointed and torn, only configured tokens being
+   accepted, and presence settling on everyone's latest state.
 3. **Example tests** — protocol edge cases, real fixtures through jade, and an
    end-to-end WebSocket session with a human-like and an agent-like client.
 
@@ -380,12 +433,15 @@ and comments (add, reply, resolve, delete; also comments loaded from the
 file) as sequenced operations on id ranges resolved in log order (§4); xlsx
 values, formulas (with rebasing), row/column structure, notes, cell
 formatting (per-attribute LWW, A1 ranges), merged cells and sheet
-management (add, rename, delete, move); index/A1-addressed intent APIs
-for people and agents; the `jade-collab` CLI; resume after a disconnect; an
-MCP server (`jade-collab-mcp`) through which agents join, read, edit and
-watch documents as replicas without a shell; durable documents with
-checkpoints and log compaction; bearer-token authentication with editor and
-viewer roles; presence.
+management (add, rename, delete, move); pptx slide
+insert/delete/move/duplicate, text in shapes, group children and speaker
+notes, shape geometry, text boxes and shape deletion;
+index/A1/slide-number-addressed intent APIs for people and agents; the
+`jade-collab` CLI; resume after a disconnect; an MCP server
+(`jade-collab-mcp`) through which agents join, read, edit and watch
+documents as replicas without a shell; durable documents with checkpoints
+and log compaction; bearer-token authentication with editor and viewer
+roles; presence.
 
 Not yet:
 
@@ -409,4 +465,7 @@ Not yet:
   are preflighted on a copy of the jade document; jade's xlsx editor rereads
   the workbook on every write. Fine for the first milestone, not for large
   documents.
-* `.pptx`.
+* pptx in the server (the crate is ready: a `PptxModel` and a `JadePptx`
+  materializer with `open` / `export`), tables and formatting in slides,
+  hidden slides, layouts, pictures and grouping. jade's pptx writer rewrites
+  and re-reads the package on every edit.
