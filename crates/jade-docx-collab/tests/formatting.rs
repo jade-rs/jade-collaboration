@@ -762,3 +762,66 @@ proptest! {
         }
     }
 }
+
+/// jade drops the comments anchored in cells it deletes; the model follows.
+#[test]
+fn comments_in_removed_cells_go_with_them() {
+    use jade_collab_core::grid::GridOp;
+
+    let mut model = DocxModel::from_paragraphs(&["before", "after"]);
+    let mark = model.paragraphs()[0].mark.unwrap();
+    let (table, r1, r2, column) = (id(200), id(201), id(202), id(203));
+    apply(
+        &mut model,
+        DocxOp::InsertTable {
+            anchor: Anchor::After(mark),
+            id: table,
+            rows: vec![r1, r2],
+            columns: vec![column],
+        },
+    );
+    for (row, first) in [(r1, 300), (r2, 310)] {
+        let story = StoryId::Cell { table, row, column };
+        apply(
+            &mut model,
+            DocxOp::InsertText {
+                story,
+                parent: None,
+                first: id(first),
+                text: "xy".into(),
+            },
+        );
+        apply(
+            &mut model,
+            DocxOp::AddComment {
+                story,
+                start: id(first),
+                end: id(first + 1),
+                id: id(first + 5),
+                content: CommentContent::new("cell"),
+            },
+        );
+    }
+    apply(
+        &mut model,
+        DocxOp::ReplyToComment {
+            comment: id(305),
+            id: id(306),
+            content: CommentContent::new("reply"),
+        },
+    );
+    let p = model.paragraphs();
+    add_comment(&mut model, p[0].chars[0], p[3].chars[0], id(400), "body");
+    apply(
+        &mut model,
+        DocxOp::Table {
+            table,
+            op: GridOp::DeleteRow { id: r1 },
+        },
+    );
+    let live: Vec<Id> = model.comments().iter().map(|c| c.id).collect();
+    assert_eq!(live, [id(315), id(400)]);
+    apply(&mut model, DocxOp::DeleteTable { table });
+    let live: Vec<Id> = model.comments().iter().map(|c| c.id).collect();
+    assert_eq!(live, [id(400)], "a body comment around the table stays");
+}

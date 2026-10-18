@@ -10,7 +10,6 @@ use jade_docx_collab::{
     Anchor, CommentContent, DocxModel, DocxOp, FormatChange, JadeDocx, ParagraphAlignment, StoryId,
 };
 use jade_docx_document_core::headless_api::execute_headless_queries_on_document;
-use jade_docx_document_core::selection::TextPosition;
 use jade_docx_headless_api::{
     HeadlessCommentSnapshot, HeadlessParagraphSnapshot, HeadlessQuery, HeadlessQueryRequest,
     HeadlessQueryResult, HeadlessRunStyle,
@@ -368,19 +367,18 @@ pub fn char_styles(model: &DocxModel, jade: &JadeDocx) -> BTreeMap<Id, CharStyle
         let runs = &jade.word().paragraph(surface).expect("surface exists").runs;
         let mut offset = 0;
         for (c, id) in paragraph.text.chars().zip(&paragraph.chars) {
-            let rendered = jade
-                .word()
-                .model_to_rendered_text_position(TextPosition::new(surface, offset))
-                .offset;
+            // jade's commands take rendered offsets (an inline text box counts
+            // as one), but its paragraph query reports offsets in the runs'
+            // text — the model's text.
             let run = snapshot
                 .runs
                 .iter()
-                .find(|r| r.start_offset <= rendered && rendered < r.end_offset)
-                .unwrap_or_else(|| panic!("no run at {rendered} of {snapshot:?}"));
+                .find(|r| r.start_offset <= offset && offset < r.end_offset)
+                .unwrap_or_else(|| panic!("no run at {offset} of {snapshot:?}"));
             assert_eq!(
-                snapshot.text.get(rendered..rendered + c.len_utf8()),
+                snapshot.text.get(offset..offset + c.len_utf8()),
                 Some(c.encode_utf8(&mut [0; 4]) as &str),
-                "jade's rendered offset {rendered} is not {c:?} in {:?}",
+                "offset {offset} is not {c:?} in {:?}",
                 snapshot.text
             );
             let mut start = 0;

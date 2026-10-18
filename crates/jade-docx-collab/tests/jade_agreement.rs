@@ -162,9 +162,13 @@ fn assert_formatted(
         for (ordinal, paragraph) in paragraphs.iter().enumerate() {
             if touched.contains(&ordinal) {
                 if let FormatChange::Alignment { alignment } = change {
+                    // jade keeps `both` where it was already justified.
                     assert_eq!(
-                        formats_after[ordinal].0.as_deref(),
-                        Some(alignment.as_jade()),
+                        formats_after[ordinal]
+                            .0
+                            .as_deref()
+                            .and_then(ParagraphAlignment::from_jade),
+                        Some(*alignment),
                         "alignment of paragraph {ordinal} {context}"
                     );
                 }

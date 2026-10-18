@@ -6,9 +6,11 @@ use jade_collab_core::grid::Grid;
 use jade_collab_core::id::{Id, ReplicaId};
 use jade_collab_core::rga::Rga;
 use jade_docx_document_core::document::{BodyElement, Table as JadeTable};
+use jade_docx_document_core::headless_api::execute_headless_queries_on_document;
 use jade_docx_document_core::word_document::WordDocument;
+use jade_docx_headless_api::{HeadlessQuery, HeadlessQueryRequest, HeadlessQueryResult};
 
-use crate::model::{Anchor, Atom, Block, DocxModel, Placed, Story, Table};
+use crate::model::{Anchor, Atom, Block, Comment, CommentContent, DocxModel, Placed, Story, Table};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
@@ -126,6 +128,62 @@ impl Loader {
     }
 }
 
+impl Loader {
+    /// The file's comments, as jade lists them, each with a model id and its
+    /// jade `w:id` so operations can name it.
+    fn comments(&mut self, word: &WordDocument) -> BTreeMap<Id, Comment> {
+        let request = HeadlessQueryRequest {
+            queries: vec![HeadlessQuery::Comments {
+                start_comment: 0,
+                max_comments: usize::MAX,
+                author: None,
+                resolved: None,
+            }],
+        };
+        let listed = match execute_headless_queries_on_document(word, &request)
+            .map(|mut response| response.results.remove(0))
+        {
+            Ok(HeadlessQueryResult::Comments { comments, .. }) => comments,
+            _ => Vec::new(),
+        };
+        let mut ids: BTreeMap<String, Id> = BTreeMap::new();
+        let mut unique = Vec::new();
+        for comment in listed {
+            // A malformed file may reuse an id; jade addresses only one.
+            if !ids.contains_key(&comment.id) {
+                ids.insert(comment.id.clone(), self.id());
+                unique.push(comment);
+            }
+        }
+        unique
+            .into_iter()
+            .map(|comment| {
+                let parent = comment
+                    .reply_to_comment_id
+                    .as_ref()
+                    .and_then(|p| ids.get(p))
+                    .copied();
+                (
+                    ids[&comment.id],
+                    Comment {
+                        parent,
+                        anchor: None,
+                        content: CommentContent {
+                            text: comment.text,
+                            author: comment.author,
+                            initials: comment.initials,
+                            date: comment.date,
+                        },
+                        resolved: comment.resolved.unwrap_or(false),
+                        deleted: false,
+                        file_id: Some(comment.id),
+                    },
+                )
+            })
+            .collect()
+    }
+}
+
 impl DocxModel {
     /// The model of `word`'s body, with ids owned by [`ReplicaId::ORIGIN`].
     pub fn from_word_document(word: &WordDocument) -> Result<Self, LoadError> {
@@ -139,9 +197,11 @@ impl DocxModel {
             tables: BTreeMap::new(),
         };
         let body = loader.story(&body.elements, true);
+        let comments = loader.comments(word);
         Ok(DocxModel {
             body,
             tables: loader.tables,
+            comments,
             max_lamport: loader.next - 1,
         })
     }

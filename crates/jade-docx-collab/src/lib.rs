@@ -14,4 +14,7 @@ mod model;
 
 pub use jade::JadeDocx;
 pub use load::LoadError;
-pub use model::{Anchor, Atom, DocxEffect, DocxModel, DocxOp, Paragraph, StoryId, TableView};
+pub use model::{
+    Anchor, Atom, CommentContent, CommentView, DocxEffect, DocxModel, DocxOp, FormatChange,
+    Paragraph, ParagraphAlignment, StoryId, TableView,
+};
