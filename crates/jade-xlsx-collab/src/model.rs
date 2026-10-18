@@ -5,7 +5,7 @@ use jade_collab_core::id::{Id, ReplicaId};
 use jade_collab_core::lww::LwwRegister;
 use jade_collab_sync::{ApplyContext, Document, Lane, Rejection};
 use jade_xlsx_headless_api::{CellInput, CellKind, CellView, SheetVisibility};
-use jade_xlsx_headless_editor::{FormatChange, HeadlessWorkbook};
+use jade_xlsx_headless_editor::{BorderLine, BorderStyle, FormatChange, HeadlessWorkbook};
 use jade_xlsx_reader::{
     delete_sheet_in_formula, rename_sheet_in_formula, shift_formula, Axis, HorizontalAlignment,
     StructureChange, VerticalAlignment,
@@ -88,7 +88,14 @@ macro_rules! each_attribute {
             number_format,
             horizontal,
             vertical,
-            wrap_text
+            wrap_text,
+            border_left,
+            border_right,
+            border_top,
+            border_bottom,
+            border_diagonal,
+            diagonal_up,
+            diagonal_down
         )
     };
 }
@@ -121,6 +128,24 @@ struct CellFormat {
     horizontal: LwwRegister<Option<HorizontalAlignment>>,
     vertical: LwwRegister<Option<VerticalAlignment>>,
     wrap_text: LwwRegister<Option<bool>>,
+    // One register per edge holding its style and colour together: an
+    // edge's look is one value (a newer automatic-colour line must not keep
+    // an older line's colour), while different edges stay independent.
+    // Defaulted so checkpoints written before borders existed still load.
+    #[serde(default)]
+    border_left: LwwRegister<Option<BorderLine>>,
+    #[serde(default)]
+    border_right: LwwRegister<Option<BorderLine>>,
+    #[serde(default)]
+    border_top: LwwRegister<Option<BorderLine>>,
+    #[serde(default)]
+    border_bottom: LwwRegister<Option<BorderLine>>,
+    #[serde(default)]
+    border_diagonal: LwwRegister<Option<BorderLine>>,
+    #[serde(default)]
+    diagonal_up: LwwRegister<Option<bool>>,
+    #[serde(default)]
+    diagonal_down: LwwRegister<Option<bool>>,
 }
 
 impl CellFormat {
@@ -183,14 +208,6 @@ impl CellFormat {
 /// operation alone, so a convergent write never reaches a server whose jade
 /// cannot realise it.
 fn canonical_format(change: &FormatChange) -> Result<FormatChange, Rejection> {
-    fn rgb(text: &str) -> Result<String, Rejection> {
-        let hex = text.strip_prefix('#').unwrap_or(text);
-        if hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-            Ok(hex.to_ascii_uppercase())
-        } else {
-            Err(reject(format!("{text:?} is not an RRGGBB colour")))
-        }
-    }
     if change.is_empty() {
         return Err(reject("a format change has to name an attribute"));
     }
@@ -200,6 +217,18 @@ fn canonical_format(change: &FormatChange) -> Result<FormatChange, Rejection> {
     }
     if let Some(color) = change.fill_color.as_mut().filter(|c| !c.is_empty()) {
         *color = rgb(color)?;
+    }
+    for line in [
+        &mut change.border_left,
+        &mut change.border_right,
+        &mut change.border_top,
+        &mut change.border_bottom,
+        &mut change.border_diagonal,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        *line = canonical_line(line)?;
     }
     if let Some(code) = &mut change.number_format {
         if code.is_empty() || code.eq_ignore_ascii_case("General") {
@@ -217,6 +246,104 @@ fn canonical_format(change: &FormatChange) -> Result<FormatChange, Rejection> {
         return Err(reject("a font needs a name"));
     }
     Ok(change)
+}
+
+/// `RRGGBB`, upper-case, as jade reads a colour back.
+fn rgb(text: &str) -> Result<String, Rejection> {
+    let hex = text.strip_prefix('#').unwrap_or(text);
+    if hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(hex.to_ascii_uppercase())
+    } else {
+        Err(reject(format!("{text:?} is not an RRGGBB colour")))
+    }
+}
+
+/// A border line as jade's `format_at` reads it back: an upper-case
+/// colour, none for no line.
+fn canonical_line(line: &BorderLine) -> Result<BorderLine, Rejection> {
+    Ok(BorderLine {
+        style: line.style,
+        color: match &line.color {
+            Some(_) if line.style == BorderStyle::None => None,
+            Some(color) => Some(rgb(color)?),
+            None => None,
+        },
+    })
+}
+
+/// Excel's border dialog for a range: the outline, the lines inside, and
+/// the diagonals of every cell. An edge of its own (`top`, …) wins over
+/// `outline`, a direction of its own over `inside`. A line of style `none`
+/// removes that edge.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RangeBorders {
+    /// The four edges of the range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outline: Option<BorderLine>,
+    /// The lines between its cells, both ways.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inside: Option<BorderLine>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top: Option<BorderLine>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bottom: Option<BorderLine>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left: Option<BorderLine>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub right: Option<BorderLine>,
+    /// Between its rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inside_horizontal: Option<BorderLine>,
+    /// Between its columns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inside_vertical: Option<BorderLine>,
+    /// Every cell's diagonal line, shown in the directions turned on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagonal: Option<BorderLine>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagonal_up: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagonal_down: Option<bool>,
+}
+
+impl RangeBorders {
+    /// What the cell at row `r`, column `c` of a `rows` × `columns` range
+    /// takes — depending only on its place in the range the operation
+    /// names, never on the grid it lands in.
+    fn at(&self, r: usize, c: usize, rows: usize, columns: usize) -> FormatChange {
+        let either = |own: &Option<BorderLine>, general: &Option<BorderLine>| {
+            own.clone().or_else(|| general.clone())
+        };
+        let horizontal = either(&self.inside_horizontal, &self.inside);
+        let vertical = either(&self.inside_vertical, &self.inside);
+        FormatChange {
+            border_top: if r == 0 {
+                either(&self.top, &self.outline)
+            } else {
+                horizontal.clone()
+            },
+            border_bottom: if r + 1 == rows {
+                either(&self.bottom, &self.outline)
+            } else {
+                horizontal
+            },
+            border_left: if c == 0 {
+                either(&self.left, &self.outline)
+            } else {
+                vertical.clone()
+            },
+            border_right: if c + 1 == columns {
+                either(&self.right, &self.outline)
+            } else {
+                vertical
+            },
+            border_diagonal: self.diagonal.clone(),
+            diagonal_up: self.diagonal_up,
+            diagonal_down: self.diagonal_down,
+            ..FormatChange::default()
+        }
+    }
 }
 
 /// Cells and the attributes each won, as few `set_format` calls as equal
@@ -418,6 +545,18 @@ pub enum XlsxOp {
         stamp: Id,
         change: FormatChange,
     },
+    /// Convergent: Excel's border dialog over `rows` × `columns` — the
+    /// outline on the range's edges, the inside lines between its cells —
+    /// written as per-cell, per-edge registers like [`XlsxOp::SetFormat`].
+    /// Which edge a cell takes depends only on its place in the lists the
+    /// operation names.
+    SetBorders {
+        sheet: Id,
+        rows: Vec<Id>,
+        columns: Vec<Id>,
+        stamp: Id,
+        borders: RangeBorders,
+    },
     /// Sequenced: merge a rectangle (no overlap with another merge or an
     /// Excel table). As in Excel the top-left value stays and the others are
     /// cleared — by a last-writer-wins write of a blank with `stamp`, so a
@@ -466,6 +605,9 @@ pub enum XlsxOp {
 }
 
 /// What jade must do; indices are 0-based.
+// A format change with its border lines is the big variant; effects live
+// for one materialization, so boxing it would only cost every caller.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum XlsxEffect {
@@ -814,6 +956,47 @@ impl XlsxModel {
             .unwrap_or_default()
     }
 
+    /// The cells of `sheet`'s current grid that show attributes written
+    /// through the model ([`XlsxModel::format`]: a merged region's covered
+    /// cells show its anchor's), row by row, with their A1 references.
+    pub fn formatted_cells(&self, sheet: Id) -> Vec<(String, FormatChange)> {
+        let Some(s) = self.sheets.iter().find(|s| s.id == sheet) else {
+            return Vec::new();
+        };
+        let mut cells: BTreeSet<(usize, usize)> = s
+            .formats
+            .keys()
+            .filter_map(|(row, column)| {
+                Some((s.grid.row_index(*row)?, s.grid.column_index(*column)?))
+            })
+            .collect();
+        // A covered cell shows its anchor's format.
+        let (rows, columns) = (s.grid.rows(), s.grid.columns());
+        for merge in s.grid.merges() {
+            let rows = lines_between(&rows, merge.top, merge.bottom);
+            let columns = lines_between(&columns, merge.left, merge.right);
+            for row in &rows {
+                for column in &columns {
+                    if let (Some(r), Some(c)) =
+                        (s.grid.row_index(*row), s.grid.column_index(*column))
+                    {
+                        cells.insert((r, c));
+                    }
+                }
+            }
+        }
+        cells
+            .into_iter()
+            .map(|(r, c)| {
+                (
+                    format!("{}{}", column_label(c as u32), r + 1),
+                    self.format(sheet, rows[r], columns[c]),
+                )
+            })
+            .filter(|(_, format)| !format.is_empty())
+            .collect()
+    }
+
     /// `(sheet, row, column)` ids of `reference` (`B3`) on the sheet named `sheet`.
     pub fn locate(&self, sheet: &str, reference: &str) -> Option<(Id, Id, Id)> {
         let s = self.sheets.iter().find(|s| !s.deleted && s.name == sheet)?;
@@ -923,8 +1106,80 @@ impl XlsxModel {
         stamp: Id,
         change: &FormatChange,
     ) -> Result<Vec<XlsxEffect>, Rejection> {
-        let index = self.sheet_index(sheet)?;
         let change = canonical_format(change)?;
+        self.format_cells(sheet, rows, columns, stamp, |_, _| change.clone())
+    }
+
+    fn set_borders(
+        &mut self,
+        sheet: Id,
+        rows: &[Id],
+        columns: &[Id],
+        stamp: Id,
+        borders: &RangeBorders,
+    ) -> Result<Vec<XlsxEffect>, Rejection> {
+        if *borders == RangeBorders::default() {
+            return Err(reject("a border change has to name a line"));
+        }
+        // Every line named is checked, also one no cell of the range takes
+        // (the inside of a single cell), so validity never depends on the
+        // range.
+        let RangeBorders {
+            outline,
+            inside,
+            top,
+            bottom,
+            left,
+            right,
+            inside_horizontal,
+            inside_vertical,
+            diagonal,
+            diagonal_up: _,
+            diagonal_down: _,
+        } = borders;
+        for line in [
+            outline,
+            inside,
+            top,
+            bottom,
+            left,
+            right,
+            inside_horizontal,
+            inside_vertical,
+            diagonal,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            canonical_line(line)?;
+        }
+        let (height, width) = (rows.len(), columns.len());
+        // Every cell's change, checked before anything is written.
+        let mut changes = BTreeMap::new();
+        for r in 0..height {
+            for c in 0..width {
+                let change = borders.at(r, c, height, width);
+                if !change.is_empty() {
+                    changes.insert((r, c), canonical_format(&change)?);
+                }
+            }
+        }
+        self.format_cells(sheet, rows, columns, stamp, |r, c| {
+            changes.get(&(r, c)).cloned().unwrap_or_default()
+        })
+    }
+
+    /// Writes `change(r, c)` — `r`, `c` the place in `rows` × `columns` —
+    /// to each cell with `stamp`, and asks jade for what won.
+    fn format_cells(
+        &mut self,
+        sheet: Id,
+        rows: &[Id],
+        columns: &[Id],
+        stamp: Id,
+        change: impl Fn(usize, usize) -> FormatChange,
+    ) -> Result<Vec<XlsxEffect>, Rejection> {
+        let index = self.sheet_index(sheet)?;
         let s = &self.sheets[index];
         if rows.is_empty()
             || columns.is_empty()
@@ -937,8 +1192,12 @@ impl XlsxModel {
         let sheet = &mut self.sheets[index];
         // Alive cells by index, with the attributes they won.
         let mut won = BTreeMap::new();
-        for row in rows {
-            for column in columns {
+        for (r, row) in rows.iter().enumerate() {
+            for (c, column) in columns.iter().enumerate() {
+                let change = change(r, c);
+                if change.is_empty() {
+                    continue;
+                }
                 let attributes = sheet
                     .formats
                     .entry((*row, *column))
@@ -1533,7 +1792,9 @@ impl Document for XlsxModel {
             | XlsxOp::Derived { .. } => Lane::Sequenced,
             // Id-keyed last-writer-wins registers (per attribute for
             // formats) commute and do not depend on the log position.
-            XlsxOp::SetNote { .. } | XlsxOp::SetFormat { .. } => Lane::Convergent,
+            XlsxOp::SetNote { .. } | XlsxOp::SetFormat { .. } | XlsxOp::SetBorders { .. } => {
+                Lane::Convergent
+            }
         }
     }
 
@@ -1561,6 +1822,13 @@ impl Document for XlsxModel {
                 stamp,
                 change,
             } => self.set_format(*sheet, rows, columns, *stamp, change),
+            XlsxOp::SetBorders {
+                sheet,
+                rows,
+                columns,
+                stamp,
+                borders,
+            } => self.set_borders(*sheet, rows, columns, *stamp, borders),
             XlsxOp::MergeCells {
                 sheet,
                 merge,

@@ -6,7 +6,7 @@ use jade_collab_core::grid::{GridOp, Merge};
 use jade_collab_core::id::Id;
 use serde::{Deserialize, Serialize};
 
-use crate::model::{parse_reference, LoadOptions, XlsxModel, XlsxOp};
+use crate::model::{parse_reference, LoadOptions, RangeBorders, XlsxModel, XlsxOp};
 use crate::{CellInput, FormatChange};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -51,6 +51,14 @@ pub enum XlsxIntent {
         sheet: String,
         range: String,
         change: FormatChange,
+    },
+    /// Draws lines over `range` as Excel's border dialog does: `outline`
+    /// around it, `inside` between its cells, or each edge on its own. Like
+    /// a format, it covers the cells the range covers now.
+    SetBorders {
+        sheet: String,
+        range: String,
+        borders: RangeBorders,
     },
     /// Merges `range` (`B2:C3`): the top-left value stays, the rest clear.
     MergeCells {
@@ -175,6 +183,21 @@ pub fn resolve(
                 columns,
                 stamp: ids(1),
                 change: change.clone(),
+            }
+        }
+        XlsxIntent::SetBorders {
+            sheet,
+            range,
+            borders,
+        } => {
+            let s = sheet_named(sheet)?;
+            let (rows, columns) = rectangle(&s.rows, &s.columns, range)?;
+            XlsxOp::SetBorders {
+                sheet: s.id,
+                rows,
+                columns,
+                stamp: ids(1),
+                borders: borders.clone(),
             }
         }
         XlsxIntent::MergeCells { sheet, range } => {

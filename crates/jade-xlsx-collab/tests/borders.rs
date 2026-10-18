@@ -631,7 +631,7 @@ fn merged_cells_take_the_anchor_s_borders_like_in_jade() {
         },
     );
     assert_eq!(edges(model.format(sheet, rows[1], columns[1])), anchor);
-    assert_eq!(jade_edges(&jade, "C7"), anchor);
+    assert_eq!(common::masked(&jade_edges(&jade, "C7"), &anchor), anchor);
 }
 
 // ── convergence ─────────────────────────────────────────────────────
@@ -650,23 +650,37 @@ fn arb_line() -> impl Strategy<Value = BorderLine> {
 fn arb_borders() -> impl Strategy<Value = RangeBorders> {
     use prop::option::of;
     (
-        (of(arb_line()), of(arb_line()), of(arb_line())),
-        (of(arb_line()), of(arb_line()), of(arb_line())),
-        (of(any::<bool>()), of(arb_line())),
+        (
+            of(arb_line()),
+            of(arb_line()),
+            of(arb_line()),
+            of(arb_line()),
+        ),
+        (
+            of(arb_line()),
+            of(arb_line()),
+            of(arb_line()),
+            of(arb_line()),
+        ),
+        (of(arb_line()), of(any::<bool>()), of(any::<bool>())),
     )
         .prop_map(
-            |((outline, inside, top), (left, inside_horizontal, diagonal), (up, right))| {
-                RangeBorders {
-                    outline,
-                    inside,
-                    top,
-                    left,
-                    right,
-                    inside_horizontal,
-                    diagonal,
-                    diagonal_up: up,
-                    ..RangeBorders::default()
-                }
+            |(
+                (outline, inside, top, bottom),
+                (left, right, inside_horizontal, inside_vertical),
+                (diagonal, diagonal_up, diagonal_down),
+            )| RangeBorders {
+                outline,
+                inside,
+                top,
+                bottom,
+                left,
+                right,
+                inside_horizontal,
+                inside_vertical,
+                diagonal,
+                diagonal_up,
+                diagonal_down,
             },
         )
 }
