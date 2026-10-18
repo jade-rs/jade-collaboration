@@ -10,7 +10,7 @@ use jade_collab_sync::{ApplyContext, Document, Lane, Materializer};
 use jade_docx_collab::intent::{resolve, resolve_with, Context, IntentOp};
 use jade_docx_collab::{
     Anchor, CommentContent, DocxEffect, DocxModel, DocxOp, FormatChange, JadeDocx, MarkKey,
-    ParagraphAlignment, RevisionKind, StoryId,
+    NoteKind, ParagraphAlignment, RevisionKind, StoryId,
 };
 use jade_docx_document_core::document::RevisionKind as JadeRevisionKind;
 use jade_docx_document_core::headless_api::execute_headless_queries_on_document;
@@ -281,12 +281,30 @@ pub fn commit_as(
         .unwrap_or_else(|e| panic!("{op:?}: {e}"));
     jade.materialize(model, effect.clone(), &ctx)
         .unwrap_or_else(|e| panic!("{op:?}: {e}"));
+    derive(model, jade, &op);
     assert_stories_agree(model, jade, &format!("after {op:?}"));
     assert_tables_agree(model, jade, &format!("after {op:?}"));
     assert_comments_agree(model, jade, &format!("after {op:?}"));
     assert_revisions_agree(model, jade, &format!("after {op:?}"));
     assert_formatting_agrees(model, jade, &format!("after {op:?}"));
     effect
+}
+
+/// Commits what the server derives after `cause` (the numbers jade gave
+/// what it made), as the sequencer does right after it.
+pub fn derive(model: &mut DocxModel, jade: &mut JadeDocx, cause: &DocxOp) {
+    let ctx = ApplyContext {
+        origin: jade_collab_core::id::ReplicaId::ORIGIN,
+        base_seq: 0,
+        seq: Some(1),
+    };
+    for op in jade.derived(model, cause) {
+        let effect = model
+            .apply(&op, &ctx)
+            .unwrap_or_else(|e| panic!("derived {op:?}: {e}"));
+        jade.materialize(model, effect, &ctx)
+            .unwrap_or_else(|e| panic!("derived {op:?}: {e}"));
+    }
 }
 
 /// A tracked change as Word shows it on one character: who made it and when.
@@ -404,10 +422,12 @@ pub fn generate_as(
     ctx: &Context,
     ids: &mut dyn FnMut(u64) -> Id,
 ) -> Option<DocxOp> {
-    let kind = choice % 40;
-    if kind < 30 {
+    // generate_plain's 36 kinds, then 10 of tracked changes (30..=39).
+    let kind = choice % 46;
+    if kind < 36 {
         return generate_plain(view, choice, ids);
     }
+    let kind = kind - 6;
     let pick = |n: usize, salt: u32| ((choice >> salt) as usize) % n.max(1);
     let tracking = || {
         let mut v = view.clone();
@@ -538,7 +558,7 @@ pub fn generate_plain(
     let paragraphs = view.paragraphs();
     let pick = |n: usize, salt: u32| ((choice >> salt) as usize) % n.max(1);
     let words = ["x", "日本", "é", "Lorem ", "  ", "ab"];
-    match choice % 30 {
+    match choice % 36 {
         // Typing at a random caret, through the index-addressed intent API.
         0..=4 => {
             let p = pick(paragraphs.len(), 8);
@@ -635,7 +655,7 @@ pub fn generate_plain(
             let table = editable[pick(editable.len(), 8)];
             let row = table.rows[pick(table.rows.len(), 12)];
             let column = table.columns[pick(table.columns.len(), 16)];
-            let op = match choice % 30 {
+            let op = match choice % 36 {
                 11 => GridOp::InsertRow {
                     id: ids(1),
                     after: (pick(3, 20) != 0).then_some(row),
@@ -703,24 +723,27 @@ pub fn generate_plain(
             };
             resolve(view, &op, ids).ok()?.into_iter().next()
         }
-        // Answering or resolving a live comment.
+        // Answering, resolving or editing a live comment.
         20 => {
             let comments = view.comments();
             if comments.is_empty() {
                 return None;
             }
             let comment = comments[pick(comments.len(), 8)].id;
-            Some(if pick(2, 16) == 0 {
-                DocxOp::ReplyToComment {
+            Some(match pick(3, 16) {
+                0 => DocxOp::ReplyToComment {
                     comment,
                     id: ids(1),
                     content: CommentContent::new("reply"),
-                }
-            } else {
-                DocxOp::ResolveComment {
+                },
+                1 => DocxOp::UpdateComment {
+                    comment,
+                    text: ["edited", "直した", "a  b"][pick(3, 24)].to_string(),
+                },
+                _ => DocxOp::ResolveComment {
                     comment,
                     resolved: pick(3, 20) != 0,
-                }
+                },
             })
         }
         // Merging up to 2 × 2 cells of an editable table.
@@ -760,6 +783,121 @@ pub fn generate_plain(
         }
         // Edits right next to a text box or a note reference.
         25..=29 => around_anchor(view, &paragraphs, choice, ids),
+        // A new footnote or endnote right after a text box or note
+        // reference (the anchor's atom its parent).
+        32 if pick(2, 30) == 0 => {
+            let anchored: Vec<(StoryId, Id)> = paragraphs
+                .iter()
+                .flat_map(|q| q.anchors.iter().map(move |a| (q.story, a.id)))
+                .collect();
+            let &(story, parent) = anchored.get(pick(anchored.len(), 8))?;
+            let id = ids(3);
+            Some(DocxOp::InsertNote {
+                kind: if pick(2, 12) == 0 {
+                    NoteKind::Endnote
+                } else {
+                    NoteKind::Footnote
+                },
+                story,
+                parent: Some(parent),
+                id,
+                text: "n".into(),
+            })
+        }
+        // A new footnote or endnote at a random caret, or where a text box
+        // or note reference already sits.
+        30..=32 => {
+            let (p, offset) = if choice % 36 == 32 {
+                let anchored: Vec<(usize, usize)> = paragraphs
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(p, q)| q.anchors.iter().map(move |a| (p, a.offset)))
+                    .collect();
+                *anchored.get(pick(anchored.len(), 8))?
+            } else {
+                let p = pick(paragraphs.len(), 8);
+                let text = &paragraphs[p].text;
+                let boundaries: Vec<usize> = text
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .chain([text.len()])
+                    .collect();
+                (p, boundaries[pick(boundaries.len(), 16)])
+            };
+            let text = ["", "note", "注"][pick(3, 24)].to_string();
+            let op = if pick(3, 28) == 0 {
+                IntentOp::InsertEndnote {
+                    paragraph: p,
+                    offset,
+                    text,
+                }
+            } else {
+                IntentOp::InsertFootnote {
+                    paragraph: p,
+                    offset,
+                    text,
+                }
+            };
+            resolve(view, &op, ids).ok()?.into_iter().next()
+        }
+        // Deleting a footnote or endnote some paragraph references.
+        33 => {
+            let notes: Vec<StoryId> = paragraphs
+                .iter()
+                .flat_map(|p| p.anchors.iter().map(|a| a.story))
+                .filter(|s| !matches!(s, StoryId::TextBox { .. }))
+                .collect();
+            Some(match *notes.get(pick(notes.len(), 8))? {
+                StoryId::Footnote { id } => DocxOp::DeleteNote {
+                    kind: NoteKind::Footnote,
+                    note: id,
+                },
+                StoryId::Endnote { id } => DocxOp::DeleteNote {
+                    kind: NoteKind::Endnote,
+                    note: id,
+                },
+                _ => unreachable!("filtered"),
+            })
+        }
+        // A new text box at a random caret.
+        34 => {
+            let p = pick(paragraphs.len(), 8);
+            let text = &paragraphs[p].text;
+            let boundaries: Vec<usize> = text
+                .char_indices()
+                .map(|(i, _)| i)
+                .chain([text.len()])
+                .collect();
+            let op = IntentOp::InsertTextBox {
+                paragraph: p,
+                offset: boundaries[pick(boundaries.len(), 16)],
+                text: ["", "box", "箱"][pick(3, 24)].to_string(),
+                width_px: None,
+                height_px: None,
+            };
+            resolve(view, &op, ids).ok()?.into_iter().next()
+        }
+        // Deleting a text box some paragraph places.
+        35 => {
+            let boxes: Vec<(usize, usize)> = paragraphs
+                .iter()
+                .enumerate()
+                .flat_map(|(p, q)| {
+                    let count = q
+                        .anchors
+                        .iter()
+                        .filter(|a| matches!(a.story, StoryId::TextBox { .. }))
+                        .count();
+                    (0..count).map(move |k| (p, k))
+                })
+                .collect();
+            let &(paragraph, text_box) = boxes.get(pick(boxes.len(), 8))?;
+            let op = IntentOp::DeleteTextBox {
+                paragraph,
+                text_box,
+            };
+            resolve(view, &op, ids).ok()?.into_iter().next()
+        }
         _ => {
             let comments = view.comments();
             if comments.is_empty() {
@@ -893,7 +1031,7 @@ fn around_anchor(
     let anchor = &paragraph.anchors[a];
     // Characters before the anchor.
     let before = paragraph.text[..anchor.offset].chars().count();
-    match choice % 30 {
+    match choice % 36 {
         25 => {
             let op = IntentOp::InsertText {
                 paragraph: p,
@@ -1040,6 +1178,11 @@ fn random_range(
 pub struct CharStyle {
     pub style: HeadlessRunStyle,
     pub highlight: Option<String>,
+    /// Whether jade's run has properties at all. jade leaves the runs of a
+    /// shape it inserts without the defaults it resolves when it reads a
+    /// file (the document's font size, say) until some later edit resolves
+    /// them; the file is the same either way.
+    pub resolved: bool,
 }
 
 fn query(word: &WordDocument, query: HeadlessQuery) -> HeadlessQueryResult {
@@ -1108,14 +1251,15 @@ pub fn char_styles_in(model: &DocxModel, word: &WordDocument) -> BTreeMap<Id, Ch
                 snapshot.text
             );
             let mut start = 0;
-            let highlight = runs
+            let properties = runs
                 .iter()
                 .find(|r| {
                     let found = start <= offset && offset < start + r.text.len();
                     start += r.text.len();
                     found
                 })
-                .and_then(|r| r.properties.as_ref())
+                .and_then(|r| r.properties.as_ref());
+            let highlight = properties
                 .and_then(|p| p.highlight.as_deref())
                 .map(str::to_string);
             out.insert(
@@ -1123,6 +1267,7 @@ pub fn char_styles_in(model: &DocxModel, word: &WordDocument) -> BTreeMap<Id, Ch
                 CharStyle {
                     style: run.style.clone(),
                     highlight,
+                    resolved: properties.is_some(),
                 },
             );
             offset += c.len_utf8();

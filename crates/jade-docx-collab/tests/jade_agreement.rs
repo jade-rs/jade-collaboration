@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use common::{
     assert_comments_agree, assert_formatting_agrees, assert_revisions_agree, assert_same_order,
-    assert_stories_agree, assert_tables_agree, char_styles, char_styles_in, commit,
+    assert_stories_agree, assert_tables_agree, char_styles, char_styles_in, commit, derive,
     formatted_char_styles, generate, generate_through_merges, jade_comments, jade_core,
     model_marks, open, paragraph_formats, paragraph_snapshot, shows, surface, CharStyle,
 };
@@ -166,7 +166,7 @@ fn assert_formatted(
                     formats_after[ordinal], formats_before[ordinal],
                     "untouched paragraph {ordinal} changed {context}"
                 );
-                for c in &paragraph.chars {
+                for c in paragraph.chars.iter().filter(|c| styles_before[c].resolved) {
                     assert_eq!(
                         styles_after[c], styles_before[c],
                         "a character of untouched paragraph {ordinal} changed {context}"
@@ -187,7 +187,8 @@ fn assert_formatted(
                 shows(change, after),
                 "{c} in range lacks {change:?}: {after:?} {context}"
             );
-        } else {
+        } else if styles_before.get(c).is_none_or(|before| before.resolved) {
+            // (A run jade has not resolved yet may be resolved by any edit.)
             assert_eq!(
                 Some(after),
                 styles_before.get(c),
@@ -238,9 +239,25 @@ proptest! {
             };
             let Some(op) = generate(&model, choice, &mut ids) else { continue };
             let ctx = ApplyContext { origin: ReplicaId(1), base_seq: 0, seq: Some(step as u64 + 1) };
-            // As the sequencer does: jade may refuse a sequenced op first.
-            if DocxModel::lane(&op) == Lane::Sequenced && jade.admit(&model, &op).is_err() {
-                continue;
+            // As the sequencer does: jade may refuse a sequenced op first —
+            // but never a note or text box the model accepts: the model
+            // refuses everywhere jade cannot put one, on every replica.
+            if DocxModel::lane(&op) == Lane::Sequenced {
+                if let Err(refusal) = jade.admit(&model, &op) {
+                    let structural = matches!(
+                        op,
+                        DocxOp::InsertNote { .. }
+                            | DocxOp::DeleteNote { .. }
+                            | DocxOp::InsertTextBox { .. }
+                            | DocxOp::DeleteTextBox { .. }
+                            | DocxOp::UpdateComment { .. }
+                    );
+                    prop_assert!(
+                        !structural || model.clone().apply(&op, &ctx).is_err(),
+                        "{} refused {:?} the model accepts: {}", name, op, refusal
+                    );
+                    continue;
+                }
             }
             let before = model.clone();
             let formatting = matches!(op, DocxOp::Format { .. });
@@ -251,6 +268,7 @@ proptest! {
                     let context = format!("{name} after {op:?}");
                     jade.materialize(&model, effect.clone(), &ctx)
                         .unwrap_or_else(|e| panic!("{name}: jade refused {op:?}: {e}"));
+                    derive(&mut model, &mut jade, &op);
                     assert_agree(&model, &jade, &context);
                     assert_comments_agree(&model, &jade, &context);
                     assert_revisions_agree(&model, &jade, &context);
@@ -825,6 +843,69 @@ fn comments_in_the_file_are_addressable_by_their_file_ids() {
     }
     assert!(jade_comments(&jade).is_empty());
     assert!(model.comments().is_empty());
+}
+
+/// Comment text is replaced in jade — for comments loaded with the file and
+/// made in the session, roots and replies — and survives an export.
+#[test]
+fn comment_text_is_edited_in_jade() {
+    let (mut model, mut jade) = open("comment.docx");
+    let mut next = model.max_lamport();
+    let mut ids = |n: u64| {
+        let id = Id::new(next + 1, ReplicaId(1));
+        next += n;
+        id
+    };
+    for (comment_id, text) in [("0", "root, edited"), ("1", "reply, edited")] {
+        let intent = IntentOp::UpdateComment {
+            comment_id: comment_id.into(),
+            text: text.into(),
+        };
+        for op in resolve(&model, &intent, &mut ids).unwrap() {
+            commit(&mut model, &mut jade, op);
+        }
+    }
+    let p = model.paragraphs();
+    let (root, reply) = (ids(1), ids(1));
+    commit(
+        &mut model,
+        &mut jade,
+        DocxOp::AddComment {
+            story: StoryId::Body,
+            start: p[0].chars[0],
+            end: p[0].chars[1],
+            id: root,
+            content: CommentContent::new("new"),
+        },
+    );
+    commit(
+        &mut model,
+        &mut jade,
+        DocxOp::ReplyToComment {
+            comment: root,
+            id: reply,
+            content: CommentContent::new("new reply"),
+        },
+    );
+    for (comment, text) in [(root, "新しい"), (reply, "answer  two"), (root, "last")] {
+        commit(
+            &mut model,
+            &mut jade,
+            DocxOp::UpdateComment {
+                comment,
+                text: text.into(),
+            },
+        );
+    }
+    let reloaded = JadeDocx::load(&jade.export_base().unwrap()).unwrap();
+    let texts: BTreeSet<String> = jade_comments(&reloaded)
+        .into_iter()
+        .map(|c| c.text)
+        .collect();
+    assert_eq!(
+        texts,
+        BTreeSet::from(["root, edited", "reply, edited", "last", "answer  two"].map(String::from))
+    );
 }
 
 /// The model cannot know that jade re-anchors a reply on the root's text;

@@ -38,8 +38,8 @@ use jade_docx_headless_api::{HeadlessCommand, HeadlessDeleteDirection};
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    CommentContent, DocxModel, DocxOp, FormatChange, Paragraph, ParagraphAlignment, RevisionKind,
-    StoryId,
+    CommentContent, DocxModel, DocxOp, FormatChange, NoteKind, Paragraph, ParagraphAlignment,
+    RevisionKind, StoryId,
 };
 
 /// Who resolves an edit, and when: the replica whose own tracked insertions
@@ -137,6 +137,55 @@ pub enum IntentOp {
     DeleteComment {
         comment_id: String,
     },
+    /// Replaces a comment's text (a root or a reply).
+    UpdateComment {
+        comment_id: String,
+        text: String,
+    },
+    /// A new footnote at a caret of a body paragraph or table cell, before
+    /// any text box or note reference at that offset (as jade inserts one);
+    /// its text starts with a tab, as jade writes it.
+    InsertFootnote {
+        paragraph: usize,
+        offset: usize,
+        #[serde(default)]
+        text: String,
+    },
+    InsertEndnote {
+        paragraph: usize,
+        offset: usize,
+        #[serde(default)]
+        text: String,
+    },
+    /// Deletes a footnote (by its `w:id`) and every reference to it.
+    DeleteFootnote {
+        footnote_id: String,
+    },
+    DeleteEndnote {
+        endnote_id: String,
+    },
+    /// A new text box (a rectangle holding one paragraph of `text`) at a
+    /// caret of a body paragraph or table cell where no text box or note
+    /// reference sits; its paragraphs are listed right after the one that
+    /// anchors it.
+    InsertTextBox {
+        paragraph: usize,
+        offset: usize,
+        #[serde(default)]
+        text: String,
+        /// Default 216.
+        #[serde(default)]
+        width_px: Option<u32>,
+        /// Default 96.
+        #[serde(default)]
+        height_px: Option<u32>,
+    },
+    /// Deletes the `text_box`-th text box (in run order) anchored in
+    /// `paragraph`, with its content.
+    DeleteTextBox {
+        paragraph: usize,
+        text_box: usize,
+    },
     /// Merges the rectangle of a top-level table's cells (zero-based rows and
     /// columns, as `read_document` lists them).
     MergeTableCells {
@@ -195,12 +244,14 @@ pub enum IntentError {
     InvalidFormat(String),
     #[error("no comment {0:?}")]
     NoSuchComment(String),
+    #[error("no footnote or endnote {0:?}")]
+    NoSuchNote(String),
+    #[error("paragraph {paragraph} has no text box {text_box}")]
+    NoSuchTextBox { paragraph: usize, text_box: usize },
     #[error("no top-level table {0}")]
     NoSuchTable(usize),
     #[error("cell ({row}, {column}) is outside the table or starts no merge")]
     NoSuchCell { row: usize, column: usize },
-    #[error("paragraph {0} is in a text box, whose paragraphs cannot be split or joined")]
-    FixedParagraphs(usize),
     #[error("no revision {0:?}")]
     NoSuchRevision(String),
     #[error("there are no revisions to decide")]
@@ -440,6 +491,38 @@ impl TryFrom<HeadlessCommand> for IntentOp {
                 resolved,
             }),
             HeadlessCommand::DeleteComment { comment_id } => Ok(Self::DeleteComment { comment_id }),
+            HeadlessCommand::UpdateComment { comment_id, text } => {
+                Ok(Self::UpdateComment { comment_id, text })
+            }
+            HeadlessCommand::InsertFootnote {
+                paragraph,
+                offset,
+                text,
+            } => Ok(Self::InsertFootnote {
+                paragraph,
+                offset,
+                text,
+            }),
+            HeadlessCommand::InsertEndnote {
+                paragraph,
+                offset,
+                text,
+            } => Ok(Self::InsertEndnote {
+                paragraph,
+                offset,
+                text,
+            }),
+            HeadlessCommand::DeleteFootnote { footnote_id } => {
+                Ok(Self::DeleteFootnote { footnote_id })
+            }
+            HeadlessCommand::DeleteEndnote { endnote_id } => Ok(Self::DeleteEndnote { endnote_id }),
+            HeadlessCommand::DeleteTextBox {
+                paragraph,
+                text_box,
+            } => Ok(Self::DeleteTextBox {
+                paragraph,
+                text_box,
+            }),
             // The author is the server's to say; jade's session fields are
             // not carried.
             HeadlessCommand::StartChangeTracking { .. } => Ok(Self::SetTracking { on: true }),
@@ -765,9 +848,6 @@ pub fn resolve_with(
             count,
         } => {
             let at = caret(&paragraphs, *paragraph, *offset)?;
-            if matches!(at.story, StoryId::TextBox { .. }) {
-                return Err(IntentError::FixedParagraphs(*paragraph));
-            }
             let mut parent = at.parent;
             Ok((0..*count)
                 .map(|_| {
@@ -1008,6 +1088,87 @@ pub fn resolve_with(
         IntentOp::DeleteComment { comment_id } => Ok(vec![DocxOp::DeleteComment {
             comment: comment(view, comment_id)?,
         }]),
+        IntentOp::UpdateComment { comment_id, text } => Ok(vec![DocxOp::UpdateComment {
+            comment: comment(view, comment_id)?,
+            text: text.clone(),
+        }]),
+        IntentOp::InsertFootnote {
+            paragraph,
+            offset,
+            text,
+        }
+        | IntentOp::InsertEndnote {
+            paragraph,
+            offset,
+            text,
+        } => {
+            let at = caret(&paragraphs, *paragraph, *offset)?;
+            let kind = match op {
+                IntentOp::InsertFootnote { .. } => NoteKind::Footnote,
+                _ => NoteKind::Endnote,
+            };
+            // The reference, then the note's tab and text.
+            let id = ids(2 + text.chars().count() as u64);
+            Ok(vec![DocxOp::InsertNote {
+                kind,
+                story: at.story,
+                parent: at.parent,
+                id,
+                text: text.clone(),
+            }])
+        }
+        IntentOp::DeleteFootnote {
+            footnote_id: file_id,
+        }
+        | IntentOp::DeleteEndnote {
+            endnote_id: file_id,
+        } => {
+            let kind = match op {
+                IntentOp::DeleteFootnote { .. } => NoteKind::Footnote,
+                _ => NoteKind::Endnote,
+            };
+            let note = view
+                .note_by_file_id(kind, file_id)
+                .ok_or_else(|| IntentError::NoSuchNote(file_id.clone()))?;
+            Ok(vec![DocxOp::DeleteNote { kind, note }])
+        }
+        IntentOp::InsertTextBox {
+            paragraph,
+            offset,
+            text,
+            width_px,
+            height_px,
+        } => {
+            let at = caret(&paragraphs, *paragraph, *offset)?;
+            Ok(vec![DocxOp::InsertTextBox {
+                story: at.story,
+                parent: at.parent,
+                id: ids(1 + text.chars().count() as u64),
+                text: text.clone(),
+                width_px: width_px.unwrap_or(216),
+                height_px: height_px.unwrap_or(96),
+            }])
+        }
+        IntentOp::DeleteTextBox {
+            paragraph,
+            text_box,
+        } => {
+            let missing = IntentError::NoSuchTextBox {
+                paragraph: *paragraph,
+                text_box: *text_box,
+            };
+            let p = paragraphs.get(*paragraph).ok_or(missing.clone())?;
+            let id = p
+                .anchors
+                .iter()
+                .filter_map(|a| match a.story {
+                    StoryId::TextBox { id } => Some(id),
+                    _ => None,
+                })
+                .nth(*text_box)
+                .ok_or(missing)?;
+            Ok(vec![DocxOp::DeleteTextBox { text_box: id }])
+        }
         IntentOp::MergeTableCells {
             table,
             top_row,

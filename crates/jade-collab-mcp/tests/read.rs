@@ -50,6 +50,37 @@ fn read_document_names_note_and_text_box_paragraphs() {
     assert!(paragraphs[6].get("anchors").is_none());
 }
 
+/// Comments are listed with the id edits name them by, their thread, text,
+/// author and state — the file's and the session's alike.
+#[test]
+fn read_document_lists_comments() {
+    let jade = JadeDocx::load(&fixture("public/fixtures/comment.docx")).unwrap();
+    let model = DocxModel::from_word_document(jade.word()).unwrap();
+    let ids: Vec<String> = model.comments().iter().map(|c| c.id.to_string()).collect();
+    let read = read_docx(&model, 0, 100);
+    assert_eq!(
+        read["comments"],
+        json!([
+            {
+                "id": ids[0],
+                "file_id": "0",
+                "reply_to": null,
+                "text": "Hello Comment",
+                "author": "植木 智之",
+                "resolved": false,
+            },
+            {
+                "id": ids[1],
+                "file_id": "1",
+                "reply_to": ids[0],
+                "text": "Reply",
+                "author": "植木 智之",
+                "resolved": false,
+            },
+        ])
+    );
+}
+
 /// Tracked changes: the document's mode and every live revision, and on
 /// each paragraph the byte spans each revision covers.
 #[test]

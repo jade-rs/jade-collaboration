@@ -9,17 +9,20 @@ use jade_docx_document_core::document::RevisionKind as JadeKind;
 use jade_docx_document_core::document::{BodyElement, Note, Table};
 use jade_docx_document_core::headless_api::apply_headless_commands_to_document;
 use jade_docx_document_core::selection::TextPosition;
-use jade_docx_document_core::word_document::{DocxExportError, ParagraphStory, WordDocument};
+use jade_docx_document_core::word_document::{
+    DocxExportError, ParagraphAnchorKind, ParagraphStory, WordDocument,
+};
 use jade_docx_document_core::Options;
 use jade_docx_headless_api::{
-    HeadlessCommand, HeadlessEditRequest, HeadlessRevisionKindFilter, HeadlessRevisionTarget,
-    HeadlessTableCellSelection,
+    HeadlessCommand, HeadlessDeleteDirection, HeadlessEditRequest, HeadlessRevisionKindFilter,
+    HeadlessRevisionTarget, HeadlessShapeKind, HeadlessTableCellSelection,
 };
 
-use crate::model::{DocxEffect, DocxModel, DocxOp, FormatChange};
+use crate::model::{DocxEffect, DocxModel, DocxOp, FormatChange, NoteKind, Numbered, StoryId};
 
 /// The server's jade document. Not `Send` (jade shares parsed parts through
 /// `Rc`), so a server keeps one per document on its own thread.
+#[derive(Clone)]
 ///
 /// It holds the *base* document: the file, every text and structural edit,
 /// and the sequenced formatting, in log order — but none of the model's
@@ -31,27 +34,51 @@ use crate::model::{DocxEffect, DocxModel, DocxOp, FormatChange};
 /// around it otherwise — never jade's guess from the mark's run.
 pub struct JadeDocx {
     word: WordDocument,
-    /// jade's `w:id` of each comment made in the session. jade numbers new
-    /// comments itself (reusing freed numbers), so the materializer records
-    /// the number each one got rather than predicting it.
-    comments: BTreeMap<Id, String>,
+    /// The number jade gave each comment (and note) made since the document
+    /// was loaded. jade numbers them itself, reusing freed numbers, so the
+    /// materializer records what it got rather than predicting it, and the
+    /// server commits it to the model as a derived [`DocxOp::Numbered`] —
+    /// which is how a restored server, whose jade has just read the file,
+    /// still knows them.
+    numbered: BTreeMap<Numbered, String>,
+    /// Numbers learnt while realising the current operation, not yet derived.
+    fresh: Vec<(Numbered, String)>,
 }
 
 impl JadeDocx {
     pub fn new(word: WordDocument) -> Self {
         Self {
             word,
-            comments: BTreeMap::new(),
+            numbered: BTreeMap::new(),
+            fresh: Vec::new(),
         }
     }
 
-    /// jade's `w:id` of the model's comment `id`: the number jade gave it, or
-    /// the one it had in the file.
+    /// jade's `w:id` of the model's comment `id`: the one it had in the file
+    /// or the number jade gave it.
     pub fn comment_id(&self, model: &DocxModel, id: Id) -> Option<String> {
-        self.comments
-            .get(&id)
-            .cloned()
-            .or_else(|| model.comment_file_id(id).map(str::to_string))
+        model
+            .comment_file_id(id)
+            .map(str::to_string)
+            .or_else(|| self.numbered.get(&Numbered::Comment { id }).cloned())
+    }
+
+    /// The `w:id`s of jade's notes of `kind`.
+    fn note_ids(&self, kind: NoteKind) -> BTreeSet<String> {
+        self.word
+            .document
+            .as_ref()
+            .map(|d| match kind {
+                NoteKind::Footnote => d.footnotes.keys().cloned().collect(),
+                NoteKind::Endnote => d.endnotes.keys().cloned().collect(),
+            })
+            .unwrap_or_default()
+    }
+
+    /// Records the number jade gave `item`.
+    fn learn(&mut self, item: Numbered, file_id: String) {
+        self.numbered.insert(item, file_id.clone());
+        self.fresh.push((item, file_id));
     }
 
     pub fn load(bytes: &[u8]) -> Result<Self, String> {
@@ -82,10 +109,7 @@ impl JadeDocx {
     /// keeps jade's own formatting.
     pub fn formatted(&self, model: &DocxModel) -> Result<WordDocument, String> {
         let formatting = model.formatting();
-        let mut copy = JadeDocx {
-            word: self.word.clone(),
-            comments: BTreeMap::new(),
-        };
+        let mut copy = JadeDocx::new(self.word.clone());
         for format in formatting {
             let surface = copy.surface(&format.paragraph)?;
             let command = copy.format_command(surface, format.start, format.end, format.change)?;
@@ -234,10 +258,7 @@ impl JadeDocx {
         if effects.is_empty() {
             return Ok(());
         }
-        let mut trial = JadeDocx {
-            word: self.word.clone(),
-            comments: self.comments.clone(),
-        };
+        let mut trial = self.clone();
         trial
             .materialize(&after, effects, &ctx)
             .map_err(|e| Rejection::new(format!("jade cannot apply this: {e}")))
@@ -337,10 +358,6 @@ impl JadeDocx {
             .ok_or_else(|| format!("jade has no paragraph {at:?}"))
     }
 
-    fn text_len(&self, surface: usize) -> usize {
-        self.word.paragraph_text_len_at(surface).unwrap_or(0)
-    }
-
     /// The rendered offset `offset` bytes into the paragraph at `surface`,
     /// after `anchors` of its text boxes and note references (and their
     /// marks). jade must have exactly that many at or before the offset.
@@ -380,6 +397,81 @@ impl JadeDocx {
             },
         )
         .map_err(|e| format!("{description}: {e}"))
+    }
+
+    /// Runs `command(offset)` — inserting a text box or note reference, or
+    /// splitting, at a rendered offset — so that it takes effect `offset`
+    /// bytes into the paragraph at surface `s` after `anchors` of its text
+    /// boxes and note references.
+    ///
+    /// jade inserts before the anchors already at an offset, and its split
+    /// takes them to the second half. To act after some of them, the
+    /// materializer types a placeholder after those, acts right after the
+    /// placeholder — before the anchors that moved on with it — and deletes
+    /// the placeholder again.
+    fn at_anchors(
+        &mut self,
+        s: usize,
+        offset: usize,
+        anchors: usize,
+        command: impl FnOnce(usize) -> HeadlessCommand,
+        session: Option<&Session>,
+    ) -> Result<(), String> {
+        self.among_anchors(s, offset, anchors, command, session, false)
+    }
+
+    /// [`Self::at_anchors`]; with `always`, through the placeholder even
+    /// when jade would act in the right place by itself.
+    fn among_anchors(
+        &mut self,
+        s: usize,
+        offset: usize,
+        anchors: usize,
+        command: impl FnOnce(usize) -> HeadlessCommand,
+        session: Option<&Session>,
+        always: bool,
+    ) -> Result<(), String> {
+        let before = self
+            .word
+            .paragraph_anchors(s)
+            .iter()
+            .filter(|a| a.offset < offset)
+            .count();
+        if anchors == before && !always {
+            let at = self.rendered(s, offset);
+            return self.run_as(command(at), session);
+        }
+        let Some(after) = anchors.checked_sub(before) else {
+            return Err(format!(
+                "jade has {before} text boxes or note references before offset {offset} of \
+                 paragraph {s}; the model has {anchors}"
+            ));
+        };
+        let saved = self.word.clone();
+        let result = (|| {
+            self.run(HeadlessCommand::InsertTextAmongAnchors {
+                paragraph: s,
+                offset: self.rendered(s, offset),
+                after_anchors: after,
+                text: PLACEHOLDER.to_string(),
+            })?;
+            self.run_as(
+                command(self.rendered(s, offset + PLACEHOLDER.len())),
+                session,
+            )?;
+            let start = self.rendered_after(s, offset, anchors)?;
+            self.run(HeadlessCommand::ReplaceRange {
+                start_paragraph: s,
+                start_offset: start,
+                end_paragraph: s,
+                end_offset: start + PLACEHOLDER.len(),
+                text: String::new(),
+            })
+        })();
+        if result.is_err() {
+            self.word = saved;
+        }
+        result
     }
 
     /// Runs `command` with jade's revision session on for `session` (and
@@ -500,6 +592,22 @@ impl JadeDocx {
                 "jade lists a text box or note between {at:?} and the next paragraph"
             ));
         }
+        // A ranged join starts at the first paragraph's rendered end, before
+        // a trailing text box or note reference, and would drop it; deleting
+        // the break from the second paragraph's start keeps it.
+        let trailing = self
+            .word
+            .paragraph_anchors(first)
+            .iter()
+            .any(|a| a.offset == len);
+        if trailing {
+            return self.run(HeadlessCommand::DeleteText {
+                paragraph: second,
+                offset: self.rendered(second, 0),
+                direction: HeadlessDeleteDirection::Backward,
+                count: 1,
+            });
+        }
         let command = HeadlessCommand::ReplaceRange {
             start_paragraph: first,
             start_offset: self.rendered(first, len),
@@ -515,9 +623,9 @@ impl JadeDocx {
     ///
     /// jade's own typing goes right after the character before the offset
     /// (before the anchors there), or at a paragraph's start after the
-    /// anchors there. Concurrent edits can order text otherwise around an
-    /// anchor; jade gets that order by a split before the anchors, typing at
-    /// the start of either half and joining the halves again.
+    /// anchors there. Concurrent edits can order text otherwise around the
+    /// anchors at an offset — after them, before them, or between two of
+    /// them; jade's `insert_text_among_anchors` names how many come first.
     fn insert_text(
         &mut self,
         at: &ParagraphStory,
@@ -539,45 +647,34 @@ impl JadeDocx {
             };
             return self.run_as(command, session);
         }
-        let in_text_box = matches!(at, ParagraphStory::TextBox { .. });
-        let half = if anchors == before + here && offset > 0 {
-            next_paragraph(at)
-        } else if anchors == 0 && offset == 0 {
-            at.clone()
-        } else {
+        if anchors < before || anchors > before + here {
             return Err(format!(
-                "jade cannot place text between the text boxes and note references at \
-                 offset {offset} of {at:?}"
-            ));
-        };
-        if in_text_box {
-            return Err(format!(
-                "jade cannot place text on that side of a note reference in text box {at:?}"
+                "jade has {before} text boxes or note references before offset {offset} of \
+                 {at:?} and {here} at it; the model has {anchors} before the text"
             ));
         }
-        let saved = self.word.clone();
-        let result = (|| {
-            self.run(HeadlessCommand::InsertParagraphBreak {
-                paragraph: s,
-                offset: self.rendered(s, offset),
-                count: 1,
-            })?;
-            let target = self.surface(&half)?;
-            self.run_as(
-                HeadlessCommand::InsertText {
-                    paragraph: target,
-                    offset: self.rendered(target, 0),
+        if session.is_some() {
+            // jade's insert_text_among_anchors writes plain text; a tracked
+            // insertion is typed right after a placeholder there instead.
+            return self.among_anchors(
+                s,
+                offset,
+                anchors,
+                |offset| HeadlessCommand::InsertText {
+                    paragraph: s,
+                    offset,
                     text,
                 },
                 session,
-            )?;
-            let first = self.surface(at)?;
-            self.join(at, self.text_len(first))
-        })();
-        if result.is_err() {
-            self.word = saved;
+                true,
+            );
         }
-        result
+        self.run(HeadlessCommand::InsertTextAmongAnchors {
+            paragraph: s,
+            offset: self.rendered(s, offset),
+            after_anchors: anchors - before,
+            text,
+        })
     }
 
     /// Applies one effect to jade.
@@ -655,26 +752,20 @@ impl JadeDocx {
                 offset,
                 anchors,
             } => {
-                let s = self.surface(&paragraph)?;
                 // jade's split takes the anchors at the offset along to the
-                // second half; it cannot end the first half with one.
-                let before = self
-                    .word
-                    .paragraph_anchors(s)
-                    .iter()
-                    .filter(|a| a.offset < offset)
-                    .count();
-                if anchors != before {
-                    return Err(format!(
-                        "jade cannot split {paragraph:?} after the text box or note reference \
-                         at offset {offset}: its split takes them to the next paragraph"
-                    ));
-                }
-                HeadlessCommand::InsertParagraphBreak {
-                    paragraph: s,
-                    offset: self.rendered(s, offset),
-                    count: 1,
-                }
+                // second half; a placeholder keeps the ones that stay.
+                let s = self.surface(&paragraph)?;
+                return self.at_anchors(
+                    s,
+                    offset,
+                    anchors,
+                    |offset| HeadlessCommand::InsertParagraphBreak {
+                        paragraph: s,
+                        offset,
+                        count: 1,
+                    },
+                    None,
+                );
             }
             DocxEffect::JoinParagraph { paragraph, offset } => {
                 return self.join(&paragraph, offset)
@@ -805,11 +896,143 @@ impl JadeDocx {
             DocxEffect::DeleteComment { comment } => HeadlessCommand::DeleteComment {
                 comment_id: self.jade_comment(model, comment)?,
             },
+            DocxEffect::UpdateComment { comment, text } => HeadlessCommand::UpdateComment {
+                comment_id: self.jade_comment(model, comment)?,
+                text,
+            },
+            DocxEffect::InsertNote {
+                kind,
+                note,
+                paragraph,
+                offset,
+                anchors,
+                text,
+            } => {
+                let s = self.surface(&paragraph)?;
+                let before = self.note_ids(kind);
+                self.at_anchors(
+                    s,
+                    offset,
+                    anchors,
+                    |offset| match kind {
+                        NoteKind::Footnote => HeadlessCommand::InsertFootnote {
+                            paragraph: s,
+                            offset,
+                            text,
+                        },
+                        NoteKind::Endnote => HeadlessCommand::InsertEndnote {
+                            paragraph: s,
+                            offset,
+                            text,
+                        },
+                    },
+                    None,
+                )?;
+                let mut new = self
+                    .note_ids(kind)
+                    .into_iter()
+                    .filter(|k| !before.contains(k));
+                return match (new.next(), new.next()) {
+                    (Some(key), None) => {
+                        self.learn(kind.numbered(note), key);
+                        Ok(())
+                    }
+                    _ => Err("jade made no single new note".to_string()),
+                };
+            }
+            DocxEffect::DeleteNote { kind, note } => {
+                let story = match kind {
+                    NoteKind::Footnote => StoryId::Footnote { id: note },
+                    NoteKind::Endnote => StoryId::Endnote { id: note },
+                };
+                let key = model
+                    .note_id(story)
+                    .filter(|k| !k.is_empty())
+                    .ok_or_else(|| format!("note {note} has no jade number"))?
+                    .to_string();
+                self.run(match kind {
+                    NoteKind::Footnote => HeadlessCommand::DeleteFootnote {
+                        footnote_id: key.clone(),
+                    },
+                    NoteKind::Endnote => HeadlessCommand::DeleteEndnote {
+                        endnote_id: key.clone(),
+                    },
+                })?;
+                // jade removes the references it knows of; one it left
+                // (in a text box, say) would leave the model behind.
+                let left = (0..self.word.paragraph_count()).any(|s| {
+                    self.word
+                        .paragraph_anchors(s)
+                        .iter()
+                        .any(|a| match &a.kind {
+                            ParagraphAnchorKind::Footnote { note_id } => {
+                                kind == NoteKind::Footnote && *note_id == key
+                            }
+                            ParagraphAnchorKind::Endnote { note_id } => {
+                                kind == NoteKind::Endnote && *note_id == key
+                            }
+                            ParagraphAnchorKind::TextBox { .. } => false,
+                        })
+                });
+                return if left {
+                    Err(format!("jade kept a reference to {kind:?} {key}"))
+                } else {
+                    Ok(())
+                };
+            }
+            DocxEffect::InsertTextBox {
+                paragraph,
+                offset,
+                anchors,
+                text,
+                width_px,
+                height_px,
+            } => {
+                let s = self.surface(&paragraph)?;
+                return self.at_anchors(
+                    s,
+                    offset,
+                    anchors,
+                    |offset| HeadlessCommand::InsertShape {
+                        paragraph: s,
+                        offset,
+                        shape: HeadlessShapeKind::Rectangle,
+                        width_px: f64::from(width_px),
+                        height_px: f64::from(height_px),
+                        fill_color: None,
+                        border_color: Some("000000".to_string()),
+                        border_width_px: 1.0,
+                        text,
+                    },
+                    None,
+                );
+            }
+            DocxEffect::DeleteTextBox {
+                paragraph,
+                text_box,
+            } => HeadlessCommand::DeleteTextBox {
+                paragraph: self.surface(&paragraph)?,
+                text_box,
+            },
+            DocxEffect::Numbered { item, file_id } => {
+                // jade numbered it when it was made; on a replayed log it
+                // must have given the same number again.
+                self.fresh.retain(|(fresh, _)| *fresh != item);
+                return match self.numbered.insert(item, file_id.clone()) {
+                    Some(known) if known != file_id => Err(format!(
+                        "jade numbered {item:?} {known}, the log says {file_id}"
+                    )),
+                    _ => Ok(()),
+                };
+            }
         };
         self.run(command)
     }
 }
 
+/// Typed and deleted again to put a text box or note reference after some
+/// of the anchors at an offset.
+const PLACEHOLDER: &str = "X";
 /// Who a tracked edit is by, for jade's revision session.
 struct Session {
     author: Option<String>,
@@ -829,6 +1052,14 @@ fn next_paragraph(at: &ParagraphStory) -> ParagraphStory {
 }
 
 impl Materializer<DocxModel> for JadeDocx {
+    /// The numbers jade gave what `cause` made, for the model to record.
+    fn derived(&mut self, _: &DocxModel, _cause: &DocxOp) -> Vec<DocxOp> {
+        std::mem::take(&mut self.fresh)
+            .into_iter()
+            .map(|(item, file_id)| DocxOp::Numbered { item, file_id })
+            .collect()
+    }
+
     fn admit(&self, model: &DocxModel, op: &DocxOp) -> Result<(), Rejection> {
         if matches!(
             op,
@@ -837,6 +1068,11 @@ impl Materializer<DocxModel> for JadeDocx {
                 | DocxOp::ReplyToComment { .. }
                 | DocxOp::ResolveComment { .. }
                 | DocxOp::DeleteComment { .. }
+                | DocxOp::UpdateComment { .. }
+                | DocxOp::InsertNote { .. }
+                | DocxOp::DeleteNote { .. }
+                | DocxOp::InsertTextBox { .. }
+                | DocxOp::DeleteTextBox { .. }
                 | DocxOp::AcceptRevisions { .. }
                 | DocxOp::RejectRevisions { .. }
         ) {
@@ -874,13 +1110,18 @@ impl Materializer<DocxModel> for JadeDocx {
                 _ => None,
             };
             let before: BTreeSet<String> = self.word.comments.keys().cloned().collect();
-            let unlisted = matches!(effect, DocxEffect::AddComment { .. }).then(|| self.unlisted());
+            let unlisted = matches!(
+                effect,
+                DocxEffect::AddComment { .. } | DocxEffect::ReplyToComment { .. }
+            )
+            .then(|| self.unlisted());
             self.realize(model, effect)
                 .map_err(|e| format!("{description}: {e}"))?;
-            // jade's add_comment splits the runs it anchors to without
-            // relisting the paragraph's text boxes, whose paragraphs then
-            // point at the wrong run and vanish until the document is read
-            // again; putting jade's own state back relists them.
+            // jade's add_comment (and a reply, anchored the same way) splits
+            // the runs it anchors to without relisting the paragraph's text
+            // boxes, whose paragraphs then point at the wrong run and vanish
+            // until the document is read again; putting jade's own state
+            // back relists them.
             if unlisted.is_some_and(|before| self.unlisted() > before) {
                 if let Some(snapshot) = self.word.snapshot_including_package() {
                     self.word.restore_snapshot(snapshot);
@@ -895,7 +1136,8 @@ impl Materializer<DocxModel> for JadeDocx {
                     .filter(|key| !before.contains(*key));
                 match (new.next(), new.next()) {
                     (Some(key), None) => {
-                        self.comments.insert(comment, key.clone());
+                        let key = key.clone();
+                        self.learn(Numbered::Comment { id: comment }, key);
                     }
                     _ => return Err(format!("{description}: jade made no single new comment")),
                 }

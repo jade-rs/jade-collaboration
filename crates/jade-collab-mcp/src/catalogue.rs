@@ -22,7 +22,7 @@ in its order: the body's paragraphs with table cells row by row, each text box's
 after the paragraph that anchors it, each footnote's after the paragraph that first references it, \
 then the other footnotes and the endnotes; each paragraph says which story it belongs to. `offset` \
 is a UTF-8 byte offset on a character boundary; text boxes and note references take no text \
-(a paragraph lists where they sit), a text box's paragraphs cannot be split or joined. xlsx cells use A1 references, 1-based rows and column letters. Indices shift \
+(a paragraph lists where they sit). xlsx cells use A1 references, 1-based rows and column letters. Indices shift \
 as the document changes, so read before editing; the edits of one call are resolved in order, \
 each against the view the previous ones left.
 
@@ -287,6 +287,37 @@ fn edits() -> Value {
                 edit("delete_comment", "docx: delete a comment (a thread root takes its replies).", json!({
                     "comment_id": string("The comment's id."),
                 }), &["comment_id"]),
+                edit("update_comment", "docx: replace a comment's text (a thread root or a reply).", json!({
+                    "comment_id": string("The comment's id."),
+                    "text": string("The new text: no line breaks, nor whitespace at either end."),
+                }), &["comment_id", "text"]),
+                edit("insert_footnote", "docx: add a footnote at a caret of a body paragraph or table cell (before any text box or note reference already at that offset). Its paragraph is listed after the one that first references it; its text starts with a tab after the number, as Word's does.", json!({
+                    "paragraph": paragraph(),
+                    "offset": offset(),
+                    "text": string("The note's text (no line breaks); default empty."),
+                }), &["paragraph", "offset"]),
+                edit("insert_endnote", "docx: add an endnote at a caret of a body paragraph or table cell, like insert_footnote; endnotes are listed after everything else.", json!({
+                    "paragraph": paragraph(),
+                    "offset": offset(),
+                    "text": string("The note's text (no line breaks); default empty."),
+                }), &["paragraph", "offset"]),
+                edit("delete_footnote", "docx: delete a footnote and every reference to it.", json!({
+                    "footnote_id": string("The footnote's number (`note` in read_document's anchors and stories)."),
+                }), &["footnote_id"]),
+                edit("delete_endnote", "docx: delete an endnote and every reference to it.", json!({
+                    "endnote_id": string("The endnote's number (`note` in read_document's anchors and stories)."),
+                }), &["endnote_id"]),
+                edit("insert_text_box", "docx: add a text box (a rectangle holding one paragraph) at a caret of a body paragraph or table cell where no text box or note reference sits; its paragraphs are listed right after the one that anchors it.", json!({
+                    "paragraph": paragraph(),
+                    "offset": offset(),
+                    "text": string("The box's text (no line breaks); default empty."),
+                    "width_px": integer("Width in pixels; default 216."),
+                    "height_px": integer("Height in pixels; default 96."),
+                }), &["paragraph", "offset"]),
+                edit("delete_text_box", "docx: delete a text box with its content and the comments in it.", json!({
+                    "paragraph": integer("The paragraph that anchors it."),
+                    "text_box": integer("Which of that paragraph's text boxes (`text_box` in its anchors), zero-based."),
+                }), &["paragraph", "text_box"]),
                 edit("merge_table_cells", "docx: merge a rectangle of a top-level table's cells; the top-left cell shows their content, row by row.", json!({
                     "table": integer("The table's index (read_document lists them)."),
                     "top_row": integer("First row, zero-based."),
@@ -530,7 +561,7 @@ fn tools() -> Vec<Tool> {
         Tool {
             name: "read_document",
             title: "Read a document",
-            description: "Your current view, a page at a time. docx: paragraphs (index, text, which story — body, a table cell, a text box, a footnote or an endnote — where its text boxes and note references sit, and which bytes tracked changes cover: deleted text stays in `text` until the deletion is accepted), the top-level tables, whether Track Changes is on and every revision with its author; xlsx: every sheet's size and its non-blank cells in A1 form, paged over all sheets in order; pptx: slides (numbered from 1) with their shapes' numbers, text and geometry and the speaker notes. Your own unanswered edits are included.",
+            description: "Your current view, a page at a time. docx: paragraphs (index, text, which story — body, a table cell, a text box, a footnote or an endnote — where its text boxes and note references sit, and which bytes tracked changes cover: deleted text stays in `text` until the deletion is accepted), the comments, the top-level tables, whether Track Changes is on and every revision with its author; xlsx: every sheet's size and its non-blank cells in A1 form, paged over all sheets in order; pptx: slides (numbered from 1) with their shapes' numbers, text and geometry and the speaker notes. Your own unanswered edits are included.",
             input: object("Arguments.", json!({
                 "session_id": session_id(),
                 "start": integer("First paragraph (docx), cell (xlsx) or slide (pptx, zero-based) to list; default 0."),
@@ -562,6 +593,18 @@ fn tools() -> Vec<Tool> {
                             "description": "Tracked changes in it, if any: `{kind: insertion|deletion, revision, start, end}` (UTF-8 byte offsets into `text`).",
                         },
                     }), &["index", "text", "story"]),
+                },
+                "comments": {
+                    "type": "array",
+                    "description": "docx: every live comment, oldest first.",
+                    "items": object("A comment.", json!({
+                        "id": string("The id edits name it by (`lamport@rN`)."),
+                        "file_id": string("Its `w:id` in the file (edits take it too), or null while the server has not numbered it yet."),
+                        "reply_to": string("The id of the thread's root, or null for a root."),
+                        "text": string("Its text."),
+                        "author": string("Its author, or null."),
+                        "resolved": json!({ "type": "boolean", "description": "Whether its thread is resolved." }),
+                    }), &["id", "file_id", "reply_to", "text", "author", "resolved"]),
                 },
                 "tracking": json!({ "type": "boolean", "description": "docx: whether Track Changes is on." }),
                 "revisions": {

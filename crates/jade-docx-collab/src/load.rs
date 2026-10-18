@@ -103,6 +103,7 @@ impl Loader {
                 has_paragraph: false,
                 ..Story::empty_paragraph()
             },
+            deleted: false,
         };
         if footnote {
             self.footnotes.insert(id, note);

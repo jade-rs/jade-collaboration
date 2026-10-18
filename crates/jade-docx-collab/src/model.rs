@@ -100,8 +100,38 @@ impl Placement {
 /// A footnote or endnote: its `w:id` and its text.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Note {
+    /// Empty for a note made in the session until the server says which
+    /// number jade gave it ([`DocxOp::Numbered`]).
     pub(crate) file_id: String,
     pub(crate) story: Story,
+    /// Deleted notes stay, invisible, so a concurrent edit of their text
+    /// still applies.
+    #[serde(default)]
+    pub(crate) deleted: bool,
+}
+
+/// Which kind of note.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoteKind {
+    Footnote,
+    Endnote,
+}
+
+impl NoteKind {
+    fn placement(self, id: Id) -> Placement {
+        match self {
+            Self::Footnote => Placement::Footnote(id),
+            Self::Endnote => Placement::Endnote(id),
+        }
+    }
+
+    pub(crate) fn numbered(self, id: Id) -> Numbered {
+        match self {
+            Self::Footnote => Numbered::Footnote { id },
+            Self::Endnote => Numbered::Endnote { id },
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -369,7 +399,8 @@ pub(crate) struct Comment {
     pub(crate) content: CommentContent,
     pub(crate) resolved: bool,
     pub(crate) deleted: bool,
-    /// jade's `w:id` for a comment loaded from the file.
+    /// jade's `w:id`: the file's for a comment loaded from it, the one jade
+    /// gave for a comment made in the session (once the server says so).
     pub(crate) file_id: Option<String>,
 }
 
@@ -379,8 +410,9 @@ pub struct CommentView {
     pub id: Id,
     /// The root of its thread; `None` for a root.
     pub parent: Option<Id>,
-    /// jade's `w:id` when the comment came with the file. jade numbers the
-    /// comments made in the session itself; the model names them by `id`.
+    /// jade's `w:id`: the file's, or for a comment made in the session the
+    /// number jade gave it (`None` until the server's derived
+    /// [`DocxOp::Numbered`] arrives).
     pub file_id: Option<String>,
     /// (story, first, last character) for a root made in the session.
     pub anchor: Option<(StoryId, Id, Id)>,
@@ -478,6 +510,8 @@ pub enum FormatChange {
     },
 }
 
+/// The sizes jade draws a new text box at, in pixels.
+const TEXT_BOX_PX: std::ops::RangeInclusive<u32> = 12..=4096;
 /// A character attribute that travels the convergent lane as a mark: a
 /// simple run property whose value replaces the previous one. Concurrent
 /// marks of one attribute resolve to the newest; different attributes are
@@ -705,8 +739,7 @@ pub enum DocxOp {
     },
     /// Convergent. Deletes characters (never marks or anchors); idempotent.
     DeleteText { story: StoryId, ids: Vec<Id> },
-    /// Convergent. Inserts a paragraph mark after `parent`. Refused in a
-    /// text box, whose paragraphs are fixed.
+    /// Convergent. Inserts a paragraph mark after `parent`.
     SplitParagraph {
         story: StoryId,
         parent: Option<Id>,
@@ -714,7 +747,7 @@ pub enum DocxOp {
     },
     /// Sequenced. Deletes `mark`, joining its paragraph with the next one.
     /// Refused while a table, or a text box or footnote the paragraph
-    /// places, follows the paragraph, and in a text box.
+    /// places, follows the paragraph.
     JoinParagraph { story: StoryId, mark: Id },
     /// Sequenced. A new empty table in the body.
     InsertTable {
@@ -795,6 +828,48 @@ pub enum DocxOp {
     ResolveComment { comment: Id, resolved: bool },
     /// Sequenced. Deleting a root deletes its replies.
     DeleteComment { comment: Id },
+    /// Sequenced. Replaces a live comment's text (root or reply); the last
+    /// replacement in log order wins.
+    UpdateComment { comment: Id, text: String },
+    /// Sequenced. A new footnote or endnote, as jade's `insert_footnote` /
+    /// `insert_endnote` makes one: its reference is an anchor atom `id`
+    /// placed after `parent` in `story` (the body or a table cell), and the
+    /// note is a new story keyed by `id` holding one paragraph with a tab
+    /// and `text` (what jade writes into a new note), its characters
+    /// `id.offset(1)`, `id.offset(2)`, …. Refused where jade cannot put the
+    /// reference: in a text box or a note.
+    InsertNote {
+        kind: NoteKind,
+        story: StoryId,
+        parent: Option<Id>,
+        id: Id,
+        #[serde(default)]
+        text: String,
+    },
+    /// Sequenced. Deletes a footnote or endnote: every reference to it and
+    /// its story.
+    DeleteNote { kind: NoteKind, note: Id },
+    /// Sequenced. A new text box, as jade's `insert_shape` draws a
+    /// rectangle holding one paragraph: its anchor atom `id` is placed after
+    /// `parent` in `story` (the body or a table cell) and the box is a new
+    /// story keyed by `id` holding `text`, its characters `id.offset(1)`, ….
+    /// Refused where a note would be.
+    InsertTextBox {
+        story: StoryId,
+        parent: Option<Id>,
+        id: Id,
+        #[serde(default)]
+        text: String,
+        width_px: u32,
+        height_px: u32,
+    },
+    /// Sequenced. Deletes a text box placed in a body paragraph or a table
+    /// cell, with its content and the comments in it.
+    DeleteTextBox { text_box: Id },
+    /// Sequenced, derived: the number (`w:id`) jade gave a comment or note
+    /// made in the session. Only the server commits these, right after the
+    /// operation that made it.
+    Numbered { item: Numbered, file_id: String },
     /// Convergent. Like `InsertText`, as a tracked insertion: revision
     /// `first`, authored by the origin replica's name.
     TrackInsertText {
@@ -827,6 +902,15 @@ pub enum DocxOp {
     /// Sequenced. Rejects whole revisions: an insertion's characters go, a
     /// deletion stops applying to its characters.
     RejectRevisions { revisions: Vec<Id> },
+}
+
+/// Something jade numbers itself when it is made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Numbered {
+    Comment { id: Id },
+    Footnote { id: Id },
+    Endnote { id: Id },
 }
 
 /// An operation's consequence in jade terms: paragraphs by jade's story
@@ -940,6 +1024,45 @@ pub enum DocxEffect {
     DeleteComment {
         comment: Id,
     },
+    UpdateComment {
+        comment: Id,
+        text: String,
+    },
+    /// A new note `note` at `offset` of `paragraph`, after `anchors` of its
+    /// text boxes and note references.
+    InsertNote {
+        kind: NoteKind,
+        note: Id,
+        paragraph: ParagraphStory,
+        offset: usize,
+        anchors: usize,
+        text: String,
+    },
+    /// Notes are named by model id; the model knows jade's number.
+    DeleteNote {
+        kind: NoteKind,
+        note: Id,
+    },
+    /// A new text box at `offset` of `paragraph`, after `anchors` of its
+    /// text boxes and note references.
+    InsertTextBox {
+        paragraph: ParagraphStory,
+        offset: usize,
+        anchors: usize,
+        text: String,
+        width_px: u32,
+        height_px: u32,
+    },
+    /// Deletes the `text_box`-th text box (in run order) of `paragraph`.
+    DeleteTextBox {
+        paragraph: ParagraphStory,
+        text_box: usize,
+    },
+    /// jade gave `item` the number `file_id` (already done in jade).
+    Numbered {
+        item: Numbered,
+        file_id: String,
+    },
     /// `InsertText` with jade's revision session on for `author` and `date`.
     TrackInsertText {
         paragraph: ParagraphStory,
@@ -1031,15 +1154,24 @@ fn reject(message: impl Into<String>) -> Rejection {
     Rejection::new(message)
 }
 
-/// jade does not write a text box's new or removed paragraphs to the file
-/// (it keeps them in memory only), so a text box's paragraphs are fixed.
-fn fixed_paragraphs(story: StoryId) -> Result<(), Rejection> {
-    match story {
-        StoryId::TextBox { .. } => Err(reject(
-            "a text box's paragraphs cannot be split or joined: jade does not write them to the file",
-        )),
-        _ => Ok(()),
+/// Refuses comment text jade would not read back from the file as written:
+/// it keeps the text as typed while the file is open, but reads line breaks
+/// back as spaces and trims the ends.
+fn comment_text(text: &str) -> Result<(), Rejection> {
+    if text.trim().is_empty() {
+        return Err(reject("a comment needs text"));
     }
+    if text.trim() != text {
+        return Err(reject(
+            "a comment's text cannot start or end with whitespace: jade does not keep it",
+        ));
+    }
+    if text.chars().any(|c| c.is_control() && c != '\t') {
+        return Err(reject(
+            "a comment's text cannot hold line breaks or control characters: jade does not keep them",
+        ));
+    }
+    Ok(())
 }
 
 impl DocxModel {
@@ -1094,7 +1226,7 @@ impl DocxModel {
         let by_file_id = |notes: &BTreeMap<Id, Note>, skip: &dyn Fn(&Id) -> bool| {
             let mut rest: Vec<(&str, Id)> = notes
                 .iter()
-                .filter(|(id, _)| !skip(id))
+                .filter(|(id, note)| !note.deleted && !skip(id))
                 .map(|(id, note)| (note.file_id.as_str(), *id))
                 .collect();
             rest.sort();
@@ -1113,7 +1245,7 @@ impl DocxModel {
         let mut endnotes = std::mem::take(&mut out.endnotes_referenced);
         endnotes.extend(by_file_id(&self.endnotes, &|id| endnotes.contains(id)));
         for id in endnotes {
-            if let Some(note) = self.endnotes.get(&id) {
+            if let Some(note) = self.endnotes.get(&id).filter(|n| !n.deleted) {
                 self.walk_story(
                     Root::Endnote(id),
                     StoryId::Endnote { id },
@@ -1221,7 +1353,7 @@ impl DocxModel {
         for anchor in &anchors {
             if let StoryId::Footnote { id } = anchor.story {
                 if out.footnotes_listed.insert(id) {
-                    if let Some(note) = self.footnotes.get(&id) {
+                    if let Some(note) = self.footnotes.get(&id).filter(|n| !n.deleted) {
                         let root = Root::Footnote(id);
                         self.walk_story(root, anchor.story, &note.story, out, &mut 0);
                     }
@@ -1316,6 +1448,14 @@ impl DocxModel {
             _ => None,
         }
         .map(|note| note.file_id.as_str())
+    }
+
+    /// The live note of `kind` jade numbers `file_id`.
+    pub fn note_by_file_id(&self, kind: NoteKind, file_id: &str) -> Option<Id> {
+        self.notes(kind)
+            .iter()
+            .find(|(_, note)| !note.deleted && note.file_id == file_id)
+            .map(|(id, _)| *id)
     }
 
     /// The table cell position (table, row, column) whose `w:tc` shows
@@ -1571,7 +1711,6 @@ impl DocxModel {
         id: Id,
     ) -> Result<Vec<DocxEffect>, Rejection> {
         self.editable_story(story)?;
-        fixed_paragraphs(story)?;
         self.story_mut(story)
             .expect("checked")
             .flow
@@ -1589,7 +1728,6 @@ impl DocxModel {
     }
 
     fn join(&mut self, story_id: StoryId, mark: Id) -> Result<Vec<DocxEffect>, Rejection> {
-        fixed_paragraphs(story_id)?;
         let story = self.editable_story(story_id)?;
         match story.flow.get(mark) {
             Some(node) if node.value == Atom::Mark && !node.deleted => {}
@@ -2223,7 +2361,7 @@ impl DocxModel {
             .collect()
     }
 
-    /// jade's `w:id` of a comment that came with the file.
+    /// jade's `w:id` of a comment: the file's, or the number jade gave it.
     pub fn comment_file_id(&self, id: Id) -> Option<&str> {
         self.comments.get(&id)?.file_id.as_deref()
     }
@@ -2237,9 +2375,7 @@ impl DocxModel {
     }
 
     fn new_comment(&self, id: Id, content: &CommentContent) -> Result<(), Rejection> {
-        if content.text.trim().is_empty() {
-            return Err(reject("a comment needs text"));
-        }
+        comment_text(&content.text)?;
         if self.comments.contains_key(&id) {
             return Err(reject(format!("comment {id} already exists")));
         }
@@ -2338,6 +2474,58 @@ impl DocxModel {
         Ok(vec![DocxEffect::ResolveComment { comment, resolved }])
     }
 
+    fn update_comment(&mut self, comment: Id, text: &str) -> Result<Vec<DocxEffect>, Rejection> {
+        self.live_comment(comment)?;
+        comment_text(text)?;
+        self.comments
+            .get_mut(&comment)
+            .expect("checked")
+            .content
+            .text = text.to_string();
+        Ok(vec![DocxEffect::UpdateComment {
+            comment,
+            text: text.to_string(),
+        }])
+    }
+
+    /// Records the number jade gave `item`; only the server says so.
+    fn numbered(
+        &mut self,
+        item: Numbered,
+        file_id: &str,
+        ctx: &ApplyContext,
+    ) -> Result<Vec<DocxEffect>, Rejection> {
+        if ctx.origin != ReplicaId::ORIGIN {
+            return Err(reject("only the server records the numbers jade gives"));
+        }
+        if file_id.is_empty() {
+            return Err(reject("jade's number cannot be empty"));
+        }
+        match item {
+            Numbered::Comment { id } => {
+                let comment = self
+                    .comments
+                    .get_mut(&id)
+                    .ok_or_else(|| reject(format!("comment {id} does not exist")))?;
+                comment.file_id = Some(file_id.to_string());
+            }
+            Numbered::Footnote { id } | Numbered::Endnote { id } => {
+                let notes = match item {
+                    Numbered::Footnote { .. } => &mut self.footnotes,
+                    _ => &mut self.endnotes,
+                };
+                let note = notes
+                    .get_mut(&id)
+                    .ok_or_else(|| reject(format!("note {id} does not exist")))?;
+                note.file_id = file_id.to_string();
+            }
+        }
+        Ok(vec![DocxEffect::Numbered {
+            item,
+            file_id: file_id.to_string(),
+        }])
+    }
+
     fn delete_comment(&mut self, comment: Id) -> Result<Vec<DocxEffect>, Rejection> {
         self.live_comment(comment)?;
         self.delete_thread(comment);
@@ -2361,6 +2549,222 @@ impl DocxModel {
         for id in doomed {
             self.comments.get_mut(&id).expect("listed").deleted = true;
         }
+    }
+
+    fn notes(&self, kind: NoteKind) -> &BTreeMap<Id, Note> {
+        match kind {
+            NoteKind::Footnote => &self.footnotes,
+            NoteKind::Endnote => &self.endnotes,
+        }
+    }
+
+    fn notes_mut(&mut self, kind: NoteKind) -> &mut BTreeMap<Id, Note> {
+        match kind {
+            NoteKind::Footnote => &mut self.footnotes,
+            NoteKind::Endnote => &mut self.endnotes,
+        }
+    }
+
+    /// Every story's RGA, deleted ones included.
+    fn flows_mut(&mut self) -> impl Iterator<Item = &mut Rga<Atom>> {
+        std::iter::once(&mut self.body.flow)
+            .chain(
+                self.tables
+                    .values_mut()
+                    .flat_map(|t| t.stories.values_mut().map(|s| &mut s.flow)),
+            )
+            .chain(self.text_boxes.values_mut().map(|s| &mut s.flow))
+            .chain(self.footnotes.values_mut().map(|n| &mut n.story.flow))
+            .chain(self.endnotes.values_mut().map(|n| &mut n.story.flow))
+    }
+
+    /// Places a new anchor `id` (a note reference or a text box) after
+    /// `parent` in `story` — a body or table-cell story, where jade inserts
+    /// them — and says where jade finds it: (paragraph, offset, anchors of
+    /// the paragraph before it). Changes nothing when it refuses.
+    fn place_anchor(
+        &mut self,
+        story: StoryId,
+        parent: Option<Id>,
+        id: Id,
+        placement: Placement,
+    ) -> Result<(ParagraphStory, usize, usize), Rejection> {
+        if !matches!(
+            story,
+            StoryId::Body | StoryId::Cell { .. } | StoryId::Split { .. }
+        ) {
+            return Err(reject(
+                "jade puts notes and text boxes in body paragraphs and table cells only",
+            ));
+        }
+        // It goes wherever its parent puts it, among the anchors at its
+        // offset too: whether it is accepted must not depend on the text
+        // around it, which concurrent convergent edits change.
+        let host = self.editable_story(story)?;
+        let mut flow = host.flow.clone();
+        flow.insert(id, parent, Atom::Anchor(placement))?;
+        let host = std::mem::replace(&mut self.story_mut(story).expect("checked").flow, flow);
+        let located = self.paragraphs().into_iter().find_map(|p| {
+            let at = p.anchors.iter().position(|a| a.id == id)?;
+            Some((p.at.clone(), p.anchors[at].offset, at))
+        });
+        located.ok_or_else(|| {
+            self.story_mut(story).expect("checked").flow = host;
+            reject("the paragraph is gone")
+        })
+    }
+
+    /// Refuses text for a new note or text box that jade would not keep.
+    fn new_story_text(text: &str) -> Result<(), Rejection> {
+        if text.chars().any(|c| c.is_control() && c != '\t') {
+            return Err(reject(
+                "a new note's or text box's text cannot hold line breaks or control characters",
+            ));
+        }
+        Ok(())
+    }
+
+    /// A one-paragraph story holding `text`, its characters `first`,
+    /// `first.offset(1)`, ….
+    fn new_story(first: Id, text: impl IntoIterator<Item = char>) -> (Story, u64) {
+        let mut story = Story::empty_paragraph();
+        let atoms: Vec<Atom> = text.into_iter().map(Atom::Char).collect();
+        let count = atoms.len() as u64;
+        if count > 0 {
+            story
+                .flow
+                .insert_run(first, None, atoms)
+                .expect("a new story takes any ids");
+        }
+        (story, count)
+    }
+
+    fn insert_note(
+        &mut self,
+        kind: NoteKind,
+        story: StoryId,
+        parent: Option<Id>,
+        id: Id,
+        text: &str,
+    ) -> Result<Vec<DocxEffect>, Rejection> {
+        Self::new_story_text(text)?;
+        if self.footnotes.contains_key(&id) || self.endnotes.contains_key(&id) {
+            return Err(reject(format!("note {id} already exists")));
+        }
+        let (paragraph, offset, anchors) =
+            self.place_anchor(story, parent, id, kind.placement(id))?;
+        // What jade writes into a new note: a tab after the number, then
+        // the text.
+        let (note, count) =
+            Self::new_story(id.offset(1), std::iter::once('\t').chain(text.chars()));
+        self.notes_mut(kind).insert(
+            id,
+            Note {
+                file_id: String::new(),
+                story: note,
+                deleted: false,
+            },
+        );
+        self.observe([id.offset(count)]);
+        Ok(vec![DocxEffect::InsertNote {
+            kind,
+            note: id,
+            paragraph,
+            offset,
+            anchors,
+            text: text.to_string(),
+        }])
+    }
+
+    fn insert_text_box(
+        &mut self,
+        story: StoryId,
+        parent: Option<Id>,
+        id: Id,
+        text: &str,
+        (width_px, height_px): (u32, u32),
+    ) -> Result<Vec<DocxEffect>, Rejection> {
+        Self::new_story_text(text)?;
+        if !(TEXT_BOX_PX.contains(&width_px) && TEXT_BOX_PX.contains(&height_px)) {
+            return Err(reject(format!(
+                "a text box is {TEXT_BOX_PX:?} pixels wide and high"
+            )));
+        }
+        if self.text_boxes.contains_key(&id) {
+            return Err(reject(format!("text box {id} already exists")));
+        }
+        let (paragraph, offset, anchors) =
+            self.place_anchor(story, parent, id, Placement::TextBox(id))?;
+        let (text_box, count) = Self::new_story(id.offset(1), text.chars());
+        self.text_boxes.insert(id, text_box);
+        self.observe([id.offset(count)]);
+        Ok(vec![DocxEffect::InsertTextBox {
+            paragraph,
+            offset,
+            anchors,
+            text: text.to_string(),
+            width_px,
+            height_px,
+        }])
+    }
+
+    /// Deletes a text box anchored in a body or table-cell paragraph: its
+    /// anchor goes, and with it the box's story and the comments in it.
+    fn delete_text_box(&mut self, text_box: Id) -> Result<Vec<DocxEffect>, Rejection> {
+        let story = StoryId::TextBox { id: text_box };
+        let found = self.paragraphs().into_iter().find_map(|p| {
+            let anchor = p.anchors.iter().find(|a| a.story == story)?;
+            let index = p
+                .anchors
+                .iter()
+                .filter(|a| matches!(a.story, StoryId::TextBox { .. }))
+                .position(|a| a.id == anchor.id)?;
+            Some((p.story, p.at.clone(), anchor.id, index))
+        });
+        let Some((host, paragraph, anchor, index)) = found else {
+            return Err(reject(format!(
+                "text box {text_box} is not in the document"
+            )));
+        };
+        if !matches!(
+            host,
+            StoryId::Body | StoryId::Cell { .. } | StoryId::Split { .. }
+        ) {
+            return Err(reject(
+                "only text boxes in body paragraphs and table cells can be deleted",
+            ));
+        }
+        self.story_mut(host).expect("walked").flow.delete(anchor)?;
+        self.drop_comments_in_removed_cells();
+        Ok(vec![DocxEffect::DeleteTextBox {
+            paragraph,
+            text_box: index,
+        }])
+    }
+
+    fn delete_note(&mut self, kind: NoteKind, note: Id) -> Result<Vec<DocxEffect>, Rejection> {
+        match self.notes(kind).get(&note) {
+            Some(entry) if !entry.deleted => {}
+            Some(_) => return Err(reject(format!("note {note} was deleted"))),
+            None => return Err(reject(format!("{kind:?} {note} does not exist"))),
+        }
+        self.notes_mut(kind)
+            .get_mut(&note)
+            .expect("checked")
+            .deleted = true;
+        let placement = Atom::Anchor(kind.placement(note));
+        for flow in self.flows_mut() {
+            let references: Vec<Id> = flow
+                .iter()
+                .filter(|n| !n.deleted && n.value == placement)
+                .map(|n| n.id)
+                .collect();
+            for id in references {
+                flow.delete(id).expect("listed");
+            }
+        }
+        self.drop_comments_in_removed_cells();
+        Ok(vec![DocxEffect::DeleteNote { kind, note }])
     }
 
     /// jade removes the comments anchored in table cells it deletes; so does
@@ -2410,6 +2814,12 @@ impl Document for DocxModel {
             | DocxOp::ReplyToComment { .. }
             | DocxOp::ResolveComment { .. }
             | DocxOp::DeleteComment { .. }
+            | DocxOp::UpdateComment { .. }
+            | DocxOp::InsertNote { .. }
+            | DocxOp::DeleteNote { .. }
+            | DocxOp::InsertTextBox { .. }
+            | DocxOp::DeleteTextBox { .. }
+            | DocxOp::Numbered { .. }
             | DocxOp::SetTracking { .. }
             | DocxOp::SetAuthor { .. }
             | DocxOp::AcceptRevisions { .. }
@@ -2484,6 +2894,25 @@ impl Document for DocxModel {
                 self.resolve_comment(*comment, *resolved)
             }
             DocxOp::DeleteComment { comment } => self.delete_comment(*comment),
+            DocxOp::UpdateComment { comment, text } => self.update_comment(*comment, text),
+            DocxOp::InsertNote {
+                kind,
+                story,
+                parent,
+                id,
+                text,
+            } => self.insert_note(*kind, *story, *parent, *id, text),
+            DocxOp::DeleteNote { kind, note } => self.delete_note(*kind, *note),
+            DocxOp::InsertTextBox {
+                story,
+                parent,
+                id,
+                text,
+                width_px,
+                height_px,
+            } => self.insert_text_box(*story, *parent, *id, text, (*width_px, *height_px)),
+            DocxOp::DeleteTextBox { text_box } => self.delete_text_box(*text_box),
+            DocxOp::Numbered { item, file_id } => self.numbered(*item, file_id, ctx),
             DocxOp::TrackInsertText {
                 story,
                 parent,

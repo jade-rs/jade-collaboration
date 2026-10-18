@@ -530,6 +530,22 @@ fn comments_by_index_and_by_id() {
     .unwrap();
     assert!(model.comments()[0].resolved);
     assert_eq!(model.comments()[1].parent, Some(comment));
+    let ops = run(
+        &mut model,
+        IntentOp::UpdateComment {
+            comment_id: key.clone(),
+            text: "that world".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        ops,
+        [DocxOp::UpdateComment {
+            comment,
+            text: "that world".into()
+        }]
+    );
+    assert_eq!(model.comments()[0].content.text, "that world");
     run(&mut model, IntentOp::DeleteComment { comment_id: key }).unwrap();
     assert!(model.comments().is_empty());
 
@@ -766,6 +782,16 @@ fn formatting_and_comment_commands_project_into_intents() {
                 comment_id: "0".into(),
             },
         ),
+        (
+            HeadlessCommand::UpdateComment {
+                comment_id: "0".into(),
+                text: "x".into(),
+            },
+            IntentOp::UpdateComment {
+                comment_id: "0".into(),
+                text: "x".into(),
+            },
+        ),
     ];
     for (command, intent) in cases {
         // Simple character attributes are marks; clearing, paragraphs and
@@ -790,10 +816,6 @@ fn formatting_and_comment_commands_project_into_intents() {
             end_paragraph: 0,
             end_offset: 1,
             font_size: f32::NAN,
-        },
-        HeadlessCommand::UpdateComment {
-            comment_id: "0".into(),
-            text: "x".into(),
         },
     ] {
         let name = command.name();

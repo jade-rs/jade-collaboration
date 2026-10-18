@@ -17,6 +17,6 @@ pub use jade_collab_core::marks::{Boundary, Expand};
 pub use load::LoadError;
 pub use model::{
     Anchor, AnchorView, Atom, CommentContent, CommentView, DocxEffect, DocxModel, DocxOp,
-    FormatChange, MarkKey, Paragraph, ParagraphAlignment, ParagraphStory, Placement, Revision,
-    RevisionKind, RevisionView, StoryId, TableView, TextFormat, Tracked,
+    FormatChange, MarkKey, NoteKind, Numbered, Paragraph, ParagraphAlignment, ParagraphStory,
+    Placement, Revision, RevisionKind, RevisionView, StoryId, TableView, TextFormat, Tracked,
 };

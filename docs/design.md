@@ -137,10 +137,49 @@ own (`StoryId::Footnote`, `Endnote`, `TextBox`, keyed by an id minted on
 load), edited like the body: convergent text and paragraph splits,
 sequenced joins. What places it — a note's reference mark, a text box's
 anchoring run — is an **anchor atom** in its host paragraph's RGA, in run
-order. Anchors are zero-width and are never deleted: `DeleteText` refuses
-them, so a concurrent deletion of the text around one cannot take it, and a
-split or join moves it with the text around it. Creating and deleting notes
-and text boxes are out of scope; note separators are not modelled.
+order. Anchors are zero-width and are never deleted as text: `DeleteText`
+refuses them, so a concurrent deletion of the text around one cannot take
+it, and a split or join moves it with the text around it. Note separators
+are not modelled.
+
+**Creating and deleting** them is sequenced. `InsertNote` (footnote or
+endnote) and `InsertTextBox` put an anchor atom after a caret's atom of a
+body or table-cell story — jade inserts them nowhere else — and create the
+story it places, with every identifier derived from the operation's `id`
+(the anchor and the story are `id`, the characters `id.offset(1)`, …), so
+every replica builds the same thing. A new note holds what jade writes into
+one: a tab after the number, then the text; a new text box (jade's
+`insert_shape`, a rectangle 12–4096 pixels a side) one paragraph of text.
+`DeleteNote` tombstones every reference to the note and the note,
+`DeleteTextBox` the box's anchor; the stories stay, invisible, so typing
+into them that was concurrent with the deletion still applies and commutes
+(as with a deleted table's cells), and the comments in a deleted text box go
+with it, as in jade. jade numbers a new note itself (reusing freed numbers);
+the server commits the number as a derived operation (§5), so the walk —
+which lists unreferenced notes by number — and a restored server both know
+it.
+
+Whether a note or text box is accepted depends only on structure that
+convergent edits cannot change (its story, its parent atom, its id):
+the session property test showed that refusing one beside another anchor —
+a rule that depends on the text around it — let a replica's optimistic view
+differ from rebuilding it once a concurrent deletion arrived. It goes
+wherever its parent atom puts it, among the anchors at its offset too.
+jade puts a new reference or shape *before* the anchors already at its
+offset, so the materializer reaches any other place by typing a placeholder
+after the anchors that come first, inserting right after it and deleting it
+again.
+
+With tracked changes: creating or deleting a note or text box is not a
+revision (Word tracks neither as one, and jade's commands write none), but
+text typed into one while tracking is on is; tracked text that lands among
+the anchors at an offset is typed right after the placeholder with jade's
+revision session on (jade's `insert_text_among_anchors` writes plain text).
+Deleting a note or text box takes the tracked changes inside it with its
+story. Both tracks commit origin operations — the authors the server names
+(`SetAuthor`, committed directly) and jade's numbers (`Numbered`, derived) —
+and both sit in the journal and the checkpoint's model, so a restored
+server keeps both (`tests/notes_tracked.rs`).
 
 The model's walk lists paragraphs in jade's paragraph-surface order, which
 is also the order the intent API indexes: the body (table cells row by
@@ -155,10 +194,10 @@ note by `w:id` and paragraph.
 The anchors follow jade's rules, which a test checks on every fixture and
 the random-edit test after every operation:
 
-* jade's text offsets cannot name a side of a zero-width run. Typing at an
-  offset where an anchor sits goes right after the character before it —
-  *before* the anchor — except at a paragraph's start, where it goes after
-  the anchors there. The intent API resolves a caret the same way (at a
+* jade's text offsets alone cannot name a side of a zero-width run. Typing
+  at an offset where an anchor sits goes right after the character before
+  it — *before* the anchor — except at a paragraph's start, where it goes
+  after the anchors there. The intent API resolves a caret the same way (at a
   paragraph's start the caret's parent is the last leading anchor), and an
   RGA insert after a visible character lands before any older anchor that
   follows it, so sequential edits always agree.
@@ -170,35 +209,53 @@ the random-edit test after every operation:
   it and the next paragraph and has no command that joins across them, so
   the model refuses such a join (sequenced) and `admit` checks it again.
 
-jade used to write a text box's text to the file but not new or removed
-paragraphs in it (a split was kept in memory only), so a text box's
-paragraphs are fixed — jade-rs/jade-core#20 now writes them (a test shows
-it), so this restriction can be lifted: the model refuses `SplitParagraph` and `JoinParagraph`
-there, on every replica. jade cannot anchor a comment in a note; the model
-refuses that too. Formatting works in every story. jade's `add_comment`
-splits the runs of the paragraph it anchors to without relisting that
-paragraph's text boxes, whose paragraphs then point at a stale run until the
+A text box's paragraphs split and join like any story's: jade-core used to
+change only its in-memory model and kept the original paragraphs in the
+file, and now writes them (`w:txbxContent` of the DrawingML box and its VML
+fallback). Formatting works in every story. jade cannot anchor a comment in
+a note — its `add_comment`, `reply_to_comment` and `delete_comment` edit
+`document.xml` only, and a note's paragraphs and runs carry no XML binding
+into the notes part, which jade rewrites from the runs by position — so the
+model refuses comments in notes on every replica; supporting them needs that
+binding in jade-core first. jade's `add_comment`
+(and a reply, which it anchors the same way) splits the runs of the
+paragraph it anchors to without relisting that paragraph's text boxes,
+whose paragraphs then point at a stale run until the
 file is read again; the materializer has jade relist them by restoring
 jade's own snapshot. A jade-core bug surfaced here — text typed after a note
 reference or text box alone in its paragraph went into that run, and the
 next edit that split the run (formatting, a comment) copied the reference
 into both halves — and is fixed on jade-core's `feat/paragraph-story-api`
 with the story API the model needs (`paragraph_story`,
-`paragraph_story_surface`, `paragraph_anchors`).
+`paragraph_story_surface`, `paragraph_anchors`). Creating notes and text
+boxes surfaced more, fixed on jade-core's `feat/collab-notes-comments`
+(jade-rs/jade-core#31): text box paragraph splits and joins never reached
+the file; a note paragraph split after a body split wrote its halves to
+the wrong paragraphs; `insert_shape` read its offset as one into the runs'
+text rather than a rendered offset, so a shape after a note reference
+landed a character too far on; and two commands were missing —
+`delete_text_box`, and `insert_text_among_anchors` (below).
 
 **Concurrency around anchors.** jade's placement depends on what it sees
 when an edit arrives, the RGA's does not: text typed after a character that
 was concurrently deleted, right after an anchor, belongs after the anchor;
 text typed where a concurrent split put an anchor at the start of the new
-paragraph belongs before it. The materializer realises these orders with a
-split before the anchors, typing at the start of the half that must hold
-the text, and a join — possible unless a text box earlier in the paragraph
-sits between the halves (jade lists the first half's text boxes between
-them). One order jade cannot produce at all: a paragraph *ending* with an
-anchor because of a split right after a concurrently deleted character (its
-split always moves the anchor on). The materializer reports that as a fault
-instead of writing a different document. Both need a jade command that
-names the side of a zero-width run.
+paragraph belongs before it; and once a deletion brings two anchors to one
+offset, text typed after the deleted character lands *between* them. jade's
+typing puts text before all the anchors at an offset (at a paragraph's
+start after them), so the materializer writes every other order with
+jade-core's `insert_text_among_anchors`, which names how many of the
+anchors come first. A split that must leave some of the anchors at its
+offset in the first half (a split right after a concurrently deleted
+character that followed an anchor) goes through the same placeholder as a
+note placed after them: jade's split takes the anchors at its offset to
+the second half, so the materializer types a placeholder after the ones
+that stay, splits right after it and deletes it. A paragraph that ends
+with an anchor is joined by deleting the break from the next paragraph's
+start: jade's ranged join starts at the rendered end, before the anchor,
+and dropped it. The materializer thereby realises every order the model
+produces; a property test runs concurrent sessions, server restarts
+included, and requires no materialization fault.
 
 ### Tables (`jade-collab-core::grid`)
 
@@ -353,20 +410,36 @@ id, the same everywhere. The sequenced half needs no id and cannot conflict
 with marks: it only changes the base.
 
 Comments are sequenced too. `AddComment` anchors to the visible characters of
-an id range (refused when none are left); `ReplyToComment`, `ResolveComment`
-and `DeleteComment` name a comment by its model id. The model keeps a comment
-table (thread root, resolved, deleted, and jade's `w:id` for comments loaded
-from the file); like Word and jade, threads are flat (a reply to a reply
-answers the root) and deleting a root deletes its replies. jade numbers the
-comments made in the session itself, reusing freed numbers, so the
-materializer records the number each new comment got instead of predicting
-it.
+an id range (refused when none are left); `ReplyToComment`, `ResolveComment`,
+`UpdateComment` and `DeleteComment` name a comment by its model id. The model
+keeps a comment table (thread root, text, resolved, deleted, and jade's
+`w:id`); like Word and jade, threads are flat (a reply to a reply answers the
+root) and deleting a root deletes its replies. A comment's text is one
+value replaced by `UpdateComment` — the last in log order wins — rather than
+an RGA story: jade replaces a comment's text as a whole and keeps no
+paragraphs in it, so a character-level merge would have nothing to realise
+it. Text jade would not read back as written — it keeps line breaks and
+whitespace at the ends while the file is open, but reads them back as
+spaces and trimmed — is refused for every comment operation, so a restored
+server and the replicas never disagree on it.
 
-`admit` preflights sequenced formatting and comment operations on a clone of
-the jade document and refuses what jade cannot do — for instance a reply
-whose root's text was deleted (jade re-anchors replies on the root's text).
-Marks are never preflighted: they must commit wherever they land, and the
-model refuses everything jade could not write (invalid values) itself.
+jade numbers the comments (and notes) made in the session itself, reusing
+freed numbers, so the materializer records the number each one got instead
+of predicting it, and the server commits it as a derived `Numbered`
+operation right after the one that made it (§5). The number is then in the
+model, every replica's and the checkpoint's: a server restored from a
+checkpoint and the file it exported, whose jade has just read that file,
+still addresses every comment and note (a property test restarts the
+server at random points of concurrent sessions). Replaying a journal checks
+that jade numbered alike.
+
+`admit` preflights sequenced formatting, comment, note and text box
+operations on a clone of the jade document and refuses what jade cannot do
+— for instance a reply whose root's text was deleted (jade re-anchors
+replies on the root's text). The agreement property test fails if jade
+refuses a note, text box or comment edit the model accepts. Marks are never
+preflighted: they must commit wherever they land, and the model refuses
+everything jade could not write (invalid values) itself.
 
 ### Tracked changes (`jade-docx-collab`)
 
@@ -688,7 +761,8 @@ operation the sequencer asks the materializer what jade did on its own
 (`Materializer::derived`) and commits each answer as an operation of the
 document's origin (replica 0), right after its cause; the server journals
 and broadcasts them like any commit, and a replayed journal applies them
-without asking again. Only the origin may commit them (the model refuses
+without asking again. The docx materializer derives the numbers jade gives
+new comments and notes this way. Only the origin may commit them (the model refuses
 them from anyone else), and they carry no effect — jade already holds what
 it derived. Replicas need nothing new: a derived operation is a remote
 sequenced operation like any other.
@@ -980,15 +1054,19 @@ reaches the file.
 Working: the two-lane protocol over WebSockets; docx text, paragraph
 split/join, table insertion/deletion and row/column structure (through
 merged cells too, as Word does), merging and unmerging cells, text in any
-table cell; text of footnotes, endnotes and text boxes
-(§4; notes also split and joined), their anchors following splits, joins
-and deletions as jade moves them; docx character formatting as convergent
+table cell; text and paragraphs of footnotes, endnotes and text boxes
+(§4), their anchors following splits, joins and deletions as jade moves
+them, in every concurrent order; creating and deleting footnotes, endnotes
+and text boxes; docx character formatting as convergent
 Peritext marks (bold, italic, underline, strike, size, family, colour,
 highlight; expanding at their end; newest wins per attribute; realised on
 the written file over jade's base formatting) and clearing as an unset mark
 plus a sequenced clear of the file's formatting; paragraph formatting and
-comments (add, reply, resolve, delete; also comments loaded from the file)
-as sequenced operations on id ranges resolved in log order (§4);
+comments (add, reply, resolve, edit, delete; also comments loaded from the
+file; in the body, table cells and text boxes) as sequenced operations on id
+ranges resolved in log order (§4), with jade's numbers for new comments and
+notes committed as derived operations so a restored server keeps
+addressing them;
 docx tracked changes (§4): a document-wide tracking mode, tracked typing
 and deleting by people and agents with the server naming each revision's
 author from the token, Word's own-insertion rule, concurrent tracked
@@ -1030,7 +1108,8 @@ Not yet:
   hypothesis (`Extends`, `InGap`), checked by a property test rather than
   proved from `Rga.walk`.
   Formatting a story's last paragraph while it is empty (it has no atom to
-  name it by); editing comment text; comments in notes and headers.
+  name it by); comments in notes (jade-core's comment commands edit
+  `document.xml` only, and note runs carry no XML binding) and headers.
   Headers and footers are not modelled.
 * xlsx conditional formats and threaded comments; borders on whole rows
   and columns through `set_borders` (`set_format` takes edges for them);
@@ -1047,16 +1126,12 @@ Not yet:
   revisions, not part of one; jade's own editor still marks one's own
   insertion deleted instead of removing it (the intent API removes it).
 * docx structure of ragged and nested tables (their text is editable);
-  creating and
-  deleting notes and text boxes; splitting or joining a text box's
-  paragraphs (jade writes them since jade-core#20; the model still
-  refuses them); comments in notes; the concurrent
-  orders around anchors jade cannot realise (§4).
+  text boxes inside text boxes or notes, and their geometry.
 * Access: reloading tokens on SIGHUP is Unix-only (the file is still polled
   everywhere); the audit log is a plain file that is never rotated.
 * Performance: RGA lookups are linear and paragraph positions are recomputed
-  by walking the model on each operation; sequenced formatting and comment
-  operations are preflighted on a copy of the jade document; marks are
+  by walking the model on each operation; sequenced formatting, comment,
+  note and text box operations are preflighted on a copy of the jade document; marks are
   realised on a fresh copy of the base document every time the file is
   written (one jade command per run of one value), and their coverage is
   recomputed by a sweep over the story (`O((n + m) log m)`) when asked;

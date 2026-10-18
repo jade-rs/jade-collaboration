@@ -8,7 +8,7 @@ mod common;
 
 use common::{assert_same_order, commit, open};
 use jade_collab_core::id::{Id, ReplicaId};
-use jade_collab_sync::{ApplyContext, Document, Lane, Materializer};
+use jade_collab_sync::{ApplyContext, Document, Lane};
 use jade_docx_collab::intent::{resolve, IntentOp};
 use jade_docx_collab::{
     CommentContent, DocxEffect, DocxModel, DocxOp, JadeDocx, ParagraphStory, StoryId,
@@ -25,15 +25,6 @@ fn ctx() -> ApplyContext {
         origin: ReplicaId(1),
         base_seq: 0,
         seq: Some(1),
-    }
-}
-
-fn fresh(replica: u64) -> impl FnMut(u64) -> Id {
-    let mut next = 1_000_000u64;
-    move |n| {
-        let id = Id::new(next, ReplicaId(replica));
-        next += n;
-        id
     }
 }
 
@@ -401,11 +392,10 @@ fn notes_are_typed_split_and_joined_through_export() {
     assert_eq!(again.paragraph_texts(), model.paragraph_texts());
 }
 
-/// jade writes a text box's text to the file but not new or removed
-/// paragraphs in it (see `jade_drops_text_box_paragraph_breaks_on_export`),
-/// so a text box's text is editable and its paragraphs are fixed.
+/// A text box's paragraphs split and join like any story's, and jade writes
+/// them to the file (jade-core once kept them in memory only).
 #[test]
-fn text_box_text_is_editable_and_its_paragraphs_are_fixed() {
+fn text_box_paragraphs_are_split_and_joined_through_export() {
     let (mut model, mut jade) = open(MIXED);
     let box_text = 10;
     edit(
@@ -420,33 +410,48 @@ fn text_box_text_is_editable_and_its_paragraphs_are_fixed() {
         },
     );
     assert_eq!(layout(&model, box_text), "Small text[4]");
-    let p = model.paragraphs()[box_text].clone();
-    let before = model.clone();
-    let split = DocxOp::SplitParagraph {
-        story: p.story,
-        parent: Some(p.chars[2]),
-        id: Id::new(5_000_000, ReplicaId(1)),
-    };
-    assert!(model.apply(&split, &ctx()).is_err());
-    assert_eq!(model, before);
-    assert!(resolve(
-        &model,
-        &IntentOp::InsertParagraphBreak {
+    edit(
+        &mut model,
+        &mut jade,
+        IntentOp::InsertParagraphBreak {
             paragraph: box_text,
             offset: 2,
-            count: 1
+            count: 2,
         },
-        &mut fresh(1)
-    )
-    .is_err());
+    );
+    let p = model.paragraphs();
+    assert_eq!(layout(&model, box_text), "Sm");
+    assert_eq!(p[box_text + 1].text, "");
+    assert_eq!(layout(&model, box_text + 2), "all text[4]");
+    assert_eq!(
+        p[box_text + 2].at,
+        ParagraphStory::TextBox {
+            host: 5,
+            text_box: 0,
+            paragraph: 2
+        }
+    );
+    let (again, _) = reloaded(&jade);
+    assert_eq!(layouts(&again), layouts(&model));
+    // Joined again, one paragraph end at a time.
+    for _ in 0..2 {
+        edit(
+            &mut model,
+            &mut jade,
+            IntentOp::DeleteText {
+                paragraph: box_text,
+                offset: 2,
+                direction: jade_docx_headless_api::HeadlessDeleteDirection::Forward,
+                count: 1,
+            },
+        );
+    }
+    assert_eq!(layout(&model, box_text), "Small text[4]");
     let (again, _) = reloaded(&jade);
     assert_eq!(layouts(&again), layouts(&model));
 }
 
-/// Why text-box paragraphs were made fixed: jade used to split the
-/// paragraph in memory but write the text box's original paragraphs. Since
-/// jade-rs/jade-core#20 it writes the split, so the model's restriction
-/// could be lifted (not done yet; see design.md §9).
+/// jade writes a text box's new paragraphs to the file.
 #[test]
 fn jade_writes_text_box_paragraph_breaks_on_export() {
     use jade_docx_document_core::headless_api::apply_headless_commands_to_document;
@@ -648,13 +653,13 @@ fn typing_after_a_deleted_character_stays_after_the_anchor() {
     assert_eq!(results[0], results[1]);
 }
 
-/// What jade cannot do: end a paragraph with an anchor through a split.
-/// When the character after an anchor is deleted before a split right after
-/// it reaches the server, the model keeps the anchor in the first half and
-/// jade could only put it in the second; the materializer reports that
-/// instead of writing a different document, and leaves jade as it was.
+/// A paragraph ending with an anchor through a split: when the character
+/// after an anchor is deleted before a split right after it reaches the
+/// server, the model keeps the anchor in the first half. jade's split takes
+/// the anchors at its offset to the second, so the materializer types a
+/// placeholder after the anchors that stay, splits after it and deletes it.
 #[test]
-fn a_split_jade_cannot_place_is_reported_not_guessed() {
+fn a_split_after_an_anchor_keeps_it_in_the_first_half() {
     let (mut model, mut jade) = open(MIXED);
     let space = model.paragraphs()[HOST].chars[4];
     commit(
@@ -665,21 +670,19 @@ fn a_split_jade_cannot_place_is_reported_not_guessed() {
             ids: vec![space],
         },
     );
-    let texts = jade.paragraph_texts();
-    let effects = model
-        .apply(
-            &DocxOp::SplitParagraph {
-                story: StoryId::Body,
-                parent: Some(space),
-                id: Id::new(1_000, ReplicaId(2)),
-            },
-            &ctx(),
-        )
-        .unwrap();
+    let id = Id::new(model.max_lamport() + 1, ReplicaId(2));
+    commit(
+        &mut model,
+        &mut jade,
+        DocxOp::SplitParagraph {
+            story: StoryId::Body,
+            parent: Some(space),
+            id,
+        },
+    );
     assert_eq!(layout(&model, HOST), "Host[5][box]");
-    let error = jade.materialize(&model, effects, &ctx()).unwrap_err();
-    assert!(error.contains("cannot"), "{error}");
-    assert_eq!(jade.paragraph_texts(), texts);
+    let (again, _) = reloaded(&jade);
+    assert_eq!(layouts(&again), layouts(&model));
 }
 
 /// Every anchor of the file, as (story it places, host story) pairs.
@@ -771,6 +774,39 @@ proptest! {
         prop_assert_eq!(stories, walked_stories(&base).0);
         prop_assert!(contiguous, "a note's or text box's paragraphs were split up");
     }
+}
+
+/// A note paragraph split after a body split reaches the file (jade-core
+/// wrote the note's halves by surface index after relisting the surfaces;
+/// found by the agreement property test).
+#[test]
+fn a_note_split_after_a_body_split_reaches_the_file() {
+    let (mut model, mut jade) = open(MIXED);
+    edit(
+        &mut model,
+        &mut jade,
+        IntentOp::InsertParagraphBreak {
+            paragraph: HOST,
+            offset: "Host after ".len(),
+            count: 1,
+        },
+    );
+    let note = model
+        .paragraph_texts()
+        .iter()
+        .position(|t| t == " Note for Host")
+        .unwrap();
+    edit(
+        &mut model,
+        &mut jade,
+        IntentOp::InsertParagraphBreak {
+            paragraph: note,
+            offset: " Note ".len(),
+            count: 1,
+        },
+    );
+    let (again, _) = reloaded(&jade);
+    assert_eq!(layouts(&again), layouts(&model));
 }
 
 /// A jade-core bug the tracked-changes generator found (seed

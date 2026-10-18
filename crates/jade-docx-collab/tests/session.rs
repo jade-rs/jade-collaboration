@@ -11,14 +11,25 @@ use common::{
 };
 use jade_collab_core::id::ReplicaId;
 use jade_collab_sync::sim::Simulation;
+use jade_collab_sync::Sequencer;
 use jade_docx_collab::{DocxModel, DocxOp, JadeDocx};
 use proptest::prelude::*;
 
 #[derive(Clone, Debug)]
 enum Step {
-    Local { client: usize, choice: u64 },
-    Up { client: usize },
-    Down { client: usize },
+    Local {
+        client: usize,
+        choice: u64,
+    },
+    Up {
+        client: usize,
+    },
+    Down {
+        client: usize,
+    },
+    /// The server stops and comes back from its checkpoint and the file
+    /// jade wrote, as a durable server restarts.
+    Restart,
 }
 
 fn steps() -> impl Strategy<Value = Vec<Step>> {
@@ -27,6 +38,7 @@ fn steps() -> impl Strategy<Value = Vec<Step>> {
             3 => (0..3usize, any::<u64>()).prop_map(|(client, choice)| Step::Local { client, choice }),
             2 => (0..3usize).prop_map(|client| Step::Up { client }),
             2 => (0..3usize).prop_map(|client| Step::Down { client }),
+            1 => Just(Step::Restart),
         ],
         0..60,
     )
@@ -75,6 +87,12 @@ proptest! {
                 }
                 Step::Down { client } => {
                     sim.deliver_down(client).unwrap();
+                }
+                Step::Restart => {
+                    let bytes = sim.server().materializer().export_base().unwrap();
+                    let checkpoint = sim.checkpoint();
+                    let jade = JadeDocx::load(&bytes).unwrap();
+                    sim.restart(Sequencer::restore(checkpoint, jade)).unwrap();
                 }
             }
             for client in 0..3 {
