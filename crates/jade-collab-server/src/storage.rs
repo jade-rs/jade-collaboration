@@ -319,6 +319,7 @@ mod tests {
     use jade_collab_sync::protocol::Committed;
     use proptest::prelude::*;
     use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Debug)]
     enum Step {
@@ -369,8 +370,95 @@ mod tests {
         }
     }
 
+    fn fsync() -> impl Strategy<Value = Fsync> {
+        prop_oneof![Just(Fsync::EveryRecord), Just(Fsync::Checkpoints)]
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    enum Event {
+        Append(Vec<u8>),
+        Sync,
+    }
+
+    /// A journal file that tells what was done to it.
+    struct Recorder {
+        file: File,
+        events: Arc<Mutex<Vec<Event>>>,
+    }
+
+    impl JournalFile for Recorder {
+        fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(Event::Append(bytes.to_vec()));
+            self.file.append(bytes)
+        }
+
+        fn sync(&mut self) -> io::Result<()> {
+            self.events.lock().unwrap().push(Event::Sync);
+            self.file.sync()
+        }
+    }
+
+    fn recording(events: &Arc<Mutex<Vec<Event>>>) -> JournalOpener {
+        let events = events.clone();
+        Arc::new(move |file| {
+            Box::new(Recorder {
+                file,
+                events: events.clone(),
+            })
+        })
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(48))]
+
+        /// Every record reaches the disk before `append` returns — and so
+        /// before anyone hears of it — under `EveryRecord`; under
+        /// `Checkpoints` the journal is written to the operating system but
+        /// never synced, across checkpoints and reopenings.
+        #[test]
+        fn the_journal_is_synced_as_the_policy_says(
+            sync in fsync(),
+            checkpoint_every in 1..6u64,
+            steps in prop::collection::vec(
+                prop_oneof![8 => record().prop_map(Some), 1 => Just(None)],
+                0..40,
+            ),
+        ) {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("doc.docx");
+            let options = StorageOptions { checkpoint_every, sync, ..StorageOptions::default() };
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let mut store = DocumentStore::create_with(
+                dir.clone(), Format::Docx, options, &checkpoint(0), b"file", recording(&events),
+            ).unwrap();
+            let mut appended = 0;
+            for step in steps {
+                let Some(record) = step else {
+                    store = DocumentStore::open_with::<String, String>(
+                        dir.clone(), Format::Docx, options, recording(&events),
+                    ).unwrap().0;
+                    continue;
+                };
+                let before = events.lock().unwrap().len();
+                let due = store.append(&record).unwrap();
+                appended += 1;
+                let mut line = serde_json::to_vec(&record).unwrap();
+                line.push(b'\n');
+                let happened = events.lock().unwrap()[before..].to_vec();
+                match sync {
+                    Fsync::EveryRecord => prop_assert_eq!(happened, vec![Event::Append(line), Event::Sync]),
+                    Fsync::Checkpoints => prop_assert_eq!(happened, vec![Event::Append(line)]),
+                }
+                if due {
+                    store.checkpoint::<String, String>(&checkpoint(appended), &[], b"file").unwrap();
+                }
+            }
+            let syncs = events.lock().unwrap().iter().filter(|e| **e == Event::Sync).count();
+            prop_assert_eq!(syncs, if sync == Fsync::EveryRecord { appended as usize } else { 0 });
+        }
 
         /// Whatever was appended, checkpointed and torn, reopening gives the
         /// newest checkpoint, the tail kept with it, its file, and exactly
@@ -379,11 +467,12 @@ mod tests {
         fn reopening_reads_back_the_newest_checkpoint_and_journal(
             checkpoint_every in 1..8u64,
             keep_tail in 0..4usize,
+            sync in fsync(),
             steps in steps(),
         ) {
             let root = tempfile::tempdir().unwrap();
             let dir = root.path().join("doc.docx");
-            let options = StorageOptions { checkpoint_every, keep_tail };
+            let options = StorageOptions { checkpoint_every, keep_tail, sync };
             let mut checkpoints = 0;
             let mut expected_checkpoint = checkpoint(checkpoints);
             let mut store = DocumentStore::create(
@@ -415,7 +504,7 @@ mod tests {
                         }
                     }
                     Step::Tear(bytes) => {
-                        store.log.write_all(&bytes).unwrap();
+                        store.log.append(&bytes).unwrap();
                         let (reopened, stored) =
                             DocumentStore::open::<String, String>(dir.clone(), Format::Docx, options).unwrap();
                         store = reopened;

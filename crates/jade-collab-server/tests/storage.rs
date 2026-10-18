@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use jade_collab_server::{Client, ClientError, Server, StorageOptions};
+use jade_collab_server::{Client, ClientError, Fsync, Server, StorageOptions};
 use jade_collab_sync::Document;
 use jade_docx_collab::intent::{resolve, IntentOp};
 use jade_docx_collab::{DocxModel, JadeDocx};
@@ -205,6 +205,7 @@ async fn checkpoints_bound_the_log_and_replicas_behind_them_must_rejoin() {
     let options = StorageOptions {
         checkpoint_every: 3,
         keep_tail: 0,
+        ..StorageOptions::default()
     };
     let server = Server::with_storage_options(dir.path(), options).unwrap();
     server.open("hello.docx", fixture("hello.docx")).unwrap();
@@ -272,6 +273,7 @@ async fn replicas_just_behind_a_checkpoint_resume_from_the_kept_tail() {
     let options = StorageOptions {
         checkpoint_every: 3,
         keep_tail: 4,
+        ..StorageOptions::default()
     };
     let server = Server::with_storage_options(dir.path(), options).unwrap();
     server.open("hello.docx", fixture("hello.docx")).unwrap();
@@ -325,6 +327,40 @@ async fn replicas_just_behind_a_checkpoint_resume_from_the_kept_tail() {
         .err()
         .expect("refused");
     assert!(matches!(error, ClientError::Rejoin(_)), "{error}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_that_syncs_every_record_restarts_like_any_other() {
+    assert_eq!(StorageOptions::default().sync, Fsync::Checkpoints);
+    let dir = tempfile::tempdir().unwrap();
+    let options = StorageOptions {
+        sync: Fsync::EveryRecord,
+        checkpoint_every: 4,
+        ..StorageOptions::default()
+    };
+    let server = Server::with_storage_options(dir.path(), options).unwrap();
+    server.open("hello.docx", fixture("hello.docx")).unwrap();
+    let (base, task) = listen(&server).await;
+    let url = format!("{base}/hello.docx/ws");
+    let writer: Client<DocxModel> = Client::connect(&url, None).await.unwrap();
+    for i in 0..5 {
+        type_text(&writer, 0, &format!("{i}"));
+        writer.settle().await.unwrap();
+    }
+    catch_up(&server, "hello.docx", &writer).await;
+    let before = server.export("hello.docx").await.unwrap();
+    let writer = writer.disconnect().await;
+    task.abort();
+    drop(server);
+
+    let server = Server::with_storage_options(dir.path(), options).unwrap();
+    assert_eq!(server.seq("hello.docx").await.unwrap(), 5);
+    assert_eq!(server.export("hello.docx").await.unwrap(), before);
+    let (base, _task) = listen(&server).await;
+    let writer = Client::resume(&format!("{base}/hello.docx/ws"), writer, None)
+        .await
+        .unwrap();
+    assert_eq!(writer.seq(), 5);
 }
 
 #[tokio::test(flavor = "multi_thread")]

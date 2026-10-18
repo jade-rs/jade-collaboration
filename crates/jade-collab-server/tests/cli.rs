@@ -112,7 +112,15 @@ fn serve_with_a_data_directory_survives_a_kill() {
     std::fs::copy(core.join("hello.docx"), &file).unwrap();
     let data = dir.join("data");
 
-    let (server, addr) = serve(&["--data".as_ref(), data.as_os_str(), file.as_os_str()]);
+    let (server, addr) = serve(&[
+        "--data".as_ref(),
+        data.as_os_str(),
+        "--fsync".as_ref(),
+        "every".as_ref(),
+        "--keep-tail".as_ref(),
+        "10".as_ref(),
+        file.as_os_str(),
+    ]);
     let docx = format!("ws://{addr}/documents/hello.docx/ws");
     run(&[
         "apply",
@@ -126,6 +134,14 @@ fn serve_with_a_data_directory_survives_a_kill() {
     let docx = format!("ws://{addr}/documents/hello.docx/ws");
     let shown = run(&["show", &docx]);
     assert!(shown.contains("Durable: Hello"), "{shown}");
+    // Only `every` and `checkpoint` are policies.
+    let refused = bin()
+        .args(["serve", "--data"])
+        .arg(&data)
+        .args(["--fsync", "sometimes"])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
