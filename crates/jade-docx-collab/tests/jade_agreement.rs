@@ -9,8 +9,9 @@ mod common;
 use std::collections::{BTreeMap, BTreeSet};
 
 use common::{
-    assert_comments_agree, assert_same_order, assert_stories_agree, char_styles, commit, generate,
-    jade_comments, jade_core, open, paragraph_formats, paragraph_snapshot, surface, CharStyle,
+    assert_comments_agree, assert_revisions_agree, assert_same_order, assert_stories_agree,
+    char_styles, commit, generate, jade_comments, jade_core, model_marks, open, paragraph_formats,
+    paragraph_snapshot, surface, CharStyle,
 };
 use jade_collab_core::id::{Id, ReplicaId};
 use jade_collab_sync::{ApplyContext, Document, Lane, Materializer};
@@ -59,6 +60,7 @@ fn every_fixture_loads_into_an_agreeing_model() {
             .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         assert_agree(&model, &jade, &path.display().to_string());
         assert_same_order(&model, &jade, &path.display().to_string());
+        assert_revisions_agree(&model, &jade, &path.display().to_string());
         checked += 1;
     }
     assert!(checked > 50, "only {checked} fixtures were checked");
@@ -269,6 +271,7 @@ proptest! {
                         .unwrap_or_else(|e| panic!("{name}: jade refused {op:?}: {e}"));
                     assert_agree(&model, &jade, &context);
                     assert_comments_agree(&model, &jade, &context);
+                    assert_revisions_agree(&model, &jade, &context);
                     if let (Some(styles_before), Some(formats_before)) = (styles_before, formats_before) {
                         assert_formatted(
                             &before,
@@ -320,6 +323,7 @@ proptest! {
         assert_same_order(&model, &reloaded, &format!("{name} against the reloaded file"));
         prop_assert_eq!(anchor_layout(&reloaded_model), anchor_layout(&model));
         prop_assert_eq!(jade_comments(&reloaded).len(), model.comments().len());
+        prop_assert_eq!(model_marks(&reloaded_model), model_marks(&model));
     }
 }
 

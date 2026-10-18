@@ -265,6 +265,115 @@ it.
 document and refuses what jade cannot do — for instance a reply whose root's
 text was deleted (jade re-anchors replies on the root's text).
 
+### Tracked changes (`jade-docx-collab`)
+
+Word's Track Changes in a shared document, edited by people and agents at
+once. What jade does, found by probing it (`tests/tracked_changes.rs`):
+with a revision session (`start_change_tracking`, one author and date for
+the whole document) typed text becomes a `w:ins` run of its own (a new
+`w:id` per edit, so two authors typing into each other's insertions stay
+apart), and a deletion becomes a `w:del` run whose text stays in the
+paragraph — every jade offset counts deleted text. Deleting text that is
+already deleted keeps its first author. Three things jade got wrong, all
+fixed on jade-core's `feat/collab-tracked-changes` (below): deleting
+inserted text *replaced* the insertion by the deletion, so rejecting all
+changes kept text nobody had accepted (Word nests `<w:ins><w:del>`);
+text typed with tracking off at the end of an insertion joined it; and a
+revision could be accepted or rejected only as whole runs. jade also does
+not remove one's own insertion on deletion, as Word does — the intent API
+does that instead (below).
+
+Before this, a file's revisions loaded as plain text: deleted text was
+ordinary visible characters and nothing was locked, so editing such a file
+silently disagreed with what Word shows.
+
+**Revisions are attributes of atoms, never tombstones.** A tracked deletion
+must stay visible (and rejectable), and a tracked insertion must be
+removable as a unit, so the model keeps beside each story's RGA:
+
+* `inserted: atom → revision` — set when the atom is created by a tracked
+  insertion (or loaded from a `w:ins` run); cleared when the insertion is
+  accepted.
+* `deleted: atom → set of revisions` — every tracked deletion that named
+  the atom. A **grow-only set** under the convergent lane; only a sequenced
+  rejection removes a member.
+* `revisions: id → {kind, author, date, replica, file w:id, moved}` — one
+  entry per tracked operation (its first atom id, or a fresh id for a
+  deletion), or per (kind, `w:id`, author, date) loaded from the file.
+
+A character is *in jade's text* while it is not tombstoned; it *shows as
+deleted* while its set is non-empty, attributed to the set's **least**
+revision id. Two concurrent tracked deletions of the same character are
+both kept, so rejecting one leaves the other in force; which one Word shows
+is a pure function of the set (jade applies them in log order and keeps the
+first, so the materializer re-attributes when the log order and the id
+order disagree — below).
+
+| Operation | Lane | Effect on the atoms |
+| --- | --- | --- |
+| `TrackInsertText {story, parent, first, text, date}` | convergent | new atoms, `inserted = first` |
+| `TrackDeleteText {story, ids, revision, date}` | convergent | `deleted[a] ∪= {revision}` for each named character (also for tombstoned ones, so it commutes with removals) |
+| `InsertText` / `DeleteText` | convergent | as before: plain atoms; a tombstone (removing tracked text outright) |
+| `AcceptRevisions {revisions}` | sequenced | insertion: `inserted` cleared; deletion: its atoms tombstoned |
+| `RejectRevisions {revisions}` | sequenced | insertion: its atoms tombstoned; deletion: removed from every set |
+| `SetTracking {on}` | sequenced | the document's mode (Word's *Track Changes* button) |
+| `SetAuthor {replica, name}` | sequenced, server only | who `replica` is |
+
+**Convergence.** The state is (tombstones, `inserted`, `deleted`): set
+union, map insertion of fresh keys, and removals keyed by a revision id.
+Every convergent operation commutes with every other operation — the
+client fast path's condition (§2) — provided a decision names a revision
+other than the one a concurrent tracked deletion creates, which always
+holds (a revision is decided only after its author's operation committed).
+`lean/JadeCollab/Revision.lean` proves it: `trackDelete_comm_*` for every
+pair, `converges` for any order of convergent operations, and that the
+attributed revision (the set's minimum) is the same everywhere. Decisions
+name **whole revisions by id**, never ranges: a range resolved in log order
+would take in a revision inserted concurrently inside it on one replica and
+not on another, and the per-step `view == rebuilt view` check would catch
+it. The intent API turns "accept the changes in paragraphs 3–5" or "reject
+all" into the ids the author's view shows; a revision made concurrently is
+left for the next decision, as in Word when someone else's change arrives
+after you clicked.
+
+A concurrent tracked deletion and an insertion inside the deleted range:
+the new atoms sit between deleted ones (RGA), keep their own `inserted`
+revision (or none), and are not deleted — the deletion named only the
+characters its author saw. jade gets the same: an insertion inside a
+`w:del` run splits it.
+
+**Authors.** A tracked operation carries a date but no author: a client
+could claim any name, and a convergent operation cannot be rejected after
+the fact. The author is the operation's origin replica, resolved through
+`authors` when the operation is applied and stored in the revision. Only
+the server writes `authors`: when a replica joins or resumes over a socket
+whose token has a name — a person, or an agent's MCP token — the server
+commits `SetAuthor` as an origin operation right after the join. Every
+replica applies a replica's operations after the `SetAuthor`s committed
+before them (the server commits them before reading anything that replica
+sends, and a replica rebuilds its view when one arrives), so the snapshot is
+the same everywhere. A replica with no name (no tokens) authors anonymously
+(jade writes no `w:author`). "Own" — for Word's rule that deleting your own
+insertion removes it — means the same author name, or the same replica when
+there is no name.
+
+**What each edit becomes with tracking on** (the intent API reads the
+mode from the view; the operations never depend on it, so a concurrent
+`SetTracking` cannot change what an edit already sent means):
+
+* typing → `TrackInsertText`;
+* deleting → characters already shown as deleted are skipped (Word keeps
+  their first author); characters of one's own *still tracked* insertion
+  go in a plain `DeleteText`; the rest in one `TrackDeleteText`;
+* paragraph splits and joins, tables, formatting and comments stay
+  untracked (jade's paragraph-mark revisions cannot all be decided yet, and
+  Word's formatting revisions are not modelled).
+
+A file's existing revisions load as these attributes (`w:moveFrom` /
+`w:moveTo` as moved deletions / insertions), are listed, and can be
+accepted and rejected like session-made ones. Paragraph-mark revisions in a
+file are left in jade untouched and not shown.
+
 ### Spreadsheets (`jade-xlsx-collab`)
 
 Sheets have row and column identifier lists (sequenced lane) and cells are
@@ -441,6 +550,24 @@ text-box insertions on the current file. `admit` is never consulted for
 convergent operations — they must commit wherever they land; the pptx model
 therefore refuses text and geometry jade would refuse (characters, the
 32-bit EMU range, locks) with jade's own validators, on every replica.
+
+**Tracked changes in jade.** jade's revision session is document-wide, so
+the materializer keeps it off and switches it on, with the operation's
+author and date, around exactly one jade command: the `InsertText` of a
+tracked insertion (the split and join that place text beside an anchor
+stay untracked) or the `ReplaceRange` of a tracked deletion. Removing
+tracked text (accepting a deletion, rejecting an insertion, deleting
+outright) is an untracked `ReplaceRange`; accepting an insertion and
+restoring a deletion are jade's `accept_revisions` / `reject_revisions`
+with *revision targets* — the parts of jade's runs under the model's
+characters, read from jade with their `w:id`s, which needs jade-core's
+targets on part of a run. When the least revision of a character's set
+changes (a tracked deletion with a smaller id arrives later in the log, or
+the least one is rejected while others remain), the model emits a restore
+and a tracked deletion by the new least revision's author, so jade shows
+the author the model does. A test compares, for every character of every
+paragraph, the model's (inserted author/date, deleted author/date) with
+jade's runs after every operation.
 
 Tables are matched to jade's `table_order_index` by identity: the model knows
 the body's table structure (nested tables included), jade's order also counts

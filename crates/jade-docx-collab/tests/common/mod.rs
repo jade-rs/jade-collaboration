@@ -5,12 +5,14 @@ use std::path::PathBuf;
 
 use jade_collab_core::grid::GridOp;
 use jade_collab_core::id::Id;
+use jade_collab_core::id::ReplicaId;
 use jade_collab_sync::{ApplyContext, Document, Lane, Materializer};
-use jade_docx_collab::intent::{resolve, IntentOp};
+use jade_docx_collab::intent::{resolve, resolve_with, Context, IntentOp};
 use jade_docx_collab::{
     Anchor, CommentContent, DocxEffect, DocxModel, DocxOp, FormatChange, JadeDocx,
-    ParagraphAlignment, StoryId,
+    ParagraphAlignment, RevisionKind, StoryId,
 };
+use jade_docx_document_core::document::RevisionKind as JadeRevisionKind;
 use jade_docx_document_core::headless_api::execute_headless_queries_on_document;
 use jade_docx_document_core::word_document::ParagraphAnchorKind;
 use jade_docx_headless_api::{
@@ -131,8 +133,18 @@ fn describe(model: &DocxModel, story: StoryId) -> String {
 /// Applies `op` as the server does — admit (sequenced), apply, materialize —
 /// and checks the model and jade still agree.
 pub fn commit(model: &mut DocxModel, jade: &mut JadeDocx, op: DocxOp) -> Vec<DocxEffect> {
+    commit_as(model, jade, op, ReplicaId(1))
+}
+
+/// [`commit`] on behalf of `origin`.
+pub fn commit_as(
+    model: &mut DocxModel,
+    jade: &mut JadeDocx,
+    op: DocxOp,
+    origin: ReplicaId,
+) -> Vec<DocxEffect> {
     let ctx = ApplyContext {
-        origin: jade_collab_core::id::ReplicaId(1),
+        origin,
         base_seq: 0,
         seq: Some(1),
     };
@@ -147,13 +159,241 @@ pub fn commit(model: &mut DocxModel, jade: &mut JadeDocx, op: DocxOp) -> Vec<Doc
         .unwrap_or_else(|e| panic!("{op:?}: {e}"));
     assert_stories_agree(model, jade, &format!("after {op:?}"));
     assert_comments_agree(model, jade, &format!("after {op:?}"));
+    assert_revisions_agree(model, jade, &format!("after {op:?}"));
     effect
+}
+
+/// A tracked change as Word shows it on one character: who made it and when.
+pub type Mark = Option<(Option<String>, Option<String>)>;
+
+/// (inserted, deleted) for every character of every paragraph, as the
+/// model shows them.
+pub fn model_marks(model: &DocxModel) -> Vec<Vec<(Mark, Mark)>> {
+    let mark = |id: Option<Id>| {
+        id.map(|id| {
+            let revision = model.revision(id).expect("a shown revision exists");
+            (revision.author.clone(), revision.date.clone())
+        })
+    };
+    model
+        .paragraphs()
+        .iter()
+        .map(|p| {
+            assert_eq!(p.tracked.len(), p.chars.len(), "one mark per character");
+            p.tracked
+                .iter()
+                .map(|t| (mark(t.inserted), mark(t.deleted)))
+                .collect()
+        })
+        .collect()
+}
+
+/// The same, read from jade's runs (a deletion inside an insertion carries
+/// both).
+pub fn jade_marks(model: &DocxModel, jade: &JadeDocx) -> Vec<Vec<(Mark, Mark)>> {
+    model
+        .paragraphs()
+        .iter()
+        .map(|p| {
+            let runs = &jade
+                .word()
+                .paragraph(surface(jade, p))
+                .expect("surface exists")
+                .runs;
+            let mut out = Vec::new();
+            for run in runs {
+                let of = |m: &jade_docx_document_core::document::RevisionMark| {
+                    Some((m.author.clone(), m.date.clone()))
+                };
+                let (inserted, deleted) = match &run.revision {
+                    None => (None, None),
+                    Some(m) => match m.kind {
+                        JadeRevisionKind::Inserted | JadeRevisionKind::MovedTo => (of(m), None),
+                        JadeRevisionKind::Deleted | JadeRevisionKind::MovedFrom => {
+                            (m.insertion.as_deref().and_then(of), of(m))
+                        }
+                    },
+                };
+                out.extend(
+                    run.text
+                        .chars()
+                        .map(|_| (inserted.clone(), deleted.clone())),
+                );
+            }
+            out
+        })
+        .collect()
+}
+
+/// Every character shows the same tracked insertion and deletion (author
+/// and date) in the model and in jade.
+pub fn assert_revisions_agree(model: &DocxModel, jade: &JadeDocx, context: &str) {
+    let ours = model_marks(model);
+    let theirs = jade_marks(model, jade);
+    for (p, (a, b)) in ours.iter().zip(&theirs).enumerate() {
+        assert_eq!(
+            a,
+            b,
+            "tracked changes of paragraph {p} ({:?}) {context}",
+            model.paragraphs()[p].text
+        );
+    }
+}
+
+/// Who is editing and when, for a generated edit.
+pub fn context(replica: ReplicaId, choice: u64) -> Context {
+    let dates = [
+        Some("2026-10-18T09:00:00Z"),
+        Some("2026-10-18T10:30:00Z"),
+        None,
+    ];
+    Context {
+        replica: Some(replica),
+        date: dates[((choice >> 50) % 3) as usize].map(str::to_string),
+    }
+}
+
+/// [`generate`], with tracked changes: the mode switched, tracked typing and
+/// deleting (as the intent API makes them with tracking on, for `ctx`),
+/// tracked deletions of arbitrary characters (already deleted ones and one's
+/// own insertions included), and accepting and rejecting revisions.
+pub fn generate_as(
+    view: &DocxModel,
+    choice: u64,
+    ctx: &Context,
+    ids: &mut dyn FnMut(u64) -> Id,
+) -> Option<DocxOp> {
+    let kind = choice % 40;
+    if kind < 30 {
+        return generate_plain(view, choice, ids);
+    }
+    let pick = |n: usize, salt: u32| ((choice >> salt) as usize) % n.max(1);
+    let tracking = || {
+        let mut v = view.clone();
+        let local = ApplyContext {
+            origin: ctx.replica.unwrap_or(ReplicaId(1)),
+            base_seq: 0,
+            seq: None,
+        };
+        v.apply(&DocxOp::SetTracking { on: true }, &local)
+            .expect("tracking can always be switched");
+        v
+    };
+    let paragraphs = view.paragraphs();
+    let boundaries =
+        |t: &str| -> Vec<usize> { t.char_indices().map(|(i, _)| i).chain([t.len()]).collect() };
+    match kind {
+        30 => Some(DocxOp::SetTracking {
+            on: pick(3, 8) != 0,
+        }),
+        31..=33 => {
+            let p = pick(paragraphs.len(), 8);
+            let b = boundaries(&paragraphs[p].text);
+            let op = IntentOp::InsertText {
+                paragraph: p,
+                offset: b[pick(b.len(), 16)],
+                text: ["x", "日本", "Lorem ", "é"][pick(4, 24)].to_string(),
+            };
+            resolve_with(&tracking(), &op, ctx, ids)
+                .ok()?
+                .into_iter()
+                .next()
+        }
+        34 | 35 => {
+            let p = pick(paragraphs.len(), 8);
+            let b = boundaries(&paragraphs[p].text);
+            let op = if kind == 34 {
+                IntentOp::DeleteText {
+                    paragraph: p,
+                    offset: b[pick(b.len(), 16)],
+                    direction: if pick(2, 28) == 0 {
+                        jade_docx_headless_api::HeadlessDeleteDirection::Forward
+                    } else {
+                        jade_docx_headless_api::HeadlessDeleteDirection::Backward
+                    },
+                    count: 1 + pick(5, 24),
+                }
+            } else {
+                let (so, eo) = (b[pick(b.len(), 16)], b[pick(b.len(), 24)]);
+                IntentOp::ReplaceRange {
+                    start_paragraph: p,
+                    start_offset: so.min(eo),
+                    end_paragraph: p,
+                    end_offset: so.max(eo),
+                    text: ["", "y", "置換"][pick(3, 32)].to_string(),
+                }
+            };
+            let ops = resolve_with(&tracking(), &op, ctx, ids).ok()?;
+            ops.get(pick(ops.len(), 40)).cloned()
+        }
+        36 => {
+            let p = pick(paragraphs.len(), 8);
+            let chars = &paragraphs[p].chars;
+            if chars.is_empty() {
+                return None;
+            }
+            let start = pick(chars.len(), 16);
+            let ids_to_delete: Vec<Id> = chars[start..]
+                .iter()
+                .take(1 + pick(4, 24))
+                .copied()
+                .collect();
+            Some(DocxOp::TrackDeleteText {
+                story: paragraphs[p].story,
+                ids: ids_to_delete,
+                revision: ids(1),
+                date: ctx.date.clone(),
+            })
+        }
+        37..=39 => {
+            let revisions = view.revisions();
+            if revisions.is_empty() {
+                return None;
+            }
+            let chosen: Vec<Id> = if kind == 39 {
+                revisions.iter().map(|r| r.id).collect()
+            } else {
+                revisions
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| (choice >> (8 + (i % 40))) & 1 == 1)
+                    .map(|(_, r)| r.id)
+                    .collect()
+            };
+            let chosen = if chosen.is_empty() {
+                vec![revisions[pick(revisions.len(), 12)].id]
+            } else {
+                chosen
+            };
+            Some(if (kind == 37) ^ (kind == 39 && pick(2, 30) == 0) {
+                DocxOp::AcceptRevisions { revisions: chosen }
+            } else {
+                DocxOp::RejectRevisions { revisions: chosen }
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The kinds of the model's live revisions, for assertions.
+pub fn revision_kinds(model: &DocxModel) -> Vec<RevisionKind> {
+    model.revisions().iter().map(|r| r.revision.kind).collect()
 }
 
 /// Turns a random `choice` into an operation on `view`. `ids(n)` reserves `n`
 /// consecutive identifiers. Returns `None` when the choice does not fit the
-/// document (e.g. no tables to edit).
+/// document (e.g. no tables to edit). Includes tracked changes, made by an
+/// unnamed replica.
 pub fn generate(view: &DocxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -> Option<DocxOp> {
+    generate_as(view, choice, &Context::default(), ids)
+}
+
+/// [`generate`] without tracked changes.
+pub fn generate_plain(
+    view: &DocxModel,
+    choice: u64,
+    ids: &mut dyn FnMut(u64) -> Id,
+) -> Option<DocxOp> {
     let paragraphs = view.paragraphs();
     let pick = |n: usize, salt: u32| ((choice >> salt) as usize) % n.max(1);
     let words = ["x", "日本", "é", "Lorem ", "  ", "ab"];

@@ -6,10 +6,12 @@
 mod common;
 
 use common::{
-    assert_comments_agree, assert_same_order, assert_stories_agree, generate, jade_comments, open,
+    assert_comments_agree, assert_revisions_agree, assert_same_order, assert_stories_agree,
+    context, generate_as, jade_comments, model_marks, open,
 };
+use jade_collab_core::id::ReplicaId;
 use jade_collab_sync::sim::Simulation;
-use jade_docx_collab::{DocxModel, JadeDocx};
+use jade_docx_collab::{DocxModel, DocxOp, JadeDocx};
 use proptest::prelude::*;
 
 #[derive(Clone, Debug)]
@@ -43,16 +45,27 @@ proptest! {
             "footnote.docx",
             "textbox.docx",
             "floating-wrap-sides.docx",
+            "review.docx",
+            "review-kinds.docx",
         ]),
         steps in steps(),
     ) {
         let (model, jade) = open(fixture);
         let mut sim = Simulation::with_materializer(model, jade, 3);
+        // The server names the first two replicas (as it does for a token
+        // with a name); the third edits anonymously.
+        for (client, name) in [(0, "Ann"), (1, "Bob")] {
+            let replica = sim.client(client).id();
+            sim.commit_origin(DocxOp::SetAuthor { replica, name: name.into() })
+                .expect("the server names a replica");
+        }
         for step in &steps {
             match *step {
                 Step::Local { client, choice } => {
                     let view = sim.client(client).view().clone();
-                    let op = generate(&view, choice, &mut |n| sim.client_mut(client).reserve(n));
+                    let me: ReplicaId = sim.client(client).id();
+                    let ctx = context(me, choice);
+                    let op = generate_as(&view, choice, &ctx, &mut |n| sim.client_mut(client).reserve(n));
                     if let Some(op) = op {
                         let _ = sim.local(client, op);
                     }
@@ -76,10 +89,12 @@ proptest! {
         }
         assert_stories_agree(server.document(), server.materializer(), "after the session");
         assert_comments_agree(server.document(), server.materializer(), "after the session");
+        assert_revisions_agree(server.document(), server.materializer(), "after the session");
         let reloaded = JadeDocx::load(&server.materializer().export().unwrap()).unwrap();
         assert_same_order(server.document(), &reloaded, "against the reloaded file");
         let reloaded_model = DocxModel::from_word_document(reloaded.word()).unwrap();
         assert_same_order(&reloaded_model, &reloaded, "after reloading");
+        prop_assert_eq!(model_marks(&reloaded_model), model_marks(server.document()));
         prop_assert_eq!(jade_comments(&reloaded).len(), server.document().comments().len());
     }
 }

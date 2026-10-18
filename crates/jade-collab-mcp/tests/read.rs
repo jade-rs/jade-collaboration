@@ -49,3 +49,38 @@ fn read_document_names_note_and_text_box_paragraphs() {
     assert_eq!(paragraphs[6]["text"], json!("Cell C"));
     assert!(paragraphs[6].get("anchors").is_none());
 }
+
+/// Tracked changes: the document's mode and every live revision, and on
+/// each paragraph the byte spans each revision covers.
+#[test]
+fn read_document_shows_tracked_insertions_and_deletions() {
+    let jade = JadeDocx::load(&fixture("public/fixtures/review.docx")).unwrap();
+    let model = DocxModel::from_word_document(jade.word()).unwrap();
+    let read = read_docx(&model, 0, 100);
+    assert_eq!(read["tracking"], json!(false));
+    let revisions = read["revisions"].as_array().unwrap();
+    assert_eq!(revisions.len(), 2);
+    let insertion = &revisions[0];
+    assert_eq!(insertion["kind"], json!("insertion"));
+    assert_eq!(insertion["author"], json!("植木 智之"));
+    assert_eq!(insertion["date"], json!("2025-11-12T19:17:00Z"));
+    assert_eq!(insertion["file_id"], json!("0"));
+    assert_eq!(insertion["text"], json!("Hello "));
+    assert_eq!(insertion["paragraphs"], json!([0]));
+    let id = insertion["id"].as_str().unwrap().to_string();
+    assert!(id.contains("@r0"), "{id}");
+    assert_eq!(revisions[1]["kind"], json!("deletion"));
+    assert_eq!(revisions[1]["text"], json!("World"));
+    let deletion = revisions[1]["id"].as_str().unwrap().to_string();
+    // On the paragraph: which bytes each revision covers.
+    let paragraph = &read["paragraphs"][0];
+    assert_eq!(paragraph["text"], json!("Hello World"));
+    assert_eq!(
+        paragraph["revisions"],
+        json!([
+            { "kind": "insertion", "revision": id, "start": 0, "end": 6 },
+            { "kind": "deletion", "revision": deletion, "start": 6, "end": 11 },
+        ])
+    );
+    assert!(read["paragraphs"][1].get("revisions").is_none());
+}

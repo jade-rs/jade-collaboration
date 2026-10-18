@@ -269,7 +269,10 @@ async fn advertised_edits_match_the_intent_apis() {
             "resolve_comment",
             "delete_comment",
             "merge_table_cells",
-            "unmerge_table_cells"
+            "unmerge_table_cells",
+            "set_tracking",
+            "accept_revisions",
+            "reject_revisions"
         ]
     );
     assert_eq!(
