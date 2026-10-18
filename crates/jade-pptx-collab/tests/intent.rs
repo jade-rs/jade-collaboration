@@ -324,10 +324,51 @@ fn intents_have_a_stable_wire_format() {
         r#"{"type":"delete_shape","slide":1,"shape":2}"#,
         r#"{"type":"insert_paragraph_break","slide":1,"target":{"shape":2},"paragraph":0,"offset":0}"#,
         r#"{"type":"replace_range","slide":1,"target":"notes","start_paragraph":0,"start_offset":0,"end_paragraph":0,"end_offset":0,"text":""}"#,
+        r#"{"type":"set_slide_hidden","slide":2,"hidden":true}"#,
     ] {
         let intent: PptxIntent =
             serde_json::from_str(json).unwrap_or_else(|e| panic!("{json}: {e}"));
         let back = serde_json::to_string(&intent).unwrap();
         assert_eq!(serde_json::from_str::<PptxIntent>(&back).unwrap(), intent);
     }
+}
+
+#[test]
+fn slides_are_hidden_and_shown_by_number() {
+    let mut model = PptxModel::from_texts(&[&["a"], &["b"]]);
+    let ops = run(
+        &mut model,
+        PptxIntent::SetSlideHidden {
+            slide: 2,
+            hidden: true,
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        ops.as_slice(),
+        [PptxOp::SetSlideHidden { hidden: true, .. }]
+    ));
+    assert_eq!(
+        model.slides().iter().map(|s| s.hidden).collect::<Vec<_>>(),
+        [false, true]
+    );
+    run(
+        &mut model,
+        PptxIntent::SetSlideHidden {
+            slide: 2,
+            hidden: false,
+        },
+    )
+    .unwrap();
+    assert!(!model.slides()[1].hidden, "a later write wins");
+    assert_eq!(
+        run(
+            &mut model,
+            PptxIntent::SetSlideHidden {
+                slide: 3,
+                hidden: true
+            }
+        ),
+        Err(IntentError::NoSuchSlide(3))
+    );
 }

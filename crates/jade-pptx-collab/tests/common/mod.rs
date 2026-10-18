@@ -72,6 +72,11 @@ pub fn assert_agree_with(model: &PptxModel, ids: &JadePptx, file: &JadePptx, con
             file.notes_text(index),
             "notes of slide {index} {context}"
         );
+        assert_eq!(
+            slide.hidden,
+            file.hidden(index),
+            "visibility of slide {index} {context}"
+        );
     }
 }
 
@@ -118,7 +123,7 @@ pub fn generate(view: &PptxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
     let slide = &slides[slide_index];
     let stories = stories(view);
     let words = ["x", "日本", "é", "Lorem ", "😀", "a\tb", "ab"];
-    match choice % 17 {
+    match choice % 18 {
         // Typing at a random caret, through the index-addressed intent API.
         0..=4 => {
             let (number, target, story) = stories[pick(stories.len(), 8)];
@@ -237,6 +242,11 @@ pub fn generate(view: &PptxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
                 height: 1 + (pick(100, 38) as i64) * 10_000,
                 rotation: 0,
             },
+        }),
+        17 => Some(PptxOp::SetSlideHidden {
+            slide: slide.id,
+            stamp: ids(1),
+            hidden: pick(2, 14) == 0,
         }),
         _ => {
             let deletable: Vec<_> = slide.shapes.iter().filter(|s| s.deletable).collect();

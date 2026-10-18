@@ -409,3 +409,54 @@ fn a_restored_materializer_finds_text_boxes_whose_ids_jade_reused() {
     restored.materialize(&model, effect, &ctx).unwrap();
     assert_agree(&model, &restored, "after editing the restored text box");
 }
+
+/// A deck whose second slide is hidden (`show="0"`), as PowerPoint writes it.
+fn deck_with_hidden_slide() -> Vec<u8> {
+    let bytes = common::fixture("sample-deck.pptx");
+    let mut package = jade_opc::OpcPackage::open_preserving(&bytes).unwrap();
+    let part = "ppt/slides/slide2.xml";
+    let xml = package.required_part_str(part).unwrap();
+    package.replace(part, xml.replacen("<p:sld ", "<p:sld show=\"0\" ", 1).into_bytes());
+    package.write().unwrap()
+}
+
+/// Hidden slides are read from the file, and showing, hiding, duplicating
+/// and inserting next to them are realised by jade as the model says.
+#[test]
+fn hidden_slides_are_loaded_and_realised() {
+    let bytes = deck_with_hidden_slide();
+    let jade = JadePptx::open(&bytes).unwrap();
+    let model = PptxModel::from_pptx(&bytes).unwrap();
+    assert_eq!(
+        model.slides().iter().map(|s| s.hidden).collect::<Vec<_>>(),
+        [false, true, false]
+    );
+    assert_agree(&model, &jade, "on load");
+    let mut s = Session {
+        model,
+        jade,
+        seq: 0,
+        next: 1_000_000,
+    };
+    // A slide inserted in front of the hidden one, and a copy of it.
+    s.intent(PptxIntent::InsertSlide { at: 2 });
+    s.intent(PptxIntent::DuplicateSlide { slide: 3 });
+    assert_eq!(
+        s.model.slides().iter().map(|s| s.hidden).collect::<Vec<_>>(),
+        [false, false, true, true, false]
+    );
+    s.intent(PptxIntent::SetSlideHidden {
+        slide: 3,
+        hidden: false,
+    });
+    s.intent(PptxIntent::SetSlideHidden {
+        slide: 1,
+        hidden: true,
+    });
+    assert_eq!(
+        s.model.slides().iter().map(|s| s.hidden).collect::<Vec<_>>(),
+        [true, false, false, true, false]
+    );
+    let reopened = JadePptx::open(&s.jade.export().unwrap()).unwrap();
+    assert_agree_with(&s.model, &s.jade, &reopened, "after export");
+}
