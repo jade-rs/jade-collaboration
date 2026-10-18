@@ -381,6 +381,22 @@ Tests are written first. Three layers:
    union of two valid merges breaks the table invariant, and soundness of the
    client fast path (convergent operations commute ⇒ applying a remote
    convergent operation to the optimistic view equals rebuilding it).
+   For tables (`Grid.lean`, `CellCommute.lean`, `Anchor.lean`): a model of
+   `jade_collab_core::grid::Grid` that behaves exactly like the Rust code
+   (same accept/reject decisions, same resulting state) with
+   `apply_preserves_valid` — every accepted row/column/merge operation keeps
+   the table valid — and `check_iff_valid` for the executable checker; cell
+   edits commute with every grid operation; a live table's anchor mark always
+   exists and is visible, and convergent text operations never change
+   whether a join or table operation is accepted. The proofs also sharpened
+   the design: a cell edit commutes with grid operations *only when it is
+   valid on the state it is applied to* (an edit to a row another replica is
+   still creating is not), so the unconditional hypothesis of
+   `fast_path_sound` does not hold for it — which is why a replica rebuilds
+   its view whenever a remote convergent operation does not apply directly.
+   The Lean model is also an executable oracle (`lake build grid-oracle`); a
+   property test feeds it and the Rust grid the same random operations and
+   compares every decision and the final state (CI job `lean-oracle`).
 2. **Property-based tests** (`proptest`) — the implementation against the
    specification (RGA differential test), convergence of random concurrent
    histories across N replicas under random message scheduling, grid
