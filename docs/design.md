@@ -37,7 +37,8 @@ index, and is classified into one of two lanes:
 * **Convergent lane** — invariant-confluent operations. They commute with every
   other operation, so a replica applies them immediately and never rolls them
   back. Text insert/delete inside a paragraph (an RGA sequence CRDT), paragraph
-  split, and cell values (last-writer-wins registers).
+  split, character formatting (Peritext-style marks over the RGA) and cell
+  values (last-writer-wins registers).
 * **Sequenced lane** — operations that need coordination. A replica applies them
   tentatively; the central **sequencer** validates them against the
   authoritative state in arrival order and either commits or rejects them.
@@ -231,25 +232,90 @@ added a paragraph — and is fixed in jade-rs/jade-core#12.
 
 ### Formatting and comments (`jade-docx-collab`)
 
-Formatting travels the sequenced lane as `Format { story, start, end,
-change }`: `start` and `end` are atom ids (characters, or a paragraph mark to
-reach an empty paragraph) of one story, inclusive, and `change` is one
-`FormatChange` — bold, italic, underline, strike, font size (half points),
-font family, font color, highlight, clear formatting, paragraph alignment and
-paragraph style. The range is resolved **when the operation is applied, in
-log order**: the visible atoms between the two ids in the story's RGA order.
-Characters deleted before it commits shrink it, characters inserted inside
-it before it commits are covered, and a range with nothing visible left does
-nothing. A character change becomes one jade command per paragraph slice; a
-paragraph change one per paragraph holding a visible atom of the range.
+**Character formatting is convergent: marks (`jade-collab-core::marks`).**
+Bold, italic, underline, strike, font size, font family, font colour and
+highlight — simple run properties whose new value replaces the old one —
+travel as `Mark { story, id, start, end, change }`, a Peritext mark (Litt,
+Lim, Kleppmann, van Hardenberg 2022). `start` and `end` are *boundaries*: a
+side of an atom of the story's RGA (`before` / `after` a character, a
+paragraph mark or an anchor) or an end of the story. RGA atoms are never
+removed — deleted text is a tombstone — and inserts never reorder the atoms
+that are there, so a mark's anchors never vanish and never move. An atom is
+covered when it lies strictly between the boundaries in the story's order,
+tombstones included, and for each attribute it shows the covering mark with
+the greatest id (last-writer-wins per attribute and character). The state
+is the *set* of marks, so marks commute with each other and with every text
+edit: a replica applies a remote mark straight onto its view, and replicas
+converge on every character's formatting whatever order the operations
+travel in (Lean: `Marks.format_converges`).
 
-The model **does not store formatting**: it only validates the value (values
-jade would write verbatim but Word cannot read, such as a hex highlight, are
-refused) and reports where jade must format. jade does the formatting, so
-Word's own rules — text typed next to bold text is bold, clearing keeps the
-highlight, a paragraph style re-cascades run properties — are jade's, never
-re-implemented. The convergent lane stays formatting-free; a Peritext-style
-mark CRDT would be needed to format optimistically without the sequencer.
+*Expand rules* are in the anchors, chosen by the intent API when the mark is
+made: a mark over the characters `first … last` starts `before first`
+(typing in front of formatted text is not covered) and, for every one of
+these attributes, ends `before` the atom that followed `last` in the
+story's order — or at the story's end — so text typed at the end of
+formatted text takes its formatting, as in Word. A link-like attribute would
+end `after last` instead (`Expand::None` in the core; no docx attribute
+uses it yet). Lean proves the consequences for any concurrent insert: inside
+the range covered, right after the last character covered exactly when the
+attribute expands, right before the first never (`typed_inside`,
+`typed_after_end`, `typed_before_start`), and inserting never changes the
+formatting of existing text (`effective_preserved`). The model refuses a
+mark whose anchors it does not have, that covers nothing, that reuses an id
+or carries an invalid value — all decided the same way on every replica.
+
+**Loaded formatting: jade is the base, marks are overrides.** The model
+stores only the marks made in the session. A character no mark of an
+attribute covers keeps what jade has for it: the file's formatting, jade's
+typing rules for text typed in the session, and the sequenced formatting
+below. The server's jade document holds exactly that *base* — every text
+and structural edit and every sequenced format, in log order, but no marks.
+The marks are realised when the file is written (`JadeDocx::formatted`,
+`JadeDocx::export(model)`): a copy of the base gets each maximal run of
+characters a mark sets (`DocxModel::formatting`) as an explicit value. jade's
+typing rule therefore only ever sees base formatting, never a mark's run:
+text typed right before bold text at a paragraph's start — where jade alone
+would copy the bold run — stays as its surroundings are, and text typed at
+the end of a bold mark is bold because the mark covers it, not because jade
+guessed. A test checks after every random edit, in concurrent sessions and
+after export that the written file shows every character's mark values and,
+for every attribute no mark sets, jade's own value. A checkpoint stores the
+base file next to the model (which holds the marks); downloads get the
+formatted file. Where no mark sets an attribute the model promises only
+"jade's base": for text typed in the session that is jade's typing rule
+applied in log order on the server (the neighbour's base formatting), which
+replicas without jade do not predict — as before marks existed. Making it
+fully determined would take loading the file's run formatting as origin
+marks, and jade-core commands that remove one direct property (a mark
+falling back to the style's value); not done.
+
+**Sequenced formatting stays for what is not a simple attribute.**
+`Format { story, start, end, change }` — paragraph alignment, paragraph
+style and clearing (and, for older clients, any character change, which
+then edits the base) — is resolved **when it is applied, in log order**:
+`start` and `end` are atom ids (characters, or a paragraph mark to reach an
+empty paragraph) of one story, inclusive, and the range is the visible
+atoms between them. Characters deleted before it commits shrink it,
+characters inserted inside it before it commits are covered, and a range
+with nothing visible left does nothing. A character change becomes one jade
+command per paragraph slice; a paragraph change one per paragraph holding a
+visible atom of the range. The model does not store this formatting: it
+validates the value (values jade would write verbatim but Word cannot read,
+such as a hex highlight, are refused on every lane) and reports where jade
+must format, and jade applies Word's own rules — a paragraph style
+re-cascades run properties, which explicit mark values then override, like
+direct formatting in Word.
+
+**Clearing** is both. The intent API turns a clear into a convergent
+`Mark { change: ClearFormatting }`, which *unsets* every attribute but the
+highlight on its range (Word's Ctrl+Space keeps the highlight) — a mark
+whose value is "back to the base", expanding like the attributes it unsets
+— plus a sequenced `Format { ClearFormatting }`, which clears the file's
+direct formatting in jade at its log position. The unset mark takes part in
+last-writer-wins like any other: marks older than the clear lose to it on
+its range, a newer mark wins over it, and a concurrent one is ordered by
+id, the same everywhere. The sequenced half needs no id and cannot conflict
+with marks: it only changes the base.
 
 Comments are sequenced too. `AddComment` anchors to the visible characters of
 an id range (refused when none are left); `ReplyToComment`, `ResolveComment`
@@ -261,9 +327,11 @@ comments made in the session itself, reusing freed numbers, so the
 materializer records the number each new comment got instead of predicting
 it.
 
-`admit` preflights formatting and comment operations on a clone of the jade
-document and refuses what jade cannot do — for instance a reply whose root's
-text was deleted (jade re-anchors replies on the root's text).
+`admit` preflights sequenced formatting and comment operations on a clone of
+the jade document and refuses what jade cannot do — for instance a reply
+whose root's text was deleted (jade re-anchors replies on the root's text).
+Marks are never preflighted: they must commit wherever they land, and the
+model refuses everything jade could not write (invalid values) itself.
 
 ### Spreadsheets (`jade-xlsx-collab`)
 
@@ -415,6 +483,11 @@ read again. For pptx, effects name slides by position and
 text by paragraph and byte offset; the materializer turns those into jade's
 UTF-16 ranges on jade's own text.
 
+A docx mark has no effect on jade's document: the server's jade holds the
+base formatting and the marks are realised on a copy whenever the file is
+written (§4, "Loaded formatting"), so jade's own typing rules never act on
+a mark's formatting.
+
 Clients do not need jade: an AI agent, a CLI or a test works on the model. A
 jade editor client additionally applies the same effects to its local
 `WordDocument`.
@@ -456,12 +529,18 @@ jade's parsed body.
   structure log records the log position), so the tentative result is
   replaced by the authoritative one. A convergent operation must therefore
   never depend on its log position.
+* A mark's boundaries are chosen by its author and travel with it. Deriving
+  them where an operation is applied — "before the atom after the range"
+  computed from a sequenced clear's ids — would put a concurrent insert on
+  one side of the boundary on a replica that applied the insert straight
+  onto its view and on the other side in the rebuilt view; so a clear's
+  unset half is a convergent mark of its own.
 
 ## 6. Components
 
 | Crate | Role |
 | --- | --- |
-| `jade-collab-core` | identifiers, Lamport clock, RGA (+ executable spec), LWW register, table grid |
+| `jade-collab-core` | identifiers, Lamport clock, RGA (+ executable spec), marks (Peritext formatting over the RGA, + executable spec), LWW register, table grid |
 | `jade-collab-sync` | `Document` trait, lanes, wire protocol, `Sequencer` (server core, with checkpoints, journal records and replay), `Replica` (client core), deterministic network simulator |
 | `jade-docx-collab` | docx model + operations, loading from a jade `WordDocument`, materialization to `HeadlessCommand`s, index-addressed intent API (migrated from jade-core) |
 | `jade-xlsx-collab` | xlsx model + operations, loading from / materializing into a jade `HeadlessWorkbook` |
@@ -495,9 +574,25 @@ Tests are written first. Three layers:
    The Lean model is also an executable oracle (`lake build grid-oracle`); a
    property test feeds it and the Rust grid the same random operations and
    compares every decision and the final state (CI job `lean-oracle`).
+   For formatting (`Marks.lean`): a character's formatting is a function of
+   the sets of inserts and marks (any order, any duplication; deletions play
+   no part), so rich text converges (`format_converges`,
+   `richRender_converges`); inserted atoms never reformat existing ones
+   (`effective_preserved`); a new atom gets exactly the formatting of the
+   gap it lands in (`effective_in_gap`), and for the marks the intent API
+   makes that means: inside the range covered, right after the end covered
+   iff the attribute expands, right before the start never (`typed_inside`,
+   `typed_after_end`, `typed_before_start`, `typed_at_story_start`). The
+   RGA's own part — that inserts keep the relative order of existing atoms —
+   is a hypothesis there, checked by property tests. `marks-oracle` runs the
+   Lean RGA walk and `effective`; a property test compares it with the Rust
+   `Rga` + `MarkSet` on random concurrent histories (same CI job).
 2. **Property-based tests** (`proptest`) — the implementation against the
-   specification (RGA differential test), convergence of random concurrent
-   histories across N replicas under random message scheduling, grid
+   specification (RGA and mark-sweep differential tests), convergence of
+   random concurrent histories across N replicas under random message
+   scheduling (text and marks peer to peer, and docx formatting through the
+   server, whose written file must show every character's formatting), the
+   expand rules for concurrent typing at a mark's edges, grid
    invariants under random structural operations, docx/xlsx/pptx model ↔
    jade agreement after random edit sequences, a restarted server
    indistinguishable from one that kept running and resuming within its
@@ -628,9 +723,13 @@ Working: the two-lane protocol over WebSockets; docx text, paragraph
 split/join, table insertion/deletion and row/column structure on simple
 tables, text in any table cell; text of footnotes, endnotes and text boxes
 (§4; notes also split and joined), their anchors following splits, joins
-and deletions as jade moves them; docx formatting (character and paragraph)
-and comments (add, reply, resolve, delete; also comments loaded from the
-file) as sequenced operations on id ranges resolved in log order (§4); xlsx
+and deletions as jade moves them; docx character formatting as convergent
+Peritext marks (bold, italic, underline, strike, size, family, colour,
+highlight; expanding at their end; newest wins per attribute; realised on
+the written file over jade's base formatting) and clearing as an unset mark
+plus a sequenced clear of the file's formatting; paragraph formatting and
+comments (add, reply, resolve, delete; also comments loaded from the file)
+as sequenced operations on id ranges resolved in log order (§4); xlsx
 values, formulas (with rebasing), row/column structure, notes, cell
 formatting (per-attribute LWW, A1 ranges), merged cells and sheet
 management (add, rename, delete, move); pptx slide
@@ -650,8 +749,18 @@ connection.
 
 Not yet:
 
-* Optimistic formatting on the convergent lane (a Peritext-style mark CRDT);
-  formatting a story's last paragraph while it is empty (it has no atom to
+* Marks for attributes with structure: links and hyperlink styles
+  (non-expanding marks; the core supports them), character styles, comments
+  as marks (they are sequenced); a mark cannot set the formatting of an
+  empty paragraph's mark (Word's paragraph-mark run properties). A jade
+  editor client would realise marks the way the server's writer does
+  (`JadeDocx::formatted`), not by applying them to its own document.
+  `read_document` (MCP) does not report formatting yet. In Lean the RGA's
+  part of the expand rules — an insert keeps the order of existing atoms
+  and lands right after its parent when its id is the newest — is a
+  hypothesis (`Extends`, `InGap`), checked by a property test rather than
+  proved from `Rga.walk`.
+  Formatting a story's last paragraph while it is empty (it has no atom to
   name it by); editing comment text; comments in notes and headers.
   Headers and footers are not modelled.
 * xlsx borders, whole-row/column formats, conditional formats and threaded
@@ -666,10 +775,13 @@ Not yet:
   connected with which token, and reloading tokens on SIGHUP is Unix-only
   (the file is still polled everywhere).
 * Performance: RGA lookups are linear and paragraph positions are recomputed
-  by walking the model on each operation; formatting and comment operations
-  are preflighted on a copy of the jade document; jade's xlsx editor rereads
-  the workbook on every write. Fine for the first milestone, not for large
-  documents.
+  by walking the model on each operation; sequenced formatting and comment
+  operations are preflighted on a copy of the jade document; marks are
+  realised on a fresh copy of the base document every time the file is
+  written (one jade command per run of one value), and their coverage is
+  recomputed by a sweep over the story (`O((n + m) log m)`) when asked;
+  jade's xlsx editor rereads the workbook on every write. Fine for the first
+  milestone, not for large documents.
 * pptx in the server (the crate is ready: a `PptxModel` and a `JadePptx`
   materializer with `open` / `export`), tables and formatting in slides,
   hidden slides, layouts, pictures and grouping. jade's pptx writer rewrites
