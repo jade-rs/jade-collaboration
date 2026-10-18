@@ -254,11 +254,10 @@ fn where_a_text_box_cannot_go_is_refused() {
         // In a text box or a note.
         text_box(p[10].story, Some(p[10].chars[0]), 100),
         text_box(p[11].story, Some(p[11].chars[0]), 100),
-        // Where an anchor already sits.
-        text_box(StoryId::Body, Some(host.chars[3]), 100),
-        text_box(StoryId::Body, Some(host.anchors[1].id), 100),
-        // No size.
+        // A size jade does not draw.
         text_box(StoryId::Body, Some(host.chars[0]), 0),
+        text_box(StoryId::Body, Some(host.chars[0]), 11),
+        text_box(StoryId::Body, Some(host.chars[0]), 4097),
         // Text jade would not keep.
         DocxOp::InsertTextBox {
             story: StoryId::Body,

@@ -400,6 +400,27 @@ pub fn generate(view: &DocxModel, choice: u64, ids: &mut dyn FnMut(u64) -> Id) -
         }
         // Edits right next to a text box or a note reference.
         25..=29 => around_anchor(view, &paragraphs, choice, ids),
+        // A new footnote or endnote right after a text box or note
+        // reference (the anchor's atom its parent).
+        32 if pick(2, 30) == 0 => {
+            let anchored: Vec<(StoryId, Id)> = paragraphs
+                .iter()
+                .flat_map(|q| q.anchors.iter().map(move |a| (q.story, a.id)))
+                .collect();
+            let &(story, parent) = anchored.get(pick(anchored.len(), 8))?;
+            let id = ids(3);
+            Some(DocxOp::InsertNote {
+                kind: if pick(2, 12) == 0 {
+                    NoteKind::Endnote
+                } else {
+                    NoteKind::Footnote
+                },
+                story,
+                parent: Some(parent),
+                id,
+                text: "n".into(),
+            })
+        }
         // A new footnote or endnote at a random caret, or where a text box
         // or note reference already sits.
         30..=32 => {

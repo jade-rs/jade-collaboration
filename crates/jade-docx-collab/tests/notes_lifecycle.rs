@@ -245,9 +245,6 @@ fn where_a_note_cannot_go_is_refused() {
         // In a text box or in a note: jade inserts notes in body paragraphs.
         note(p[10].story, Some(p[10].chars[0])),
         note(p[11].story, Some(p[11].chars[0])),
-        // Right after a reference at the same offset: jade always puts a new
-        // reference before the ones already there.
-        note(StoryId::Body, Some(host.anchors[0].id)),
         // Text jade would not keep.
         DocxOp::InsertNote {
             kind: NoteKind::Endnote,
@@ -413,31 +410,70 @@ fn note_commands_project_into_intents() {
     );
 }
 
-/// jade puts a new reference before the text boxes and references already
-/// at its offset, and can type only before or after all of them. Text typed
-/// concurrently at the same caret would land between the new reference and
-/// the old ones whenever its id sorts after the new one's — an order jade
-/// cannot write — so a note cannot go where another anchor already sits,
-/// at a paragraph's start included.
+/// A note goes wherever its caret's atom puts it among the anchors at an
+/// offset — jade inserts a new reference before the anchors there, so the
+/// materializer types a placeholder after the anchors that come first,
+/// inserts the note after it and deletes it again. Acceptance therefore
+/// never depends on the text around the caret, which concurrent edits
+/// change: a replica's view stays what rebuilding it gives.
 #[test]
-fn a_note_cannot_share_an_offset_with_another_anchor() {
+fn a_note_goes_among_the_anchors_at_its_offset() {
     let (mut model, mut jade) = open("footnote.docx");
-    // "Hello" ¹, the reference at offset 5.
-    let refused = |model: &DocxModel, intent: IntentOp| {
-        let mut next = model.max_lamport() + 1;
-        let ops = resolve(model, &intent, &mut |n| {
-            let id = Id::new(next, ReplicaId(1));
-            next += n;
-            id
-        })
-        .expect("the intent resolves");
-        let mut trial = model.clone();
-        assert!(
-            ops.iter().any(|op| trial.apply(op, &ctx()).is_err()),
-            "{intent:?} was accepted"
-        );
-    };
-    refused(&model, insert_footnote(0, 5, "x"));
+    // "Hello" ¹: a note at the caret before the reference goes first.
+    edit(&mut model, &mut jade, insert_footnote(0, 5, "a"));
+    let first = model
+        .note_id(model.paragraphs()[1].story)
+        .unwrap()
+        .to_string();
+    assert_eq!(layout(&model, 0), format!("Hello[{first}][1]"));
+    // One placed right after the reference itself (its atom the parent).
+    let reference = model.paragraphs()[0].anchors[1].id;
+    let id = Id::new(model.max_lamport() + 1, ReplicaId(1));
+    commit(
+        &mut model,
+        &mut jade,
+        DocxOp::InsertNote {
+            kind: NoteKind::Endnote,
+            story: StoryId::Body,
+            parent: Some(reference),
+            id,
+            text: "e".into(),
+        },
+    );
+    let last = model.paragraphs().len() - 1;
+    let endnote = model
+        .note_id(model.paragraphs()[last].story)
+        .unwrap()
+        .to_string();
+    assert_eq!(layout(&model, 0), format!("Hello[{first}][1][{endnote}]"));
+    // And a text box between the two references.
+    let between = model.paragraphs()[0].anchors[0].id;
+    let id = Id::new(model.max_lamport() + 1, ReplicaId(1));
+    commit(
+        &mut model,
+        &mut jade,
+        DocxOp::InsertTextBox {
+            story: StoryId::Body,
+            parent: Some(between),
+            id,
+            text: "b".into(),
+            width_px: 100,
+            height_px: 50,
+        },
+    );
+    assert_eq!(
+        layout(&model, 0),
+        format!("Hello[{first}][box][1][{endnote}]")
+    );
+    let (again, _) = reloaded(&jade);
+    assert_eq!(layouts(&again), layouts(&model));
+}
+
+/// At a paragraph's start a new note goes before the anchors there, as jade
+/// puts it.
+#[test]
+fn a_note_at_a_paragraph_start_goes_before_its_anchors() {
+    let (mut model, mut jade) = open("footnote.docx");
     edit(
         &mut model,
         &mut jade,
@@ -448,16 +484,20 @@ fn a_note_cannot_share_an_offset_with_another_anchor() {
         },
     );
     assert_eq!(layout(&model, 1), "[1]");
-    refused(
-        &model,
+    edit(
+        &mut model,
+        &mut jade,
         IntentOp::InsertEndnote {
             paragraph: 1,
             offset: 0,
             text: "e".into(),
         },
     );
-    // Right before the character before the reference is fine.
-    edit(&mut model, &mut jade, insert_footnote(0, 4, "x"));
+    let number = model
+        .note_id(model.paragraphs().last().unwrap().story)
+        .unwrap()
+        .to_string();
+    assert_eq!(layout(&model, 1), format!("[{number}][1]"));
     let (again, _) = reloaded(&jade);
     assert_eq!(layouts(&again), layouts(&model));
 }
@@ -538,56 +578,61 @@ fn text_typed_between_two_anchors_brought_together_is_written() {
     assert_eq!(layouts(&again), layouts(&model));
 }
 
-/// A paragraph that ends with a note reference or a text box cannot be
-/// joined with the next: jade's join starts before the trailing anchor
-/// (its rendered paragraph end) and drops it. The model refuses, on every
-/// replica; found by the agreement property test once an endnote could be
-/// put into an empty paragraph.
+/// A paragraph that ends with a note reference or a text box joins the next
+/// keeping it: jade's ranged join starts at the paragraph's rendered end,
+/// before the trailing anchor, and would drop it, so the materializer joins
+/// such a paragraph from the next one's start instead. (Refusing the join
+/// would make its acceptance depend on whether text after the anchor was
+/// deleted — something concurrent edits change.)
 #[test]
-fn a_paragraph_ending_with_an_anchor_is_not_joined() {
-    let (mut model, mut jade) = open("jade-core/hello.docx");
-    edit(
-        &mut model,
-        &mut jade,
-        IntentOp::InsertParagraphBreak {
-            paragraph: 0,
-            offset: "Hello\u{c}".len(),
-            count: 1,
-        },
-    );
-    edit(
-        &mut model,
-        &mut jade,
-        IntentOp::InsertEndnote {
-            paragraph: 1,
-            offset: 0,
-            text: String::new(),
-        },
-    );
-    let number = model
-        .note_id(model.paragraphs().last().unwrap().story)
-        .unwrap()
-        .to_string();
-    assert_eq!(layout(&model, 1), format!("[{number}]"));
-    let join = DocxOp::JoinParagraph {
-        story: StoryId::Body,
-        mark: model.paragraphs()[1].mark.unwrap(),
-    };
-    let before = model.clone();
-    assert!(model.apply(&join, &ctx()).is_err());
-    assert_eq!(model, before);
-    // Joining the paragraph before it is fine: the reference leads the
-    // joined paragraph.
-    let mark = model.paragraphs()[0].mark.unwrap();
-    commit(
-        &mut model,
-        &mut jade,
-        DocxOp::JoinParagraph {
-            story: StoryId::Body,
-            mark,
-        },
-    );
-    assert_eq!(layout(&model, 0), format!("Hello\u{c}[{number}]"));
-    let (again, _) = reloaded(&jade);
-    assert_eq!(layouts(&again), layouts(&model));
+fn a_paragraph_ending_with_an_anchor_is_joined_keeping_it() {
+    for text in ["", "abc"] {
+        let (mut model, mut jade) = open("jade-core/hello.docx");
+        edit(
+            &mut model,
+            &mut jade,
+            IntentOp::InsertParagraphBreak {
+                paragraph: 0,
+                offset: "Hello\u{c}".len(),
+                count: 1,
+            },
+        );
+        if !text.is_empty() {
+            edit(
+                &mut model,
+                &mut jade,
+                IntentOp::InsertText {
+                    paragraph: 1,
+                    offset: 0,
+                    text: text.into(),
+                },
+            );
+        }
+        edit(
+            &mut model,
+            &mut jade,
+            IntentOp::InsertEndnote {
+                paragraph: 1,
+                offset: text.len(),
+                text: String::new(),
+            },
+        );
+        let number = model
+            .note_id(model.paragraphs().last().unwrap().story)
+            .unwrap()
+            .to_string();
+        assert_eq!(layout(&model, 1), format!("{text}[{number}]"));
+        let mark = model.paragraphs()[1].mark.unwrap();
+        commit(
+            &mut model,
+            &mut jade,
+            DocxOp::JoinParagraph {
+                story: StoryId::Body,
+                mark,
+            },
+        );
+        assert_eq!(layout(&model, 1), format!("{text}[{number}]World"));
+        let (again, _) = reloaded(&jade);
+        assert_eq!(layouts(&again), layouts(&model));
+    }
 }
