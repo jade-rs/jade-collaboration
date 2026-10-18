@@ -20,6 +20,7 @@ use tokio::task::JoinHandle;
 use crate::auth::{
     access, authenticate, forbidden, recheck, Grant, Presented, Role, Tokens, TokensError,
 };
+use crate::limits::{Bucket, PresenceLimits};
 use crate::room::{self, Command, Source};
 use crate::storage::{newest_generation, StorageOptions};
 use crate::wire::{ClientMessage, Format, ServerMessage};
@@ -68,6 +69,7 @@ pub struct Server {
     storage: Option<Arc<Storage>>,
     /// The tokens in force; every connection watches them.
     tokens: Option<Arc<watch::Sender<Arc<Tokens>>>>,
+    presence: PresenceLimits,
 }
 
 /// A name that is a single plain file name, so it can name a directory too.
@@ -108,6 +110,7 @@ impl Server {
                 options,
             })),
             tokens: None,
+            presence: PresenceLimits::default(),
         };
         let entries = std::fs::read_dir(&dir).map_err(|e| storage_error(e.to_string()))?;
         for entry in entries {
@@ -140,6 +143,13 @@ impl Server {
     /// Requires one of `tokens` on every route and socket from now on.
     pub fn with_tokens(mut self, tokens: Tokens) -> Self {
         self.tokens = Some(Arc::new(watch::Sender::new(Arc::new(tokens))));
+        self
+    }
+
+    /// Limits what each connection may share as presence (instead of
+    /// [`PresenceLimits::default`]).
+    pub fn with_presence_limits(mut self, limits: PresenceLimits) -> Self {
+        self.presence = limits;
         self
     }
 
@@ -399,6 +409,7 @@ async fn socket(
         }),
         _ => None,
     };
+    let limits = server.presence;
     match server.commands(&name) {
         Ok(commands) => upgrade.on_upgrade(move |socket| {
             connection(
@@ -409,6 +420,7 @@ async fn socket(
                     role,
                     tokens,
                 },
+                limits,
             )
         }),
         Err(error) => error_response(error),
@@ -456,8 +468,14 @@ impl Access {
     }
 }
 
-/// One socket, doing what `access` allows.
-async fn connection(socket: WebSocket, commands: mpsc::Sender<Command>, mut access: Access) {
+/// One socket, doing what `access` allows and sharing presence within
+/// `limits`.
+async fn connection(
+    socket: WebSocket,
+    commands: mpsc::Sender<Command>,
+    mut access: Access,
+    limits: PresenceLimits,
+) {
     let (mut sink, mut stream) = socket.split();
     let (outbox, mut outgoing) = unbounded_channel::<String>();
     // The last word, if the server closes the socket: said, then closed.
@@ -492,6 +510,8 @@ async fn connection(socket: WebSocket, commands: mpsc::Sender<Command>, mut acce
         let _ = outbox.send(message.to_json());
     };
     let mut replica = None;
+    let opened = std::time::Instant::now();
+    let mut presence_rate = Bucket::new(limits);
     // The tokens may have changed since the request was let in.
     let mut revoked = access.refresh().err();
     while revoked.is_none() {
@@ -566,6 +586,20 @@ async fn connection(socket: WebSocket, commands: mpsc::Sender<Command>, mut acce
             }
             ClientMessage::Presence { state } => match replica {
                 Some(replica) => {
+                    // Over a limit, it is dropped here, before the
+                    // document's thread sees it; only the sender hears of
+                    // it, and operations are not touched.
+                    let admitted = limits.check_size(&state).and_then(|()| {
+                        if presence_rate.allow(opened.elapsed()) {
+                            Ok(())
+                        } else {
+                            Err(limits.rate_message())
+                        }
+                    });
+                    if let Err(reason) = admitted {
+                        say(ServerMessage::PresenceRejected { reason });
+                        continue;
+                    }
                     let command = Command::Presence {
                         replica,
                         name: access.grant.as_ref().map(|grant| grant.name.clone()),

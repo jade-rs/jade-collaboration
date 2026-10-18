@@ -51,6 +51,7 @@ struct Shared<D: Document> {
     replica: Mutex<Replica<D>>,
     events: Mutex<Vec<ReplicaEvent<D::Op>>>,
     presence: Mutex<BTreeMap<ReplicaId, Presence>>,
+    presence_rejections: Mutex<Vec<String>>,
     error: Mutex<Option<ClientError>>,
     changed: Notify,
 }
@@ -216,6 +217,7 @@ where
             replica: Mutex::new(replica),
             events: Mutex::new(events),
             presence: Mutex::new(BTreeMap::new()),
+            presence_rejections: Mutex::new(Vec::new()),
             error: Mutex::new(None),
             changed: Notify::new(),
         });
@@ -267,6 +269,10 @@ where
             }
             ServerMessage::PresenceLeft { replica } => {
                 shared.presence.lock().unwrap().remove(&replica);
+                return Ok(());
+            }
+            ServerMessage::PresenceRejected { reason } => {
+                shared.presence_rejections.lock().unwrap().push(reason);
                 return Ok(());
             }
             ServerMessage::Error { message } => return Err(ClientError::Protocol(message)),
@@ -340,6 +346,12 @@ where
         let message = serde_json::to_string(&ClientMessage::Presence { state })
             .expect("client messages serialize");
         let _ = self.outgoing.send(message);
+    }
+
+    /// Why the server dropped presence updates of this connection (over its
+    /// size or rate limit) since the last call.
+    pub fn take_presence_rejections(&self) -> Vec<String> {
+        std::mem::take(&mut *self.shared.presence_rejections.lock().unwrap())
     }
 
     /// What the other replicas currently share.

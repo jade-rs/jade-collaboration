@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
-use jade_collab_server::{Client, Format, Fsync, Server, StorageOptions, Tokens};
+use jade_collab_server::{Client, Format, Fsync, PresenceLimits, Server, StorageOptions, Tokens};
 use jade_collab_sync::ReplicaEvent;
 use jade_docx_collab::intent::{resolve, IntentOp};
 use jade_docx_collab::DocxModel;
@@ -61,6 +61,18 @@ enum Cli {
         /// only SIGHUP.
         #[arg(long, value_name = "SECONDS", default_value_t = 1, requires = "tokens")]
         tokens_poll: u64,
+        /// The largest presence state a connection may share, in bytes of
+        /// JSON (default 16384).
+        #[arg(long, value_name = "BYTES")]
+        presence_max_bytes: Option<usize>,
+        /// Presence updates a connection may send at once (default 40);
+        /// more are dropped and the sender gets `presence_rejected`.
+        #[arg(long, value_name = "N")]
+        presence_burst: Option<u32>,
+        /// Presence updates per second a connection may keep sending after
+        /// that (default 20).
+        #[arg(long, value_name = "N")]
+        presence_per_second: Option<u32>,
         files: Vec<PathBuf>,
     },
     /// Print a document's current content as JSON.
@@ -290,6 +302,7 @@ struct ServeOptions {
     fsync: Option<FsyncArg>,
     tokens: Option<PathBuf>,
     tokens_poll: u64,
+    presence: PresenceLimits,
     files: Vec<PathBuf>,
 }
 
@@ -303,6 +316,7 @@ async fn serve(options: ServeOptions) -> Result<(), String> {
         fsync,
         tokens,
         tokens_poll,
+        presence,
         files,
     } = options;
     // Bound first, so `--addr host:0` works and the URLs printed are real.
@@ -331,6 +345,7 @@ async fn serve(options: ServeOptions) -> Result<(), String> {
         }
         None => Server::new(),
     };
+    let server = server.with_presence_limits(presence);
     let server = match &tokens {
         Some(path) => server.with_tokens(Tokens::load(path).map_err(|e| e.to_string())?),
         None => server,
@@ -407,8 +422,17 @@ async fn main() -> ExitCode {
             fsync,
             tokens,
             tokens_poll,
+            presence_max_bytes,
+            presence_burst,
+            presence_per_second,
             files,
         } => {
+            let defaults = PresenceLimits::default();
+            let presence = PresenceLimits {
+                max_bytes: presence_max_bytes.unwrap_or(defaults.max_bytes),
+                burst: presence_burst.unwrap_or(defaults.burst),
+                per_second: presence_per_second.unwrap_or(defaults.per_second),
+            };
             serve(ServeOptions {
                 addr,
                 save,
@@ -418,6 +442,7 @@ async fn main() -> ExitCode {
                 fsync,
                 tokens,
                 tokens_poll,
+                presence,
                 files,
             })
             .await
