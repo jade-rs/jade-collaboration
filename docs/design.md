@@ -386,9 +386,13 @@ Tests are written first. Three layers:
    histories across N replicas under random message scheduling, grid
    invariants under random structural operations, docx/xlsx/pptx model ↔
    jade agreement after random edit sequences, a restarted server
-   indistinguishable from one that kept running, the journal reading back
-   whatever was appended, checkpointed and torn, only configured tokens being
-   accepted, and presence settling on everyone's latest state.
+   indistinguishable from one that kept running and resuming within its
+   kept tail exactly as one that never checkpointed, the journal reading
+   back whatever was appended, checkpointed and torn and being synced as its
+   policy says, only configured tokens being accepted and every route
+   agreeing with an independent reading of random per-document token tables,
+   the presence rate limiter agreeing with an exact GCRA, and presence
+   settling on everyone's latest state.
 3. **Example tests** — protocol edge cases, real fixtures through jade, and an
    end-to-end WebSocket session with a human-like and an agent-like client.
 
@@ -400,7 +404,7 @@ A server with a storage directory keeps, per document, the newest
 **checkpoint** and a **journal** of what happened after it:
 
 ```
-<dir>/<name>/snapshot-<n>.json    {"format": "docx", "checkpoint": {seq, processed, next_replica, faults, document}}
+<dir>/<name>/snapshot-<n>.json    {"format": "docx", "checkpoint": {seq, processed, next_replica, faults, document}, "tail": [committed…]}
 <dir>/<name>/snapshot-<n>.docx    the file jade exported at that seq
 <dir>/<name>/log-<n>.jsonl        one record per line: joined | committed | rejected
 ```
@@ -413,15 +417,32 @@ journal (`Sequencer::restore`, `Sequencer::replay`). The journal records
 joins (so replica ids are never reused), commits and rejections (a rejection
 moves the replica's processed client sequence number, which is what a resume
 reports). Each record is appended before anyone hears of it, so no replica can
-be ahead of the disk; a torn last line is dropped.
+be ahead of the journal; a torn last line is dropped.
+
+Appending hands the record to the operating system, which survives the
+process dying but not the machine losing power. `StorageOptions::sync`
+chooses: `Fsync::Checkpoints` (the default) syncs only checkpoints;
+`Fsync::EveryRecord` syncs every record before `append` returns, and so
+before the commit is broadcast — an acknowledged edit is on the disk, at one
+`fsync` per record. The store appends through a `JournalFile` (a `File` in
+production), so a property test can watch every write and sync over random
+appends, checkpoints and reopenings.
 
 Every `checkpoint_every` records a new generation is written (file, empty
 journal, then the `.json`, which is the commit point), older ones are removed
-and the in-memory log is compacted. A replica further behind than the
-checkpoint cannot resume and is told to join again (`rejoin`). A property
-test runs two simulated sessions side by side, one whose server restarts from
-what is on disk and one whose clients merely reconnect, and requires them to
-agree at every step.
+and the in-memory log is compacted — except for its **tail**: the last
+`keep_tail` committed operations are kept in memory and written into the
+snapshot (`Sequencer::compact_keeping`, `Sequencer::restore_with_tail`, which
+refuses a tail that does not end at the checkpoint or has gaps). A replica at
+most `keep_tail` operations behind the current position can therefore always
+resume, across checkpoints and restarts; one further behind is told to join
+again (`rejoin`). A property test runs two simulated sessions side by side,
+one whose server restarts from what is on disk and one whose clients merely
+reconnect, checkpointing with random tails, and requires them to agree at
+every step; it also replays the same history into a sequencer that never
+checkpoints and requires every resume from the kept tail on to be answered
+exactly as that one answers it, and every resume from before it to be
+refused at precisely the kept position.
 
 ### Access control
 
@@ -432,6 +453,41 @@ follows the log, but its connection answers each of its submissions with a
 rejection itself, so nothing a viewer sends reaches the sequencer or the
 journal.
 
+A grant may list `documents`: exact names or globs over the whole name (`*`
+any run of characters, `?` exactly one, case-sensitive), each with the
+token's role or one of its own (`{"document": …, "role": …}`); the first that
+matches decides, and a name none matches is closed. The format, in full:
+
+```json
+{
+  "<token>": {
+    "name": "carol",
+    "role": "editor" | "viewer",
+    "documents": ["contract.docx", "deck-*.pptx",
+                  {"document": "notes.docx", "role": "viewer"}]
+  }
+}
+```
+
+`documents` is optional (every document); an empty list opens none.
+`GET /documents` lists only what the token opens. Download, upload and the
+socket answer 403 to a known token without access, checked before the
+document is looked up (the socket before the upgrade), so a 403 does not tell
+whether the document exists; upload needs the editor role on that name.
+
+**Rotation.** The tokens file is the single source of truth; there is no
+admin endpoint, which would be a second way in to defend. The server holds
+its tokens in a watch channel: `Server::set_tokens` replaces them,
+`Server::watch_tokens` polls a file and takes it whenever its contents change
+(the CLI does so every second, and on SIGHUP), and a file that cannot be read
+or parsed is reported and changes nothing. A request is checked against the
+tokens in force when it arrives. Every socket keeps the token it presented
+and re-checks it on each change before reading anything further from the
+client (a biased select), so nothing sent after a change is judged by the
+old tokens: a withdrawn token, or one that no longer opens the socket's
+document, gets `revoked {message}` and a policy-violation close frame; a
+changed role or name applies from then on.
+
 ### Presence
 
 `presence {state}` carries arbitrary JSON (a cursor, a selection) and is
@@ -441,6 +497,16 @@ connection closes or the replica resumes elsewhere. The document's thread
 keeps the latest presence in memory for newcomers. Presence never touches the
 sequencer, the log or the disk. Because it shares the per-connection channel
 with commits, it cannot reorder them.
+
+Each connection is limited (`PresenceLimits`): a state of at most
+`max_bytes` of JSON as relayed (16 KiB by default), and a token bucket of
+`burst` updates refilled at `per_second` (40 and 20). The bucket keeps its
+credit in billionths of an update, so refilling is exact integer arithmetic;
+a property test compares it with the generic cell rate algorithm over random
+limits and arrival times. An update over a limit is dropped by the
+connection itself, before the document's thread sees it, and only its sender
+gets `presence_rejected {reason}`; submissions go through the same loop
+untouched.
 
 ## 9. Status and next steps
 
@@ -459,9 +525,12 @@ materializer re-learns which file id jade gave each session-made text box);
 index/A1/slide-number-addressed intent APIs for people and agents; the
 `jade-collab` CLI; resume after a disconnect; an MCP server
 (`jade-collab-mcp`) through which agents join, read, edit and watch
-documents as replicas without a shell; durable documents with checkpoints
-and log compaction; bearer-token authentication with editor and viewer
-roles; presence.
+documents as replicas without a shell; durable documents with checkpoints,
+log compaction that keeps a tail for replicas slightly behind, and an
+optional fsync per journal record; bearer-token authentication with editor
+and viewer roles, per-document access and roles, and tokens rotated without a
+restart (revoked sockets are closed); presence, limited in size and rate per
+connection.
 
 Not yet:
 
@@ -473,12 +542,10 @@ Not yet:
 * docx structure of ragged and nested tables (their text is editable),
   rows/columns through merged regions, text boxes, notes, tracked changes.
 * Excel table (ListObject) structure and header edits.
-* Durability and access, beyond what §8 covers: per-document permissions
-  (a token is valid for every document), token rotation without a restart,
-  an fsync per journal record (records are written to the OS at once; only
-  checkpoints are fsynced), keeping a tail of the log after a checkpoint so
-  that briefly disconnected replicas need not rejoin, and limits on the size
-  and rate of presence updates.
+* Access and durability: a connection's outgoing queue is unbounded (a
+  client that stops reading makes it grow), there is no audit log of who
+  connected with which token, and reloading tokens on SIGHUP is Unix-only
+  (the file is still polled everywhere).
 * Performance: RGA lookups are linear and paragraph positions are recomputed
   by walking the model on each operation; formatting and comment operations
   are preflighted on a copy of the jade document; jade's xlsx editor rereads

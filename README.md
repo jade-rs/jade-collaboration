@@ -110,8 +110,17 @@ the server and start it again on the same directory and every document comes
 back as it was; connected programs call `Client::resume` and carry on. A file
 named on the command line is only read the first time — after that the
 stored document wins. `--checkpoint-every N` (default 1000) bounds the
-journal; a replica that was offline for longer than a checkpoint is told to
-join again (`ClientError::Rejoin`).
+journal. `--keep-tail N` (default 1000) keeps the last N committed operations
+of each checkpoint in its snapshot and in memory, so a replica at most N
+operations behind can always resume, across checkpoints and restarts;
+one further behind is told to join again (`ClientError::Rejoin`).
+
+Every journal record reaches the operating system before anyone hears of
+it, so killing the process loses nothing. `--fsync every`
+(`StorageOptions { sync: Fsync::EveryRecord, .. }`) also syncs each record to
+the disk before it is broadcast, so an acknowledged edit survives a power
+failure, at one `fsync` per record; `--fsync checkpoint`, the default, only
+syncs checkpoints.
 
 ### Access tokens
 
@@ -119,7 +128,10 @@ join again (`ClientError::Rejoin`).
 cat > tokens.json <<'JSON'
 {
   "s3cret-alice": { "name": "alice", "role": "editor" },
-  "s3cret-bot":   { "name": "review-bot", "role": "viewer" }
+  "s3cret-bot":   { "name": "review-bot", "role": "viewer" },
+  "s3cret-carol": { "name": "carol", "role": "viewer",
+                    "documents": ["deck-*.pptx",
+                                  { "document": "contract.docx", "role": "editor" }] }
 }
 JSON
 jade-collab serve --tokens tokens.json contract.docx
@@ -134,6 +146,25 @@ their edits are rejected by the server and never applied, and they cannot
 upload. `Client::connect(url, Some(token))` / `Client::resume(url, replica,
 Some(token))` send the header.
 
+A grant without `documents` opens every document. With `documents`, it opens
+only the names listed — exact names or globs over the whole name (`*` any
+run of characters, `?` exactly one) — each with the token's role or, written
+`{"document": …, "role": …}`, a role of its own; the first entry that matches
+decides. `GET /documents` lists only what the token opens; the other routes
+and the socket answer 403 to a known token without access, and uploading
+needs the editor role on that name.
+
+The tokens file can change while the server runs: it is read again when its
+contents change (checked every `--tokens-poll SECONDS`, default 1; 0 turns
+it off) and on SIGHUP, and a file that does not parse is reported and
+changes nothing. The new tokens apply to the next request, and to every open
+socket at once: one whose token was withdrawn, or no longer opens its
+document, receives `{"type":"revoked","message":…}` and is closed
+(`ClientError::Revoked`); a changed role applies to what it sends next. In
+Rust: `Server::set_tokens`, `Server::reload_tokens`, `Server::watch_tokens`.
+There is deliberately no HTTP endpoint for this: whoever can write the
+tokens file already decides who gets in.
+
 ### Presence
 
 Cursors, selections and the like travel as presence: a client sends
@@ -144,6 +175,13 @@ document receive `{"type":"presence","replica":3,"name":"alice","state":…}`
 are told the current presence of everyone. Presence is never logged or
 stored and never reorders operations. In Rust: `client.set_presence(json)`,
 `client.presence()`, `client.wait_for_presence(…)`.
+
+Each connection may share a state of at most 16 KiB of JSON, 40 updates at
+once and 20 per second after that (`--presence-max-bytes`,
+`--presence-burst`, `--presence-per-second`; `Server::with_presence_limits`).
+An update over a limit is dropped — nobody else sees it — and only its
+sender receives `{"type":"presence_rejected","reason":…}`
+(`client.take_presence_rejections()`). Operations are never limited.
 
 ## How it is verified
 
@@ -158,10 +196,14 @@ Tests come first. Three layers:
   specification, random multi-client sessions over a simulated network for
   convergence, grid invariants under random structure edits, the model
   against jade after random edits on real fixtures (every fixture in
-  jade-core is loaded and compared), and a server restarted from its
-  checkpoint and journal against one that never stopped.
+  jade-core is loaded and compared), a server restarted from its
+  checkpoint, kept tail and journal against one that never stopped and one
+  that never checkpointed, the journal's fsync policy, token tables with
+  per-document roles against an independent reference, and the presence
+  rate limiter against an exact GCRA.
 * **End-to-end tests** run real WebSocket sessions and the CLI, including a
-  server restarted from its storage directory, tokens and presence.
+  server restarted from its storage directory, tokens (per document, and
+  rotated while connections are open) and presence limits.
 
 ## License
 
