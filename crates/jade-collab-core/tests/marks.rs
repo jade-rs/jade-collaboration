@@ -639,3 +639,37 @@ proptest! {
         prop_assert_eq!(marks.at(&rga, typed, &0).is_some(), covered);
     }
 }
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// The RGA facts `Marks.lean` takes as hypotheses (`Extends`, `InGap`):
+    /// inserting keeps the relative order of the atoms that were there, and
+    /// an atom typed after `l` with an id newer than everything lands right
+    /// after `l`.
+    #[test]
+    fn rga_inserts_keep_the_order_and_typing_lands_right_after_its_parent(
+        actions in prop::collection::vec(action(2), 0..60),
+        at in any::<usize>(),
+        others in prop::collection::vec((any::<usize>(), prop::char::range('A', 'Z')), 0..6),
+    ) {
+        let (_, mut replicas) = run(2, &actions);
+        let peer = &mut replicas[0];
+        let before = peer.rga.ids();
+        prop_assume!(!before.is_empty());
+        let l = before[at % before.len()];
+        let typed = Id::new(peer.rga.max_lamport() + 1, ReplicaId(9));
+        peer.rga.insert(typed, Some(l), '*').unwrap();
+        let after = peer.rga.ids();
+        prop_assert_eq!(after[after.iter().position(|a| *a == l).unwrap() + 1], typed);
+        // More inserts anywhere, older or newer.
+        for (k, (at, value)) in others.into_iter().enumerate() {
+            let len = peer.rga.len();
+            let parent = (at % (len + 1) != len).then(|| peer.rga.nodes()[at % (len + 1)].id);
+            let lamport = parent.map_or(1, |p| p.lamport + 1).max(peer.rga.max_lamport() / 2 + 1);
+            let _ = peer.rga.insert(Id::new(lamport, ReplicaId(20 + k as u64)), parent, value);
+        }
+        let kept: Vec<Id> = peer.rga.ids().into_iter().filter(|a| after.contains(a)).collect();
+        prop_assert_eq!(kept, after);
+    }
+}
