@@ -133,6 +133,12 @@ enum Op {
         parent: Option<Id>,
         value: char,
     },
+    /// A typed run: `len` atoms chained after `parent`, ids `first`, ….
+    InsertRun {
+        first: Id,
+        parent: Option<Id>,
+        values: Vec<char>,
+    },
     Delete {
         id: Id,
     },
@@ -141,6 +147,7 @@ enum Op {
 #[derive(Clone, Debug)]
 enum Action {
     Insert { peer: usize, at: usize, value: char },
+    InsertRun { peer: usize, at: usize, len: usize },
     Delete { peer: usize, at: usize },
     Sync { from: usize, to: usize },
 }
@@ -150,6 +157,18 @@ fn action(peers: usize) -> impl Strategy<Value = Action> {
         4 => (0..peers, any::<usize>(), prop::char::range('a', 'z'))
             .prop_map(|(peer, at, value)| Action::Insert { peer, at, value }),
         2 => (0..peers, any::<usize>()).prop_map(|(peer, at)| Action::Delete { peer, at }),
+        2 => (0..peers, 0..peers).prop_map(|(from, to)| Action::Sync { from, to }),
+    ]
+}
+
+/// Like [`action`], plus typed runs, so histories grow to thousands of atoms.
+fn large_action(peers: usize) -> impl Strategy<Value = Action> {
+    prop_oneof![
+        4 => (0..peers, any::<usize>(), prop::char::range('a', 'z'))
+            .prop_map(|(peer, at, value)| Action::Insert { peer, at, value }),
+        2 => (0..peers, any::<usize>(), 1usize..60)
+            .prop_map(|(peer, at, len)| Action::InsertRun { peer, at, len }),
+        3 => (0..peers, any::<usize>()).prop_map(|(peer, at)| Action::Delete { peer, at }),
         2 => (0..peers, 0..peers).prop_map(|(from, to)| Action::Sync { from, to }),
     ]
 }
@@ -169,9 +188,29 @@ fn deliver(peer: &mut Peer, index: usize, op: &Op) {
             peer.clock.observe(*id);
             peer.rga.insert(*id, *parent, *value).unwrap();
         }
+        Op::InsertRun {
+            first,
+            parent,
+            values,
+        } => {
+            peer.clock.observe(first.offset(values.len() as u64 - 1));
+            peer.rga
+                .insert_run(*first, *parent, values.iter().copied())
+                .unwrap();
+        }
         Op::Delete { id } => {
             peer.rga.delete(*id).unwrap();
         }
+    }
+}
+
+/// Anchors on any atom (tombstones included) or the start.
+fn anchor(rga: &Rga<char>, at: usize) -> Option<Id> {
+    let len = rga.len();
+    if len == 0 || at % (len + 1) == len {
+        None
+    } else {
+        Some(rga.nodes()[at % (len + 1)].id)
     }
 }
 
@@ -190,15 +229,22 @@ fn run(peers: usize, actions: &[Action]) -> (Vec<Op>, Vec<Peer>) {
         match *action {
             Action::Insert { peer, at, value } => {
                 let replica = &mut replicas[peer];
-                // Anchor on any atom (tombstones included) or the start.
-                let ids = replica.rga.ids();
-                let parent = if ids.is_empty() || at % (ids.len() + 1) == ids.len() {
-                    None
-                } else {
-                    Some(ids[at % (ids.len() + 1)])
-                };
+                let parent = anchor(&replica.rga, at);
                 let id = replica.clock.tick();
                 let op = Op::Insert { id, parent, value };
+                log.push(op.clone());
+                deliver(replica, log.len() - 1, &op);
+            }
+            Action::InsertRun { peer, at, len } => {
+                let replica = &mut replicas[peer];
+                let parent = anchor(&replica.rga, at);
+                let first = replica.clock.reserve(len as u64);
+                let values = (0..len).map(|k| (b'A' + (k % 26) as u8) as char).collect();
+                let op = Op::InsertRun {
+                    first,
+                    parent,
+                    values,
+                };
                 log.push(op.clone());
                 deliver(replica, log.len() - 1, &op);
             }
@@ -240,12 +286,62 @@ fn spec_of(log: &[Op]) -> (Vec<spec::Insert<char>>, BTreeSet<Id>) {
             Op::Insert { id, parent, value } => {
                 inserts.push(spec::Insert::new(*id, *parent, *value))
             }
+            Op::InsertRun {
+                first,
+                parent,
+                values,
+            } => {
+                let mut previous = *parent;
+                for (k, value) in values.iter().enumerate() {
+                    let id = first.offset(k as u64);
+                    inserts.push(spec::Insert::new(id, previous, *value));
+                    previous = Some(id);
+                }
+            }
             Op::Delete { id } => {
                 deleted.insert(*id);
             }
         }
     }
     (inserts, deleted)
+}
+
+/// Delivers `log` to a fresh sequence in the causal order `picks` chooses.
+fn deliver_in_random_causal_order(log: &[Op], picks: &[usize]) -> Rga<char> {
+    let mut rga: Rga<char> = Rga::new();
+    let mut pending: Vec<&Op> = log.iter().collect();
+    let mut pick = picks.iter().cycle();
+    while !pending.is_empty() {
+        let ready: Vec<usize> = pending
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| match op {
+                Op::Insert { parent, .. } | Op::InsertRun { parent, .. } => {
+                    parent.is_none_or(|p| rga.contains(p))
+                }
+                Op::Delete { id } => rga.contains(*id),
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let chosen = ready[*pick.next().unwrap() % ready.len()];
+        match pending.remove(chosen) {
+            Op::Insert { id, parent, value } => {
+                rga.insert(*id, *parent, *value).unwrap();
+            }
+            Op::InsertRun {
+                first,
+                parent,
+                values,
+            } => {
+                rga.insert_run(*first, *parent, values.iter().copied())
+                    .unwrap();
+            }
+            Op::Delete { id } => {
+                rga.delete(*id).unwrap();
+            }
+        }
+    }
+    rga
 }
 
 proptest! {
@@ -276,29 +372,7 @@ proptest! {
         picks in prop::collection::vec(any::<usize>(), 200),
     ) {
         let (log, _) = run(3, &actions);
-        let mut rga: Rga<char> = Rga::new();
-        let mut pending: Vec<&Op> = log.iter().collect();
-        let mut pick = picks.iter().cycle();
-        while !pending.is_empty() {
-            let ready: Vec<usize> = pending
-                .iter()
-                .enumerate()
-                .filter(|(_, op)| match op {
-                    Op::Insert { parent, .. } => parent.is_none_or(|p| rga.contains(p)),
-                    Op::Delete { id } => rga.contains(*id),
-                })
-                .map(|(i, _)| i)
-                .collect();
-            let chosen = ready[*pick.next().unwrap() % ready.len()];
-            match pending.remove(chosen) {
-                Op::Insert { id, parent, value } => {
-                    rga.insert(*id, *parent, *value).unwrap();
-                }
-                Op::Delete { id } => {
-                    rga.delete(*id).unwrap();
-                }
-            }
-        }
+        let rga = deliver_in_random_causal_order(&log, &picks);
         let (inserts, deleted) = spec_of(&log);
         let visible: Vec<(Id, char)> = rga.visible().map(|(id, c)| (id, *c)).collect();
         prop_assert_eq!(visible, spec::render(&inserts, &deleted));
@@ -321,5 +395,37 @@ proptest! {
             shuffled.swap(i, (state >> 33) as usize % (i + 1));
         }
         prop_assert_eq!(spec::render(&inserts, &deleted), spec::render(&shuffled, &deleted));
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(48))]
+
+    /// Histories of thousands of atoms — typed runs, concurrent single
+    /// inserts and deletions across five replicas — still converge to the
+    /// specification.
+    #[test]
+    fn large_concurrent_histories_converge_to_the_spec(
+        actions in prop::collection::vec(large_action(5), 0..400),
+        picks in prop::collection::vec(any::<usize>(), 64),
+    ) {
+        let (log, replicas) = run(5, &actions);
+        let (inserts, deleted) = spec_of(&log);
+        let expected = spec::render(&inserts, &deleted);
+        let order = spec::linearize(&inserts);
+        for replica in &replicas {
+            prop_assert_eq!(replica.rga.ids(), order.clone());
+            let visible: Vec<(Id, char)> = replica.rga.visible().map(|(id, c)| (id, *c)).collect();
+            prop_assert_eq!(&visible, &expected);
+            for (index, (id, _)) in expected.iter().enumerate() {
+                prop_assert_eq!(replica.rga.visible_index(*id), Some(index));
+                prop_assert_eq!(replica.rga.visible_id_at(index), Some(*id));
+            }
+            for (position, id) in order.iter().enumerate() {
+                prop_assert_eq!(replica.rga.position(*id), Some(position));
+            }
+        }
+        let rga = deliver_in_random_causal_order(&log, &picks);
+        prop_assert_eq!(rga.ids(), order);
     }
 }
