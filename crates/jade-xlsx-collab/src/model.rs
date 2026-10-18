@@ -302,8 +302,32 @@ impl XlsxModel {
     /// The non-blank cells of `sheet` in its current grid, row by row, with
     /// their A1 references.
     pub fn filled_cells(&self, sheet: Id) -> Vec<(String, &CellInput)> {
-        let _ = sheet;
-        todo!()
+        let Some(sheet) = self.sheets.iter().find(|s| s.id == sheet) else {
+            return Vec::new();
+        };
+        let position = |lines: Vec<Id>| -> BTreeMap<Id, usize> {
+            lines
+                .into_iter()
+                .enumerate()
+                .map(|(i, id)| (id, i))
+                .collect()
+        };
+        let rows = position(sheet.grid.rows());
+        let columns = position(sheet.grid.columns());
+        let mut cells: Vec<((usize, usize), &CellInput)> = sheet
+            .cells
+            .iter()
+            .filter_map(|((row, column), register)| {
+                let value = register.get()?;
+                let at = (*rows.get(row)?, *columns.get(column)?);
+                (*value != CellInput::Blank).then_some((at, value))
+            })
+            .collect();
+        cells.sort_by_key(|(at, _)| *at);
+        cells
+            .into_iter()
+            .map(|((r, c), value)| (format!("{}{}", column_label(c as u32), r + 1), value))
+            .collect()
     }
 
     /// `(sheet, row, column)` ids of `reference` (`B3`) on the sheet named `sheet`.
