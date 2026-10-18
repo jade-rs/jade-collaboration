@@ -94,12 +94,22 @@ pub enum ServerMessage {
     PresenceLeft {
         replica: ReplicaId,
     },
+    /// This connection's last presence update was over the server's size or
+    /// rate limit and was dropped.
+    PresenceRejected {
+        reason: String,
+    },
     /// The server cannot resume the replica (it never joined, or its log
     /// position was compacted into a checkpoint); join again.
     Rejoin {
         message: String,
     },
     Error {
+        message: String,
+    },
+    /// The connection's token was withdrawn, or no longer opens this
+    /// document; the server closes the socket after this.
+    Revoked {
         message: String,
     },
 }

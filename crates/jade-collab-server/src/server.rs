@@ -1,9 +1,11 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::rejection::WebSocketUpgradeRejection;
+use axum::extract::ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
 use axum::middleware;
@@ -12,9 +14,13 @@ use axum::routing::get;
 use axum::{Extension, Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc::unbounded_channel, oneshot};
+use tokio::sync::{mpsc::unbounded_channel, oneshot, watch};
+use tokio::task::JoinHandle;
 
-use crate::auth::{authenticate, Grant, Tokens};
+use crate::auth::{
+    access, authenticate, forbidden, recheck, Grant, Presented, Role, Tokens, TokensError,
+};
+use crate::limits::{Bucket, PresenceLimits};
 use crate::room::{self, Command, Source};
 use crate::storage::{newest_generation, StorageOptions};
 use crate::wire::{ClientMessage, Format, ServerMessage};
@@ -39,6 +45,10 @@ pub enum ServerError {
     Stopped(String),
     #[error("cannot export {name}: {message}")]
     Export { name: String, message: String },
+    #[error("this server was started without tokens and cannot take any")]
+    NoTokens,
+    #[error(transparent)]
+    Tokens(#[from] TokensError),
 }
 
 struct RoomHandle {
@@ -57,7 +67,9 @@ struct Storage {
 pub struct Server {
     rooms: Arc<Mutex<BTreeMap<String, RoomHandle>>>,
     storage: Option<Arc<Storage>>,
-    tokens: Option<Arc<Tokens>>,
+    /// The tokens in force; every connection watches them.
+    tokens: Option<Arc<watch::Sender<Arc<Tokens>>>>,
+    presence: PresenceLimits,
 }
 
 /// A name that is a single plain file name, so it can name a directory too.
@@ -98,6 +110,7 @@ impl Server {
                 options,
             })),
             tokens: None,
+            presence: PresenceLimits::default(),
         };
         let entries = std::fs::read_dir(&dir).map_err(|e| storage_error(e.to_string()))?;
         for entry in entries {
@@ -129,12 +142,73 @@ impl Server {
 
     /// Requires one of `tokens` on every route and socket from now on.
     pub fn with_tokens(mut self, tokens: Tokens) -> Self {
-        self.tokens = Some(Arc::new(tokens));
+        self.tokens = Some(Arc::new(watch::Sender::new(Arc::new(tokens))));
         self
     }
 
-    pub(crate) fn tokens(&self) -> Option<&Tokens> {
-        self.tokens.as_deref()
+    /// Limits what each connection may share as presence (instead of
+    /// [`PresenceLimits::default`]).
+    pub fn with_presence_limits(mut self, limits: PresenceLimits) -> Self {
+        self.presence = limits;
+        self
+    }
+
+    pub(crate) fn tokens(&self) -> Option<Arc<Tokens>> {
+        self.tokens.as_ref().map(|tokens| tokens.borrow().clone())
+    }
+
+    fn watch(&self) -> Option<watch::Receiver<Arc<Tokens>>> {
+        self.tokens.as_ref().map(|tokens| tokens.subscribe())
+    }
+
+    /// Replaces the tokens of a server started with tokens. The next request
+    /// is checked against the new ones, and every open socket at once: one
+    /// whose token is gone, or no longer opens its document, is told why
+    /// (`revoked`) and closed; one whose role changed has the new role for
+    /// whatever it sends next.
+    pub fn set_tokens(&self, tokens: Tokens) -> Result<(), ServerError> {
+        let current = self.tokens.as_ref().ok_or(ServerError::NoTokens)?;
+        current.send_replace(Arc::new(tokens));
+        Ok(())
+    }
+
+    /// Reads the tokens file at `path` and takes its tokens.
+    pub fn reload_tokens(&self, path: &std::path::Path) -> Result<(), ServerError> {
+        if self.tokens.is_none() {
+            return Err(ServerError::NoTokens);
+        }
+        self.set_tokens(Tokens::load(path)?)
+    }
+
+    /// Reads the tokens file at `path` every `every` and takes its tokens
+    /// whenever its contents change. A file that cannot be read or does not
+    /// parse is reported on stderr and the tokens in force stay. Runs until
+    /// the handle is aborted; needs a Tokio runtime.
+    pub fn watch_tokens(&self, path: PathBuf, every: Duration) -> JoinHandle<()> {
+        let server = self.clone();
+        tokio::spawn(async move {
+            // The file as it was last looked at, so each change is acted on
+            // (and each problem reported) once.
+            let mut seen = std::fs::read(&path).map_err(|e| e.to_string());
+            loop {
+                tokio::time::sleep(every).await;
+                let now = std::fs::read(&path).map_err(|e| e.to_string());
+                if now == seen {
+                    continue;
+                }
+                seen = now;
+                match &seen {
+                    Ok(_) => match server.reload_tokens(&path) {
+                        Ok(()) => eprintln!("took new tokens from {}", path.display()),
+                        Err(error) => eprintln!("kept the tokens in force: {error}"),
+                    },
+                    Err(error) => eprintln!(
+                        "kept the tokens in force: cannot read {}: {error}",
+                        path.display()
+                    ),
+                }
+            }
+        })
     }
 
     /// Opens `bytes` as the document `name` (its extension picks the format).
@@ -226,7 +300,8 @@ impl Server {
     }
 
     /// `GET /documents`, `GET|PUT /documents/{name}`, and the editing socket
-    /// at `GET /documents/{name}/ws`; all behind the tokens, if any.
+    /// at `GET /documents/{name}/ws`; all behind the tokens, if any, and
+    /// each document behind the documents its token opens.
     pub fn router(&self) -> Router {
         Router::new()
             .route("/documents", get(list))
@@ -241,11 +316,17 @@ impl Server {
     }
 }
 
-async fn list(State(server): State<Server>) -> Json<Vec<serde_json::Value>> {
+/// The documents the token may open.
+async fn list(
+    State(server): State<Server>,
+    grant: Option<Extension<Grant>>,
+) -> Json<Vec<serde_json::Value>> {
+    let grant = grant.map(|Extension(grant)| grant);
     Json(
         server
             .documents()
             .into_iter()
+            .filter(|(name, _)| access(grant.as_ref(), name).is_some())
             .map(|(name, format)| serde_json::json!({ "name": name, "format": format }))
             .collect(),
     )
@@ -263,7 +344,15 @@ fn error_response(error: ServerError) -> Response {
     (status, error.to_string()).into_response()
 }
 
-async fn download(Path(name): Path<String>, State(server): State<Server>) -> Response {
+async fn download(
+    Path(name): Path<String>,
+    State(server): State<Server>,
+    grant: Option<Extension<Grant>>,
+) -> Response {
+    let grant = grant.map(|Extension(grant)| grant);
+    if access(grant.as_ref(), &name).is_none() {
+        return forbidden(&name);
+    }
     match server.export(&name).await {
         Ok(bytes) => ([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response(),
         Err(error) => error_response(error),
@@ -276,8 +365,13 @@ async fn upload(
     grant: Option<Extension<Grant>>,
     body: Bytes,
 ) -> Response {
-    if grant.is_some_and(|Extension(grant)| !grant.may_edit()) {
-        return (StatusCode::FORBIDDEN, "viewers cannot upload documents").into_response();
+    let grant = grant.map(|Extension(grant)| grant);
+    match access(grant.as_ref(), &name) {
+        Some(Role::Editor) => {}
+        Some(Role::Viewer) => {
+            return (StatusCode::FORBIDDEN, "viewers cannot upload documents").into_response()
+        }
+        None => return forbidden(&name),
     }
     let opened = tokio::task::spawn_blocking(move || server.open(&name, body.to_vec())).await;
     match opened {
@@ -295,24 +389,120 @@ async fn socket(
     Path(name): Path<String>,
     State(server): State<Server>,
     grant: Option<Extension<Grant>>,
-    upgrade: WebSocketUpgrade,
+    presented: Option<Extension<Presented>>,
+    upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
     let grant = grant.map(|Extension(grant)| grant);
+    // Access is decided before anything else is looked at.
+    let Some(role) = access(grant.as_ref(), &name) else {
+        return forbidden(&name);
+    };
+    let upgrade = match upgrade {
+        Ok(upgrade) => upgrade,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let tokens = match (presented, server.watch()) {
+        (Some(Extension(Presented(token))), Some(tokens)) => Some(Watched {
+            token,
+            document: name.clone(),
+            tokens,
+        }),
+        _ => None,
+    };
+    let limits = server.presence;
     match server.commands(&name) {
-        Ok(commands) => upgrade.on_upgrade(move |socket| connection(socket, commands, grant)),
+        Ok(commands) => upgrade.on_upgrade(move |socket| {
+            connection(
+                socket,
+                commands,
+                Access {
+                    grant,
+                    role,
+                    tokens,
+                },
+                limits,
+            )
+        }),
         Err(error) => error_response(error),
     }
 }
 
-/// One socket. `grant` is who it belongs to on a server with tokens.
-async fn connection(socket: WebSocket, commands: mpsc::Sender<Command>, grant: Option<Grant>) {
-    let may_edit = grant.as_ref().is_none_or(Grant::may_edit);
+/// What a socket may do, on a server with tokens kept up to date with them.
+struct Access {
+    /// Who the socket belongs to, on a server with tokens.
+    grant: Option<Grant>,
+    /// What it may do with its document.
+    role: Role,
+    tokens: Option<Watched>,
+}
+
+/// The token a socket presented, and the server's tokens as they change.
+struct Watched {
+    token: String,
+    document: String,
+    tokens: watch::Receiver<Arc<Tokens>>,
+}
+
+impl Access {
+    /// Waits until the server's tokens change; never, without tokens.
+    async fn changed(&mut self) {
+        if let Some(watched) = &mut self.tokens {
+            if watched.tokens.changed().await.is_ok() {
+                return;
+            }
+        }
+        // No tokens, or the server is gone: nothing will change.
+        std::future::pending().await
+    }
+
+    /// Takes the tokens now in force, or says why the socket must close.
+    fn refresh(&mut self) -> Result<(), String> {
+        let Some(watched) = &mut self.tokens else {
+            return Ok(());
+        };
+        let tokens = watched.tokens.borrow_and_update().clone();
+        let (grant, role) = recheck(&tokens, &watched.token, &watched.document)?;
+        self.grant = Some(grant);
+        self.role = role;
+        Ok(())
+    }
+}
+
+/// One socket, doing what `access` allows and sharing presence within
+/// `limits`.
+async fn connection(
+    socket: WebSocket,
+    commands: mpsc::Sender<Command>,
+    mut access: Access,
+    limits: PresenceLimits,
+) {
     let (mut sink, mut stream) = socket.split();
     let (outbox, mut outgoing) = unbounded_channel::<String>();
-    let writer = tokio::spawn(async move {
-        while let Some(message) = outgoing.recv().await {
-            if sink.send(Message::Text(message.into())).await.is_err() {
-                break;
+    // The last word, if the server closes the socket: said, then closed.
+    let (closer, close) = oneshot::channel::<ServerMessage>();
+    let mut writer = tokio::spawn(async move {
+        tokio::pin!(close);
+        loop {
+            tokio::select! {
+                biased;
+                last = &mut close => {
+                    if let Ok(last) = last {
+                        let _ = sink.send(Message::Text(last.to_json().into())).await;
+                        let _ = sink
+                            .send(Message::Close(Some(CloseFrame {
+                                code: close_code::POLICY,
+                                reason: "access revoked".into(),
+                            })))
+                            .await;
+                    }
+                    break;
+                }
+                message = outgoing.recv() => {
+                    let Some(message) = message else { break };
+                    if sink.send(Message::Text(message.into())).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
@@ -320,7 +510,21 @@ async fn connection(socket: WebSocket, commands: mpsc::Sender<Command>, grant: O
         let _ = outbox.send(message.to_json());
     };
     let mut replica = None;
-    while let Some(Ok(message)) = stream.next().await {
+    let opened = std::time::Instant::now();
+    let mut presence_rate = Bucket::new(limits);
+    // The tokens may have changed since the request was let in.
+    let mut revoked = access.refresh().err();
+    while revoked.is_none() {
+        let message = tokio::select! {
+            // A change of tokens comes before anything sent after it.
+            biased;
+            () = access.changed() => {
+                revoked = access.refresh().err();
+                continue;
+            }
+            message = stream.next() => message,
+        };
+        let Some(Ok(message)) = message else { break };
         let text = match message {
             Message::Text(text) => text,
             Message::Close(_) => break,
@@ -382,9 +586,23 @@ async fn connection(socket: WebSocket, commands: mpsc::Sender<Command>, grant: O
             }
             ClientMessage::Presence { state } => match replica {
                 Some(replica) => {
+                    // Over a limit, it is dropped here, before the
+                    // document's thread sees it; only the sender hears of
+                    // it, and operations are not touched.
+                    let admitted = limits.check_size(&state).and_then(|()| {
+                        if presence_rate.allow(opened.elapsed()) {
+                            Ok(())
+                        } else {
+                            Err(limits.rate_message())
+                        }
+                    });
+                    if let Err(reason) = admitted {
+                        say(ServerMessage::PresenceRejected { reason });
+                        continue;
+                    }
                     let command = Command::Presence {
                         replica,
-                        name: grant.as_ref().map(|grant| grant.name.clone()),
+                        name: access.grant.as_ref().map(|grant| grant.name.clone()),
                         state,
                         outbox: outbox.clone(),
                     };
@@ -399,7 +617,7 @@ async fn connection(socket: WebSocket, commands: mpsc::Sender<Command>, grant: O
             ClientMessage::Submit(submission) => match replica {
                 // Answered here: a viewer's operation never reaches the
                 // document, and its replica has nothing of its own in the log.
-                Some(_) if !may_edit => say(ServerMessage::Rejected(Rejected {
+                Some(_) if access.role != Role::Editor => say(ServerMessage::Rejected(Rejected {
                     client_seq: submission.client_seq,
                     reason: Rejection::new("this token is read-only (viewer)"),
                 })),
@@ -425,6 +643,12 @@ async fn connection(socket: WebSocket, commands: mpsc::Sender<Command>, grant: O
             replica,
             outbox: outbox.clone(),
         });
+    }
+    if let Some(message) = revoked {
+        let _ = closer.send(ServerMessage::Revoked {
+            message: format!("access revoked: {message}"),
+        });
+        let _ = tokio::time::timeout(Duration::from_secs(5), &mut writer).await;
     }
     // The socket is gone; nothing more can be written to it.
     writer.abort();

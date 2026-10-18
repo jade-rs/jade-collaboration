@@ -112,7 +112,15 @@ fn serve_with_a_data_directory_survives_a_kill() {
     std::fs::copy(core.join("hello.docx"), &file).unwrap();
     let data = dir.join("data");
 
-    let (server, addr) = serve(&["--data".as_ref(), data.as_os_str(), file.as_os_str()]);
+    let (server, addr) = serve(&[
+        "--data".as_ref(),
+        data.as_os_str(),
+        "--fsync".as_ref(),
+        "every".as_ref(),
+        "--keep-tail".as_ref(),
+        "10".as_ref(),
+        file.as_os_str(),
+    ]);
     let docx = format!("ws://{addr}/documents/hello.docx/ws");
     run(&[
         "apply",
@@ -126,6 +134,14 @@ fn serve_with_a_data_directory_survives_a_kill() {
     let docx = format!("ws://{addr}/documents/hello.docx/ws");
     let shown = run(&["show", &docx]);
     assert!(shown.contains("Durable: Hello"), "{shown}");
+    // Only `every` and `checkpoint` are policies.
+    let refused = bin()
+        .args(["serve", "--data"])
+        .arg(&data)
+        .args(["--fsync", "sometimes"])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -158,6 +174,67 @@ fn serve_with_tokens() {
     let shown = run(&["show", "--token", "vi", &docx]);
     assert!(shown.contains("Signed: Hello"), "{shown}");
     assert!(!shown.contains("Signed: Signed:"), "{shown}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Retries `show` with `token` until it succeeds or fails as `succeeds`.
+fn until_show(docx: &str, token: &str, succeeds: bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let output = bin()
+            .args(["show", "--token", token, docx])
+            .output()
+            .unwrap();
+        if output.status.success() == succeeds {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "show with {token} never {}",
+            if succeeds { "succeeded" } else { "failed" }
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn tokens_rotate_without_a_restart() {
+    let dir = std::env::temp_dir().join(format!("jade-collab-cli-rotate-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let core = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../jade-core");
+    let file = dir.join("hello.docx");
+    std::fs::copy(core.join("hello.docx"), &file).unwrap();
+    let tokens = dir.join("tokens.json");
+    std::fs::write(&tokens, r#"{"one": {"name": "One", "role": "viewer"}}"#).unwrap();
+
+    // Without polling, the file is read again on SIGHUP.
+    let (server, addr) = serve(&[
+        "--tokens".as_ref(),
+        tokens.as_os_str(),
+        "--tokens-poll".as_ref(),
+        "0".as_ref(),
+        file.as_os_str(),
+    ]);
+    let docx = format!("ws://{addr}/documents/hello.docx/ws");
+    until_show(&docx, "one", true);
+    std::fs::write(&tokens, r#"{"two": {"name": "Two", "role": "viewer"}}"#).unwrap();
+    let hup = Command::new("kill")
+        .args(["-HUP", &server.0.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(hup.success());
+    until_show(&docx, "one", false);
+    until_show(&docx, "two", true);
+    drop(server);
+
+    // By default the file is watched.
+    let (_server, addr) = serve(&["--tokens".as_ref(), tokens.as_os_str(), file.as_os_str()]);
+    let docx = format!("ws://{addr}/documents/hello.docx/ws");
+    until_show(&docx, "two", true);
+    std::fs::write(&tokens, r#"{"three": {"name": "Three", "role": "viewer"}}"#).unwrap();
+    until_show(&docx, "two", false);
+    until_show(&docx, "three", true);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

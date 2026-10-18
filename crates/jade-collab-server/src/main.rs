@@ -3,9 +3,10 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
-use clap::Parser;
-use jade_collab_server::{Client, Format, Server, StorageOptions, Tokens};
+use clap::{Parser, ValueEnum};
+use jade_collab_server::{Client, Format, Fsync, PresenceLimits, Server, StorageOptions, Tokens};
 use jade_collab_sync::ReplicaEvent;
 use jade_docx_collab::intent::{resolve, IntentOp};
 use jade_docx_collab::DocxModel;
@@ -35,10 +36,43 @@ enum Cli {
         /// With --data, take a checkpoint after this many journal records.
         #[arg(long, value_name = "N", requires = "data")]
         checkpoint_every: Option<u64>,
+        /// With --data, keep this many committed operations from before each
+        /// checkpoint, so replicas that far behind can still resume
+        /// (default 1000).
+        #[arg(long, value_name = "N", requires = "data")]
+        keep_tail: Option<usize>,
+        /// With --data, when the journal is synced to the disk: after every
+        /// record, before anyone hears of it, or only at checkpoints (the
+        /// default; the process dying loses nothing, a power failure can).
+        #[arg(long, value_enum, value_name = "WHEN", requires = "data")]
+        fsync: Option<FsyncArg>,
         /// Require a bearer token on every request. The file is a JSON
-        /// object: {"<token>": {"name": "alice", "role": "editor"|"viewer"}}.
+        /// object: {"<token>": {"name": "alice", "role": "editor"|"viewer"}};
+        /// a grant may add "documents": ["contract.docx", "deck-*.pptx",
+        /// {"document": "notes.docx", "role": "viewer"}] to limit the token
+        /// to those names (globs; the first match decides the role).
+        /// The file is the only source of tokens: it is read again on SIGHUP
+        /// and whenever it changes, and sockets whose token was withdrawn
+        /// are closed. A file that does not parse leaves the tokens as they
+        /// were.
         #[arg(long, value_name = "FILE")]
         tokens: Option<PathBuf>,
+        /// With --tokens, look for changes to the file this often; 0 leaves
+        /// only SIGHUP.
+        #[arg(long, value_name = "SECONDS", default_value_t = 1, requires = "tokens")]
+        tokens_poll: u64,
+        /// The largest presence state a connection may share, in bytes of
+        /// JSON (default 16384).
+        #[arg(long, value_name = "BYTES")]
+        presence_max_bytes: Option<usize>,
+        /// Presence updates a connection may send at once (default 40);
+        /// more are dropped and the sender gets `presence_rejected`.
+        #[arg(long, value_name = "N")]
+        presence_burst: Option<u32>,
+        /// Presence updates per second a connection may keep sending after
+        /// that (default 20).
+        #[arg(long, value_name = "N")]
+        presence_per_second: Option<u32>,
         files: Vec<PathBuf>,
     },
     /// Print a document's current content as JSON.
@@ -63,6 +97,12 @@ enum Cli {
         url: String,
         edits: String,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum FsyncArg {
+    Every,
+    Checkpoint,
 }
 
 fn format_of(url: &str) -> Result<Format, String> {
@@ -258,7 +298,11 @@ struct ServeOptions {
     save: bool,
     data: Option<PathBuf>,
     checkpoint_every: Option<u64>,
+    keep_tail: Option<usize>,
+    fsync: Option<FsyncArg>,
     tokens: Option<PathBuf>,
+    tokens_poll: u64,
+    presence: PresenceLimits,
     files: Vec<PathBuf>,
 }
 
@@ -268,7 +312,11 @@ async fn serve(options: ServeOptions) -> Result<(), String> {
         save,
         data,
         checkpoint_every,
+        keep_tail,
+        fsync,
         tokens,
+        tokens_poll,
+        presence,
         files,
     } = options;
     // Bound first, so `--addr host:0` works and the URLs printed are real.
@@ -282,6 +330,13 @@ async fn serve(options: ServeOptions) -> Result<(), String> {
             if let Some(n) = checkpoint_every {
                 storage.checkpoint_every = n.max(1);
             }
+            if let Some(n) = keep_tail {
+                storage.keep_tail = n;
+            }
+            storage.sync = match fsync {
+                Some(FsyncArg::Every) => Fsync::EveryRecord,
+                Some(FsyncArg::Checkpoint) | None => Fsync::Checkpoints,
+            };
             let server = Server::with_storage_options(dir, storage).map_err(|e| e.to_string())?;
             for (name, _) in server.documents() {
                 println!("serving ws://{addr}/documents/{name}/ws (stored)");
@@ -290,10 +345,17 @@ async fn serve(options: ServeOptions) -> Result<(), String> {
         }
         None => Server::new(),
     };
-    let server = match tokens {
-        Some(path) => server.with_tokens(Tokens::load(&path).map_err(|e| e.to_string())?),
+    let server = server.with_presence_limits(presence);
+    let server = match &tokens {
+        Some(path) => server.with_tokens(Tokens::load(path).map_err(|e| e.to_string())?),
         None => server,
     };
+    if let Some(path) = tokens {
+        if tokens_poll > 0 {
+            server.watch_tokens(path.clone(), Duration::from_secs(tokens_poll));
+        }
+        reload_on_hangup(server.clone(), path).map_err(|e| e.to_string())?;
+    }
     let stored: Vec<String> = server.documents().into_iter().map(|(n, _)| n).collect();
     let mut named = Vec::new();
     for path in files {
@@ -327,6 +389,27 @@ async fn serve(options: ServeOptions) -> Result<(), String> {
     Ok(())
 }
 
+/// Reads the tokens file again whenever the process gets SIGHUP.
+#[cfg(unix)]
+fn reload_on_hangup(server: Server, path: PathBuf) -> std::io::Result<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut hangups = signal(SignalKind::hangup())?;
+    tokio::spawn(async move {
+        while hangups.recv().await.is_some() {
+            match server.reload_tokens(&path) {
+                Ok(()) => eprintln!("took new tokens from {}", path.display()),
+                Err(error) => eprintln!("kept the tokens in force: {error}"),
+            }
+        }
+    });
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn reload_on_hangup(_: Server, _: PathBuf) -> std::io::Result<()> {
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let result = match Cli::parse() {
@@ -335,15 +418,31 @@ async fn main() -> ExitCode {
             save,
             data,
             checkpoint_every,
+            keep_tail,
+            fsync,
             tokens,
+            tokens_poll,
+            presence_max_bytes,
+            presence_burst,
+            presence_per_second,
             files,
         } => {
+            let defaults = PresenceLimits::default();
+            let presence = PresenceLimits {
+                max_bytes: presence_max_bytes.unwrap_or(defaults.max_bytes),
+                burst: presence_burst.unwrap_or(defaults.burst),
+                per_second: presence_per_second.unwrap_or(defaults.per_second),
+            };
             serve(ServeOptions {
                 addr,
                 save,
                 data,
                 checkpoint_every,
+                keep_tail,
+                fsync,
                 tokens,
+                tokens_poll,
+                presence,
                 files,
             })
             .await

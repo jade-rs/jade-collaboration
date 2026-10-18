@@ -5,7 +5,7 @@
 
 use std::collections::VecDeque;
 
-use crate::protocol::{Downstream, Submission};
+use crate::protocol::{Committed, Downstream, Submission};
 use crate::{
     Checkpoint, Document, Lane, Materializer, NoMaterializer, Record, Rejection, Replica,
     Sequencer, SubmitOutcome, SyncError,
@@ -102,10 +102,17 @@ impl<D: Document, M: Materializer<D>> Simulation<D, M> {
     /// Checkpoints and compacts the server, as a durable server does every
     /// so often; the journal starts over.
     pub fn checkpoint(&mut self) -> Checkpoint<D> {
+        self.checkpoint_keeping(0).0
+    }
+
+    /// Like [`Simulation::checkpoint`], but the server keeps the last `keep`
+    /// committed operations, which are returned with the checkpoint (a
+    /// durable server stores them with it).
+    pub fn checkpoint_keeping(&mut self, keep: usize) -> (Checkpoint<D>, Vec<Committed<D::Op>>) {
         let checkpoint = self.server.checkpoint();
-        self.server.compact();
+        self.server.compact_keeping(keep);
         self.journal.clear();
-        checkpoint
+        (checkpoint, self.server.log().to_vec())
     }
 
     /// Every connection drops and comes back: messages in flight are lost,
