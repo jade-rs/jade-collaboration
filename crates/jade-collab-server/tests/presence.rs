@@ -184,7 +184,16 @@ fn type_at_end(client: &Client<DocxModel>, text: &str) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_presence_flood_does_not_disturb_the_operation_stream() {
-    let (server, url) = start(Server::new().with_presence_limits(PresenceLimits::UNLIMITED)).await;
+    // Unlimited presence, so the flood (2000 updates) may all wait for a
+    // slow reader at once on a loaded machine: the outgoing queue holds it,
+    // since dropping slow readers is not what this test is about
+    // (backpressure.rs is).
+    let (server, url) = start(
+        Server::new()
+            .with_presence_limits(PresenceLimits::UNLIMITED)
+            .with_outgoing_limit(8192),
+    )
+    .await;
     let flooder: Client<DocxModel> = Client::connect(&url, None).await.unwrap();
     let a: Client<DocxModel> = Client::connect(&url, None).await.unwrap();
     let b: Client<DocxModel> = Client::connect(&url, None).await.unwrap();
