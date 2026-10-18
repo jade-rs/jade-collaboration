@@ -186,8 +186,6 @@ pub enum IntentError {
     NoSuchTable(usize),
     #[error("cell ({row}, {column}) is outside the table or starts no merge")]
     NoSuchCell { row: usize, column: usize },
-    #[error("paragraph {0} is in a text box, whose paragraphs cannot be split or joined")]
-    FixedParagraphs(usize),
 }
 
 /// A headless command with no collaborative intent form.
@@ -586,9 +584,6 @@ pub fn resolve(
             count,
         } => {
             let at = caret(&paragraphs, *paragraph, *offset)?;
-            if matches!(at.story, StoryId::TextBox { .. }) {
-                return Err(IntentError::FixedParagraphs(*paragraph));
-            }
             let mut parent = at.parent;
             Ok((0..*count)
                 .map(|_| {

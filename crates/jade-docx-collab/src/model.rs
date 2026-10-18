@@ -575,8 +575,7 @@ pub enum DocxOp {
     },
     /// Convergent. Deletes characters (never marks or anchors); idempotent.
     DeleteText { story: StoryId, ids: Vec<Id> },
-    /// Convergent. Inserts a paragraph mark after `parent`. Refused in a
-    /// text box, whose paragraphs are fixed.
+    /// Convergent. Inserts a paragraph mark after `parent`.
     SplitParagraph {
         story: StoryId,
         parent: Option<Id>,
@@ -584,7 +583,7 @@ pub enum DocxOp {
     },
     /// Sequenced. Deletes `mark`, joining its paragraph with the next one.
     /// Refused while a table, or a text box or footnote the paragraph
-    /// places, follows the paragraph, and in a text box.
+    /// places, follows the paragraph.
     JoinParagraph { story: StoryId, mark: Id },
     /// Sequenced. A new empty table in the body.
     InsertTable {
@@ -857,17 +856,6 @@ struct Located {
 
 fn reject(message: impl Into<String>) -> Rejection {
     Rejection::new(message)
-}
-
-/// jade does not write a text box's new or removed paragraphs to the file
-/// (it keeps them in memory only), so a text box's paragraphs are fixed.
-fn fixed_paragraphs(story: StoryId) -> Result<(), Rejection> {
-    match story {
-        StoryId::TextBox { .. } => Err(reject(
-            "a text box's paragraphs cannot be split or joined: jade does not write them to the file",
-        )),
-        _ => Ok(()),
-    }
 }
 
 /// Refuses comment text jade would not read back from the file as written:
@@ -1369,7 +1357,6 @@ impl DocxModel {
         id: Id,
     ) -> Result<Vec<DocxEffect>, Rejection> {
         self.editable_story(story)?;
-        fixed_paragraphs(story)?;
         self.story_mut(story)
             .expect("checked")
             .flow
@@ -1387,7 +1374,6 @@ impl DocxModel {
     }
 
     fn join(&mut self, story_id: StoryId, mark: Id) -> Result<Vec<DocxEffect>, Rejection> {
-        fixed_paragraphs(story_id)?;
         let story = self.editable_story(story_id)?;
         match story.flow.get(mark) {
             Some(node) if node.value == Atom::Mark && !node.deleted => {}

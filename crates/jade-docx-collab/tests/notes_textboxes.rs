@@ -28,15 +28,6 @@ fn ctx() -> ApplyContext {
     }
 }
 
-fn fresh(replica: u64) -> impl FnMut(u64) -> Id {
-    let mut next = 1_000_000u64;
-    move |n| {
-        let id = Id::new(next, ReplicaId(replica));
-        next += n;
-        id
-    }
-}
-
 /// Resolves `intent` against `model` and commits the operations it makes.
 fn edit(model: &mut DocxModel, jade: &mut JadeDocx, intent: IntentOp) -> Vec<DocxOp> {
     let mut next = model.max_lamport() + 1;

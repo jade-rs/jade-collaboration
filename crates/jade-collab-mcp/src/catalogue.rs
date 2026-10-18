@@ -21,7 +21,7 @@ in its order: the body's paragraphs with table cells row by row, each text box's
 after the paragraph that anchors it, each footnote's after the paragraph that first references it, \
 then the other footnotes and the endnotes; each paragraph says which story it belongs to. `offset` \
 is a UTF-8 byte offset on a character boundary; text boxes and note references take no text \
-(a paragraph lists where they sit), a text box's paragraphs cannot be split or joined. xlsx cells use A1 references, 1-based rows and column letters. Indices shift \
+(a paragraph lists where they sit). xlsx cells use A1 references, 1-based rows and column letters. Indices shift \
 as the document changes, so read before editing; the edits of one call are resolved in order, \
 each against the view the previous ones left.
 
