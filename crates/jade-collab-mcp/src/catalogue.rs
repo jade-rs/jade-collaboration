@@ -262,6 +262,17 @@ fn edits() -> Value {
                 edit("delete_endnote", "docx: delete an endnote and every reference to it.", json!({
                     "endnote_id": string("The endnote's number (`note` in read_document's anchors and stories)."),
                 }), &["endnote_id"]),
+                edit("insert_text_box", "docx: add a text box (a rectangle holding one paragraph) at a caret of a body paragraph or table cell where no text box or note reference sits; its paragraphs are listed right after the one that anchors it.", json!({
+                    "paragraph": paragraph(),
+                    "offset": offset(),
+                    "text": string("The box's text (no line breaks); default empty."),
+                    "width_px": integer("Width in pixels; default 216."),
+                    "height_px": integer("Height in pixels; default 96."),
+                }), &["paragraph", "offset"]),
+                edit("delete_text_box", "docx: delete a text box with its content and the comments in it.", json!({
+                    "paragraph": integer("The paragraph that anchors it."),
+                    "text_box": integer("Which of that paragraph's text boxes (`text_box` in its anchors), zero-based."),
+                }), &["paragraph", "text_box"]),
                 edit("merge_table_cells", "docx: merge a rectangle of a top-level table's cells; the top-left cell shows their content, row by row.", json!({
                     "table": integer("The table's index (read_document lists them)."),
                     "top_row": integer("First row, zero-based."),

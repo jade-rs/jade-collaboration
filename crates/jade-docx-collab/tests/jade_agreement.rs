@@ -255,9 +255,25 @@ proptest! {
             };
             let Some(op) = generate(&model, choice, &mut ids) else { continue };
             let ctx = ApplyContext { origin: ReplicaId(1), base_seq: 0, seq: Some(step as u64 + 1) };
-            // As the sequencer does: jade may refuse a sequenced op first.
-            if DocxModel::lane(&op) == Lane::Sequenced && jade.admit(&model, &op).is_err() {
-                continue;
+            // As the sequencer does: jade may refuse a sequenced op first —
+            // but never a note or text box the model accepts: the model
+            // refuses everywhere jade cannot put one, on every replica.
+            if DocxModel::lane(&op) == Lane::Sequenced {
+                if let Err(refusal) = jade.admit(&model, &op) {
+                    let structural = matches!(
+                        op,
+                        DocxOp::InsertNote { .. }
+                            | DocxOp::DeleteNote { .. }
+                            | DocxOp::InsertTextBox { .. }
+                            | DocxOp::DeleteTextBox { .. }
+                            | DocxOp::UpdateComment { .. }
+                    );
+                    prop_assert!(
+                        !structural || model.clone().apply(&op, &ctx).is_err(),
+                        "{} refused {:?} the model accepts: {}", name, op, refusal
+                    );
+                    continue;
+                }
             }
             let before = model.clone();
             let formatting = matches!(op, DocxOp::Format { .. });

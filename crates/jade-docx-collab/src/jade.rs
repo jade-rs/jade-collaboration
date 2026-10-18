@@ -12,7 +12,9 @@ use jade_docx_document_core::word_document::{
     DocxExportError, ParagraphAnchorKind, ParagraphStory, WordDocument,
 };
 use jade_docx_document_core::Options;
-use jade_docx_headless_api::{HeadlessCommand, HeadlessEditRequest, HeadlessTableCellSelection};
+use jade_docx_headless_api::{
+    HeadlessCommand, HeadlessEditRequest, HeadlessShapeKind, HeadlessTableCellSelection,
+};
 
 use crate::model::{DocxEffect, DocxModel, DocxOp, FormatChange, NoteKind, Numbered, StoryId};
 
@@ -711,6 +713,34 @@ impl JadeDocx {
                     Ok(())
                 };
             }
+            DocxEffect::InsertTextBox {
+                paragraph,
+                offset,
+                anchors,
+                text,
+                width_px,
+                height_px,
+            } => {
+                let s = self.surface(&paragraph)?;
+                HeadlessCommand::InsertShape {
+                    paragraph: s,
+                    offset: self.rendered_after(s, offset, anchors)?,
+                    shape: HeadlessShapeKind::Rectangle,
+                    width_px: f64::from(width_px),
+                    height_px: f64::from(height_px),
+                    fill_color: None,
+                    border_color: Some("000000".to_string()),
+                    border_width_px: 1.0,
+                    text,
+                }
+            }
+            DocxEffect::DeleteTextBox {
+                paragraph,
+                text_box,
+            } => HeadlessCommand::DeleteTextBox {
+                paragraph: self.surface(&paragraph)?,
+                text_box,
+            },
             DocxEffect::Numbered { item, file_id } => {
                 // jade numbered it when it was made; on a replayed log it
                 // must have given the same number again.
@@ -759,6 +789,8 @@ impl Materializer<DocxModel> for JadeDocx {
                 | DocxOp::UpdateComment { .. }
                 | DocxOp::InsertNote { .. }
                 | DocxOp::DeleteNote { .. }
+                | DocxOp::InsertTextBox { .. }
+                | DocxOp::DeleteTextBox { .. }
         ) {
             return self.preflight(model, op);
         }

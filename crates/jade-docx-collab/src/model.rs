@@ -425,6 +425,9 @@ pub enum FormatChange {
     },
 }
 
+/// The sizes a new text box may have, in pixels.
+const TEXT_BOX_PX: std::ops::RangeInclusive<u32> = 1..=10_000;
+
 /// Word's limits: 1pt to 1638pt.
 const FONT_HALF_POINTS: std::ops::RangeInclusive<u32> = 2..=3276;
 
@@ -665,6 +668,23 @@ pub enum DocxOp {
     /// Sequenced. Deletes a footnote or endnote: every reference to it and
     /// its story.
     DeleteNote { kind: NoteKind, note: Id },
+    /// Sequenced. A new text box, as jade's `insert_shape` draws a
+    /// rectangle holding one paragraph: its anchor atom `id` is placed after
+    /// `parent` in `story` (the body or a table cell) and the box is a new
+    /// story keyed by `id` holding `text`, its characters `id.offset(1)`, ….
+    /// Refused where a note would be.
+    InsertTextBox {
+        story: StoryId,
+        parent: Option<Id>,
+        id: Id,
+        #[serde(default)]
+        text: String,
+        width_px: u32,
+        height_px: u32,
+    },
+    /// Sequenced. Deletes a text box placed in a body paragraph or a table
+    /// cell, with its content and the comments in it.
+    DeleteTextBox { text_box: Id },
     /// Sequenced, derived: the number (`w:id`) jade gave a comment or note
     /// made in the session. Only the server commits these, right after the
     /// operation that made it.
@@ -810,6 +830,21 @@ pub enum DocxEffect {
     DeleteNote {
         kind: NoteKind,
         note: Id,
+    },
+    /// A new text box at `offset` of `paragraph`, after `anchors` of its
+    /// text boxes and note references (none sits at the offset).
+    InsertTextBox {
+        paragraph: ParagraphStory,
+        offset: usize,
+        anchors: usize,
+        text: String,
+        width_px: u32,
+        height_px: u32,
+    },
+    /// Deletes the `text_box`-th text box (in run order) of `paragraph`.
+    DeleteTextBox {
+        paragraph: ParagraphStory,
+        text_box: usize,
     },
     /// jade gave `item` the number `file_id` (already done in jade).
     Numbered {
@@ -2031,39 +2066,33 @@ impl DocxModel {
             .chain(self.endnotes.values_mut().map(|n| &mut n.story.flow))
     }
 
-    fn insert_note(
+    /// Places a new anchor `id` (a note reference or a text box) after
+    /// `parent` in `story` — a body or table-cell story, where jade inserts
+    /// them — and says where jade finds it: (paragraph, offset, anchors of
+    /// the paragraph before it). Changes nothing when it refuses.
+    fn place_anchor(
         &mut self,
-        kind: NoteKind,
         story: StoryId,
         parent: Option<Id>,
         id: Id,
-        text: &str,
-    ) -> Result<Vec<DocxEffect>, Rejection> {
+        placement: Placement,
+    ) -> Result<(ParagraphStory, usize, usize), Rejection> {
         if !matches!(
             story,
             StoryId::Body | StoryId::Cell { .. } | StoryId::Split { .. }
         ) {
             return Err(reject(
-                "jade puts footnotes and endnotes in body paragraphs and table cells only",
+                "jade puts notes and text boxes in body paragraphs and table cells only",
             ));
-        }
-        if text.chars().any(|c| c.is_control() && c != '\t') {
-            return Err(reject(
-                "a note's text cannot hold line breaks or control characters",
-            ));
-        }
-        if self.footnotes.contains_key(&id) || self.endnotes.contains_key(&id) {
-            return Err(reject(format!("note {id} already exists")));
         }
         let host = self.editable_story(story)?;
         let mut flow = host.flow.clone();
-        let placement = kind.placement(id);
         flow.insert(id, parent, Atom::Anchor(placement))?;
-        // jade puts a new reference before the anchors already at its
-        // offset and types only before or after all of them: text typed at
-        // this caret concurrently could land between the new reference and
-        // an old one, which jade cannot write. So no other anchor may sit
-        // right next to it.
+        // jade puts a new anchor before the ones already at its offset and
+        // types only before or after all of them: text typed at this caret
+        // concurrently could land between the new anchor and an old one,
+        // which jade cannot write. So no other anchor may sit right next
+        // to it.
         let index = flow.visible_index(id).expect("just inserted");
         let neighbours = [
             index.checked_sub(1).and_then(|i| flow.visible_id_at(i)),
@@ -2077,7 +2106,7 @@ impl DocxModel {
         };
         if neighbours.into_iter().any(anchor) {
             return Err(reject(
-                "a note cannot go where a text box or note reference already sits",
+                "a note or text box cannot go where a text box or note reference already sits",
             ));
         }
         let host = std::mem::replace(&mut self.story_mut(story).expect("checked").flow, flow);
@@ -2085,19 +2114,55 @@ impl DocxModel {
             let at = p.anchors.iter().position(|a| a.id == id)?;
             Some((p.at.clone(), p.anchors[at].offset, at))
         });
-        let Some((paragraph, offset, anchors)) = located else {
+        located.ok_or_else(|| {
             self.story_mut(story).expect("checked").flow = host;
-            return Err(reject("the note's paragraph is gone"));
-        };
-        let mut note = Story::empty_paragraph();
-        let initial: Vec<Atom> = std::iter::once('\t')
-            .chain(text.chars())
-            .map(Atom::Char)
-            .collect();
-        let count = initial.len() as u64;
-        note.flow
-            .insert_run(id.offset(1), None, initial)
-            .expect("a new story takes any ids");
+            reject("the paragraph is gone")
+        })
+    }
+
+    /// Refuses text for a new note or text box that jade would not keep.
+    fn new_story_text(text: &str) -> Result<(), Rejection> {
+        if text.chars().any(|c| c.is_control() && c != '\t') {
+            return Err(reject(
+                "a new note's or text box's text cannot hold line breaks or control characters",
+            ));
+        }
+        Ok(())
+    }
+
+    /// A one-paragraph story holding `text`, its characters `first`,
+    /// `first.offset(1)`, ….
+    fn new_story(first: Id, text: impl IntoIterator<Item = char>) -> (Story, u64) {
+        let mut story = Story::empty_paragraph();
+        let atoms: Vec<Atom> = text.into_iter().map(Atom::Char).collect();
+        let count = atoms.len() as u64;
+        if count > 0 {
+            story
+                .flow
+                .insert_run(first, None, atoms)
+                .expect("a new story takes any ids");
+        }
+        (story, count)
+    }
+
+    fn insert_note(
+        &mut self,
+        kind: NoteKind,
+        story: StoryId,
+        parent: Option<Id>,
+        id: Id,
+        text: &str,
+    ) -> Result<Vec<DocxEffect>, Rejection> {
+        Self::new_story_text(text)?;
+        if self.footnotes.contains_key(&id) || self.endnotes.contains_key(&id) {
+            return Err(reject(format!("note {id} already exists")));
+        }
+        let (paragraph, offset, anchors) =
+            self.place_anchor(story, parent, id, kind.placement(id))?;
+        // What jade writes into a new note: a tab after the number, then
+        // the text.
+        let (note, count) =
+            Self::new_story(id.offset(1), std::iter::once('\t').chain(text.chars()));
         self.notes_mut(kind).insert(
             id,
             Note {
@@ -2114,6 +2179,72 @@ impl DocxModel {
             offset,
             anchors,
             text: text.to_string(),
+        }])
+    }
+
+    fn insert_text_box(
+        &mut self,
+        story: StoryId,
+        parent: Option<Id>,
+        id: Id,
+        text: &str,
+        (width_px, height_px): (u32, u32),
+    ) -> Result<Vec<DocxEffect>, Rejection> {
+        Self::new_story_text(text)?;
+        if !(TEXT_BOX_PX.contains(&width_px) && TEXT_BOX_PX.contains(&height_px)) {
+            return Err(reject(format!(
+                "a text box is {TEXT_BOX_PX:?} pixels wide and high"
+            )));
+        }
+        if self.text_boxes.contains_key(&id) {
+            return Err(reject(format!("text box {id} already exists")));
+        }
+        let (paragraph, offset, anchors) =
+            self.place_anchor(story, parent, id, Placement::TextBox(id))?;
+        let (text_box, count) = Self::new_story(id.offset(1), text.chars());
+        self.text_boxes.insert(id, text_box);
+        self.observe([id.offset(count)]);
+        Ok(vec![DocxEffect::InsertTextBox {
+            paragraph,
+            offset,
+            anchors,
+            text: text.to_string(),
+            width_px,
+            height_px,
+        }])
+    }
+
+    /// Deletes a text box anchored in a body or table-cell paragraph: its
+    /// anchor goes, and with it the box's story and the comments in it.
+    fn delete_text_box(&mut self, text_box: Id) -> Result<Vec<DocxEffect>, Rejection> {
+        let story = StoryId::TextBox { id: text_box };
+        let found = self.paragraphs().into_iter().find_map(|p| {
+            let anchor = p.anchors.iter().find(|a| a.story == story)?;
+            let index = p
+                .anchors
+                .iter()
+                .filter(|a| matches!(a.story, StoryId::TextBox { .. }))
+                .position(|a| a.id == anchor.id)?;
+            Some((p.story, p.at.clone(), anchor.id, index))
+        });
+        let Some((host, paragraph, anchor, index)) = found else {
+            return Err(reject(format!(
+                "text box {text_box} is not in the document"
+            )));
+        };
+        if !matches!(
+            host,
+            StoryId::Body | StoryId::Cell { .. } | StoryId::Split { .. }
+        ) {
+            return Err(reject(
+                "only text boxes in body paragraphs and table cells can be deleted",
+            ));
+        }
+        self.story_mut(host).expect("walked").flow.delete(anchor)?;
+        self.drop_comments_in_removed_cells();
+        Ok(vec![DocxEffect::DeleteTextBox {
+            paragraph,
+            text_box: index,
         }])
     }
 
@@ -2189,6 +2320,8 @@ impl Document for DocxModel {
             | DocxOp::UpdateComment { .. }
             | DocxOp::InsertNote { .. }
             | DocxOp::DeleteNote { .. }
+            | DocxOp::InsertTextBox { .. }
+            | DocxOp::DeleteTextBox { .. }
             | DocxOp::Numbered { .. } => Lane::Sequenced,
         }
     }
@@ -2262,6 +2395,15 @@ impl Document for DocxModel {
                 text,
             } => self.insert_note(*kind, *story, *parent, *id, text),
             DocxOp::DeleteNote { kind, note } => self.delete_note(*kind, *note),
+            DocxOp::InsertTextBox {
+                story,
+                parent,
+                id,
+                text,
+                width_px,
+                height_px,
+            } => self.insert_text_box(*story, *parent, *id, text, (*width_px, *height_px)),
+            DocxOp::DeleteTextBox { text_box } => self.delete_text_box(*text_box),
             DocxOp::Numbered { item, file_id } => self.numbered(*item, file_id, ctx),
         }
     }

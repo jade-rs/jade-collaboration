@@ -145,6 +145,28 @@ pub enum IntentOp {
     DeleteEndnote {
         endnote_id: String,
     },
+    /// A new text box (a rectangle holding one paragraph of `text`) at a
+    /// caret of a body paragraph or table cell where no text box or note
+    /// reference sits; its paragraphs are listed right after the one that
+    /// anchors it.
+    InsertTextBox {
+        paragraph: usize,
+        offset: usize,
+        #[serde(default)]
+        text: String,
+        /// Default 216.
+        #[serde(default)]
+        width_px: Option<u32>,
+        /// Default 96.
+        #[serde(default)]
+        height_px: Option<u32>,
+    },
+    /// Deletes the `text_box`-th text box (in run order) anchored in
+    /// `paragraph`, with its content.
+    DeleteTextBox {
+        paragraph: usize,
+        text_box: usize,
+    },
     /// Merges the rectangle of a top-level table's cells (zero-based rows and
     /// columns, as `read_document` lists them).
     MergeTableCells {
@@ -182,6 +204,8 @@ pub enum IntentError {
     NoSuchComment(String),
     #[error("no footnote or endnote {0:?}")]
     NoSuchNote(String),
+    #[error("paragraph {paragraph} has no text box {text_box}")]
+    NoSuchTextBox { paragraph: usize, text_box: usize },
     #[error("no top-level table {0}")]
     NoSuchTable(usize),
     #[error("cell ({row}, {column}) is outside the table or starts no merge")]
@@ -446,6 +470,13 @@ impl TryFrom<HeadlessCommand> for IntentOp {
                 Ok(Self::DeleteFootnote { footnote_id })
             }
             HeadlessCommand::DeleteEndnote { endnote_id } => Ok(Self::DeleteEndnote { endnote_id }),
+            HeadlessCommand::DeleteTextBox {
+                paragraph,
+                text_box,
+            } => Ok(Self::DeleteTextBox {
+                paragraph,
+                text_box,
+            }),
             other => Err(UnsupportedCommand {
                 command_name: other.name(),
                 lane,
@@ -830,6 +861,43 @@ pub fn resolve(
                 .note_by_file_id(kind, file_id)
                 .ok_or_else(|| IntentError::NoSuchNote(file_id.clone()))?;
             Ok(vec![DocxOp::DeleteNote { kind, note }])
+        }
+        IntentOp::InsertTextBox {
+            paragraph,
+            offset,
+            text,
+            width_px,
+            height_px,
+        } => {
+            let at = caret(&paragraphs, *paragraph, *offset)?;
+            Ok(vec![DocxOp::InsertTextBox {
+                story: at.story,
+                parent: at.parent,
+                id: ids(1 + text.chars().count() as u64),
+                text: text.clone(),
+                width_px: width_px.unwrap_or(216),
+                height_px: height_px.unwrap_or(96),
+            }])
+        }
+        IntentOp::DeleteTextBox {
+            paragraph,
+            text_box,
+        } => {
+            let missing = IntentError::NoSuchTextBox {
+                paragraph: *paragraph,
+                text_box: *text_box,
+            };
+            let p = paragraphs.get(*paragraph).ok_or(missing.clone())?;
+            let id = p
+                .anchors
+                .iter()
+                .filter_map(|a| match a.story {
+                    StoryId::TextBox { id } => Some(id),
+                    _ => None,
+                })
+                .nth(*text_box)
+                .ok_or(missing)?;
+            Ok(vec![DocxOp::DeleteTextBox { text_box: id }])
         }
         IntentOp::MergeTableCells {
             table,

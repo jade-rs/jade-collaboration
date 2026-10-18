@@ -372,3 +372,25 @@ fn text_box_ops_have_a_wire_format() {
         }
     );
 }
+
+/// A text box after a note reference in its paragraph: jade's shape command
+/// takes a rendered offset, in which the reference counts its mark (found
+/// by the session property test; fixed in jade-core).
+#[test]
+fn a_text_box_goes_after_a_note_reference() {
+    let (mut model, mut jade) = open("footnote.docx");
+    edit(
+        &mut model,
+        &mut jade,
+        IntentOp::InsertFootnote {
+            paragraph: 0,
+            offset: 2,
+            text: String::new(),
+        },
+    );
+    edit(&mut model, &mut jade, insert_text_box(0, 3, "boxed"));
+    let number = model.note_id(model.paragraphs()[2].story).unwrap();
+    assert_eq!(layout(&model, 0), format!("He[{number}]l[box]lo[1]"));
+    let (again, _) = reloaded(&jade);
+    assert_eq!(layouts(&again), layouts(&model));
+}
