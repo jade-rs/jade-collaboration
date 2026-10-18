@@ -686,7 +686,7 @@ impl DocxModel {
             text: String::new(),
             chars: Vec::new(),
         };
-        for node in story.flow.nodes().iter().filter(|n| !n.deleted) {
+        for node in story.flow.iter().filter(|n| !n.deleted) {
             match node.value {
                 Atom::Char(c) => {
                     current.text.push(c);
@@ -1288,15 +1288,15 @@ impl DocxModel {
         if first > last {
             return Err(reject("the range starts after it ends"));
         }
-        let ids: BTreeSet<Id> = flow.nodes()[first..=last]
-            .iter()
+        let ids: BTreeSet<Id> = flow
+            .nodes_in(first..=last)
             .filter(|n| !n.deleted)
             .map(|n| n.id)
             .collect();
         // Only atoms of visible paragraphs (not of a deleted table's cells).
         let located = self.locate(&ids);
-        Ok(flow.nodes()[first..=last]
-            .iter()
+        Ok(flow
+            .nodes_in(first..=last)
             .map(|n| n.id)
             .filter(|id| located.contains_key(id))
             .collect())

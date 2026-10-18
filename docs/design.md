@@ -117,9 +117,12 @@ The specification (`rga::spec`, and `lean/JadeCollab/Rga.lean`) is literally
 that: the state is the *set* of insert operations plus the set of deleted
 identifiers, and the document is a pure function of those sets. Lean proves
 that replicas which received the same operations, in any order and with any
-duplication, render the same document. The production implementation keeps a
-linear array and integrates with the classic RGA skip rule; a property test
-checks it against the specification on random concurrent histories.
+duplication, render the same document. The production implementation keeps
+the document order in chunks of at most 128 atoms with an id → chunk map and
+Fenwick trees of (visible) counts, so lookups, inserts and deletes cost
+O(log n + 128), and integrates with the classic RGA skip rule; property tests
+check it against the specification on random concurrent histories and
+against the original flat-array implementation kept as a reference.
 
 A story's last paragraph has no mark atom (Word's final paragraph mark cannot
 be deleted). Splitting a paragraph inserts a mark: convergent. Joining deletes
