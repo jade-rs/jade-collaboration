@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use jade_collab_server::{Client, Format, Server, StorageOptions};
+use jade_collab_server::{Client, Format, Server, StorageOptions, Tokens};
 use jade_collab_sync::ReplicaEvent;
 use jade_docx_collab::intent::{resolve, IntentOp};
 use jade_docx_collab::DocxModel;
@@ -33,10 +33,17 @@ enum Cli {
         /// With --data, take a checkpoint after this many journal records.
         #[arg(long, value_name = "N", requires = "data")]
         checkpoint_every: Option<u64>,
+        /// Require a bearer token on every request. The file is a JSON
+        /// object: {"<token>": {"name": "alice", "role": "editor"|"viewer"}}.
+        #[arg(long, value_name = "FILE")]
+        tokens: Option<PathBuf>,
         files: Vec<PathBuf>,
     },
     /// Print a document's current content as JSON.
     Show {
+        /// The bearer token, if the server requires one.
+        #[arg(long)]
+        token: Option<String>,
         /// ws://host:port/documents/<name>/ws
         url: String,
     },
@@ -45,7 +52,13 @@ enum Cli {
     /// delete_text, replace_range, insert_paragraph_break.
     /// xlsx: {"type":"set_cell","sheet":"S","reference":"B2","value":{"kind":"number","value":1}},
     /// insert_row, delete_row, insert_column, delete_column.
-    Apply { url: String, edits: String },
+    Apply {
+        /// The bearer token, if the server requires one.
+        #[arg(long)]
+        token: Option<String>,
+        url: String,
+        edits: String,
+    },
 }
 
 fn format_of(url: &str) -> Result<Format, String> {
@@ -120,16 +133,16 @@ fn report<Op: std::fmt::Debug>(events: Vec<ReplicaEvent<Op>>) -> Result<(), Stri
     }
 }
 
-async fn show(url: &str) -> Result<(), String> {
+async fn show(url: &str, token: Option<&str>) -> Result<(), String> {
     let output = match format_of(url)? {
         Format::Docx => docx_json(
-            &Client::<DocxModel>::connect(url)
+            &Client::<DocxModel>::connect(url, token)
                 .await
                 .map_err(|e| e.to_string())?
                 .view(),
         ),
         Format::Xlsx => xlsx_json(
-            &Client::<XlsxModel>::connect(url)
+            &Client::<XlsxModel>::connect(url, token)
                 .await
                 .map_err(|e| e.to_string())?
                 .view(),
@@ -139,10 +152,10 @@ async fn show(url: &str) -> Result<(), String> {
     Ok(())
 }
 
-async fn apply(url: &str, text: &str) -> Result<(), String> {
+async fn apply(url: &str, token: Option<&str>, text: &str) -> Result<(), String> {
     match format_of(url)? {
         Format::Docx => {
-            let client = Client::<DocxModel>::connect(url)
+            let client = Client::<DocxModel>::connect(url, token)
                 .await
                 .map_err(|e| e.to_string())?;
             for edit in edits::<IntentOp>(text)? {
@@ -161,7 +174,7 @@ async fn apply(url: &str, text: &str) -> Result<(), String> {
             );
         }
         Format::Xlsx => {
-            let client = Client::<XlsxModel>::connect(url)
+            let client = Client::<XlsxModel>::connect(url, token)
                 .await
                 .map_err(|e| e.to_string())?;
             for edit in edits::<XlsxIntent>(text)? {
@@ -186,6 +199,7 @@ struct ServeOptions {
     save: bool,
     data: Option<PathBuf>,
     checkpoint_every: Option<u64>,
+    tokens: Option<PathBuf>,
     files: Vec<PathBuf>,
 }
 
@@ -195,6 +209,7 @@ async fn serve(options: ServeOptions) -> Result<(), String> {
         save,
         data,
         checkpoint_every,
+        tokens,
         files,
     } = options;
     let server = match data {
@@ -210,6 +225,10 @@ async fn serve(options: ServeOptions) -> Result<(), String> {
             server
         }
         None => Server::new(),
+    };
+    let server = match tokens {
+        Some(path) => server.with_tokens(Tokens::load(&path).map_err(|e| e.to_string())?),
+        None => server,
     };
     let stored: Vec<String> = server.documents().into_iter().map(|(n, _)| n).collect();
     let mut named = Vec::new();
@@ -251,6 +270,7 @@ async fn main() -> ExitCode {
             save,
             data,
             checkpoint_every,
+            tokens,
             files,
         } => {
             serve(ServeOptions {
@@ -258,12 +278,13 @@ async fn main() -> ExitCode {
                 save,
                 data,
                 checkpoint_every,
+                tokens,
                 files,
             })
             .await
         }
-        Cli::Show { url } => show(&url).await,
-        Cli::Apply { url, edits } => apply(&url, &edits).await,
+        Cli::Show { token, url } => show(&url, token.as_deref()).await,
+        Cli::Apply { token, url, edits } => apply(&url, token.as_deref(), &edits).await,
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

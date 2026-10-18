@@ -260,6 +260,7 @@ proptest! {
         presented in "[a-zA-Z0-9]{0,12}",
         pick in any::<prop::sample::Index>(),
         use_configured in any::<bool>(),
+        tweak in 0..3u8,
         in_query in any::<bool>(),
     ) {
         let json = serde_json::to_string(
@@ -278,8 +279,17 @@ proptest! {
         )
         .unwrap();
         let tokens: Vec<&String> = configured.keys().collect();
+        // A configured token, or one a character longer or shorter.
         let presented = if use_configured && !tokens.is_empty() {
-            pick.get(&tokens).to_string()
+            let mut token = pick.get(&tokens).to_string();
+            match tweak {
+                1 => token.push('x'),
+                2 => {
+                    token.pop();
+                }
+                _ => {}
+            }
+            token
         } else {
             presented
         };

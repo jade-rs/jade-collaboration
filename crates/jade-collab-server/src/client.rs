@@ -11,6 +11,8 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::{header, HeaderValue};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
@@ -56,6 +58,22 @@ fn text(message: &ClientMessage) -> Message {
     )
 }
 
+/// Opens the socket, presenting `token` as a bearer token if there is one.
+async fn open(url: &str, token: Option<&str>) -> Result<Socket, ClientError> {
+    let mut request = url
+        .into_client_request()
+        .map_err(|e| ClientError::Connect(e.to_string()))?;
+    if let Some(token) = token {
+        let value = HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|e| ClientError::Connect(format!("unusable token: {e}")))?;
+        request.headers_mut().insert(header::AUTHORIZATION, value);
+    }
+    let (socket, _) = connect_async(request)
+        .await
+        .map_err(|e| ClientError::Connect(e.to_string()))?;
+    Ok(socket)
+}
+
 async fn next_message(stream: &mut SplitStream<Socket>) -> Result<ServerMessage, ClientError> {
     while let Some(message) = stream.next().await {
         match message.map_err(|e| ClientError::Protocol(e.to_string()))? {
@@ -91,11 +109,11 @@ where
     D: Document + DeserializeOwned + Send + 'static,
     D::Op: Serialize + DeserializeOwned + Send + 'static,
 {
-    /// Joins the document at `url` (`ws://host/documents/{name}/ws`) as a new replica.
-    pub async fn connect(url: &str) -> Result<Self, ClientError> {
-        let (socket, _) = connect_async(url)
-            .await
-            .map_err(|e| ClientError::Connect(e.to_string()))?;
+    /// Joins the document at `url` (`ws://host/documents/{name}/ws`) as a
+    /// new replica. `token` is sent as a bearer token; a server with tokens
+    /// also takes one in the URL (`…/ws?token=…`).
+    pub async fn connect(url: &str, token: Option<&str>) -> Result<Self, ClientError> {
+        let socket = open(url, token).await?;
         let (mut sink, mut stream) = socket.split();
         sink.send(text(&ClientMessage::Join))
             .await
@@ -121,10 +139,12 @@ where
     /// on what it missed and resends what the server never answered. Fails
     /// with [`ClientError::Rejoin`] when the server can no longer resume it;
     /// [`Client::connect`] then joins as a new replica.
-    pub async fn resume(url: &str, mut replica: Replica<D>) -> Result<Self, ClientError> {
-        let (socket, _) = connect_async(url)
-            .await
-            .map_err(|e| ClientError::Connect(e.to_string()))?;
+    pub async fn resume(
+        url: &str,
+        mut replica: Replica<D>,
+        token: Option<&str>,
+    ) -> Result<Self, ClientError> {
+        let socket = open(url, token).await?;
         let (mut sink, mut stream) = socket.split();
         sink.send(text(&ClientMessage::Resume {
             replica: replica.id(),

@@ -6,17 +6,20 @@ use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
+use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc::unbounded_channel, oneshot};
 
+use crate::auth::{authenticate, Grant, Tokens};
 use crate::room::{self, Command, Source};
 use crate::storage::{newest_generation, StorageOptions};
 use crate::wire::{ClientMessage, Format, ServerMessage};
-use jade_collab_sync::SyncError;
+use jade_collab_sync::protocol::Rejected;
+use jade_collab_sync::{Rejection, SyncError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
@@ -54,6 +57,7 @@ struct Storage {
 pub struct Server {
     rooms: Arc<Mutex<BTreeMap<String, RoomHandle>>>,
     storage: Option<Arc<Storage>>,
+    tokens: Option<Arc<Tokens>>,
 }
 
 /// A name that is a single plain file name, so it can name a directory too.
@@ -93,6 +97,7 @@ impl Server {
                 dir: dir.clone(),
                 options,
             })),
+            tokens: None,
         };
         let entries = std::fs::read_dir(&dir).map_err(|e| storage_error(e.to_string()))?;
         for entry in entries {
@@ -120,6 +125,16 @@ impl Server {
             )?;
         }
         Ok(server)
+    }
+
+    /// Requires one of `tokens` on every route and socket from now on.
+    pub fn with_tokens(mut self, tokens: Tokens) -> Self {
+        self.tokens = Some(Arc::new(tokens));
+        self
+    }
+
+    pub(crate) fn tokens(&self) -> Option<&Tokens> {
+        self.tokens.as_deref()
     }
 
     /// Opens `bytes` as the document `name` (its extension picks the format).
@@ -211,12 +226,13 @@ impl Server {
     }
 
     /// `GET /documents`, `GET|PUT /documents/{name}`, and the editing socket
-    /// at `GET /documents/{name}/ws`.
+    /// at `GET /documents/{name}/ws`; all behind the tokens, if any.
     pub fn router(&self) -> Router {
         Router::new()
             .route("/documents", get(list))
             .route("/documents/{name}", get(download).put(upload))
             .route("/documents/{name}/ws", get(socket))
+            .layer(middleware::from_fn_with_state(self.clone(), authenticate))
             .with_state(self.clone())
     }
 
@@ -254,7 +270,15 @@ async fn download(Path(name): Path<String>, State(server): State<Server>) -> Res
     }
 }
 
-async fn upload(Path(name): Path<String>, State(server): State<Server>, body: Bytes) -> Response {
+async fn upload(
+    Path(name): Path<String>,
+    State(server): State<Server>,
+    grant: Option<Extension<Grant>>,
+    body: Bytes,
+) -> Response {
+    if grant.is_some_and(|Extension(grant)| !grant.may_edit()) {
+        return (StatusCode::FORBIDDEN, "viewers cannot upload documents").into_response();
+    }
     let opened = tokio::task::spawn_blocking(move || server.open(&name, body.to_vec())).await;
     match opened {
         Ok(Ok(format)) => (
@@ -270,15 +294,19 @@ async fn upload(Path(name): Path<String>, State(server): State<Server>, body: By
 async fn socket(
     Path(name): Path<String>,
     State(server): State<Server>,
+    grant: Option<Extension<Grant>>,
     upgrade: WebSocketUpgrade,
 ) -> Response {
+    let grant = grant.map(|Extension(grant)| grant);
     match server.commands(&name) {
-        Ok(commands) => upgrade.on_upgrade(move |socket| connection(socket, commands)),
+        Ok(commands) => upgrade.on_upgrade(move |socket| connection(socket, commands, grant)),
         Err(error) => error_response(error),
     }
 }
 
-async fn connection(socket: WebSocket, commands: mpsc::Sender<Command>) {
+/// One socket. `grant` is who it belongs to on a server with tokens.
+async fn connection(socket: WebSocket, commands: mpsc::Sender<Command>, grant: Option<Grant>) {
+    let may_edit = grant.as_ref().is_none_or(Grant::may_edit);
     let (mut sink, mut stream) = socket.split();
     let (outbox, mut outgoing) = unbounded_channel::<String>();
     let writer = tokio::spawn(async move {
@@ -353,6 +381,12 @@ async fn connection(socket: WebSocket, commands: mpsc::Sender<Command>) {
                 }
             }
             ClientMessage::Submit(submission) => match replica {
+                // Answered here: a viewer's operation never reaches the
+                // document, and its replica has nothing of its own in the log.
+                Some(_) if !may_edit => say(ServerMessage::Rejected(Rejected {
+                    client_seq: submission.client_seq,
+                    reason: Rejection::new("this token is read-only (viewer)"),
+                })),
                 Some(replica) => {
                     if commands
                         .send(Command::Submit {
