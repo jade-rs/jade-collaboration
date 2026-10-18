@@ -9,8 +9,9 @@ mod common;
 use std::collections::{BTreeMap, BTreeSet};
 
 use common::{
-    assert_comments_agree, assert_same_order, assert_stories_agree, char_styles, commit, generate,
-    jade_comments, jade_core, open, paragraph_formats, paragraph_snapshot, surface, CharStyle,
+    assert_comments_agree, assert_formatting_agrees, assert_same_order, assert_stories_agree,
+    char_styles, char_styles_in, commit, formatted_char_styles, generate, jade_comments, jade_core,
+    open, paragraph_formats, paragraph_snapshot, shows, surface, CharStyle,
 };
 use jade_collab_core::id::{Id, ReplicaId};
 use jade_collab_sync::{ApplyContext, Document, Lane, Materializer};
@@ -93,7 +94,7 @@ fn hello_round_trips_an_edit_through_export() {
     jade.materialize(&model, effect, &ctx).unwrap();
     assert_agree(&model, &jade, "after the edit");
 
-    let bytes = jade.export().unwrap();
+    let bytes = jade.export(&model).unwrap();
     let reloaded = JadeDocx::load(&bytes).unwrap();
     assert_eq!(reloaded.paragraph_texts(), model.paragraph_texts());
     assert!(model.paragraph_texts()[0].starts_with("Edited: "));
@@ -111,26 +112,6 @@ const EDIT_FIXTURES: &[&str] = &[
     "textbox.docx",
     "floating-wrap-sides.docx",
 ];
-
-/// Whether `style` shows `change` (for the properties jade's queries report).
-fn shows(change: &FormatChange, style: &CharStyle) -> bool {
-    let s = &style.style;
-    match change {
-        FormatChange::Bold { value } => s.bold.unwrap_or(false) == *value,
-        FormatChange::Italic { value } => s.italic.unwrap_or(false) == *value,
-        FormatChange::Underline { value, .. } => s.underline.unwrap_or(false) == *value,
-        // The query reports `w:strike` only, not `w:dstrike`.
-        FormatChange::Strike { value, double } => *double || s.strike.unwrap_or(false) == *value,
-        FormatChange::FontSize { half_points } => s.font_size == Some(*half_points as f32 / 2.0),
-        FormatChange::FontFamily { family } => s.font_family.as_deref() == Some(family.as_str()),
-        FormatChange::FontColor { color } => s.color.as_deref() == Some(color.as_str()),
-        FormatChange::Highlight { color } => style.highlight.as_deref() == Some(color.as_str()),
-        // Clearing restores whatever the style says; only "elsewhere nothing
-        // changed" is checked for it.
-        FormatChange::ClearFormatting => true,
-        FormatChange::Alignment { .. } | FormatChange::ParagraphStyle { .. } => true,
-    }
-}
 
 /// jade after a `Format` op: the change shows on exactly the characters the
 /// model resolved (or on exactly the paragraphs the model touched), and
@@ -269,6 +250,7 @@ proptest! {
                         .unwrap_or_else(|e| panic!("{name}: jade refused {op:?}: {e}"));
                     assert_agree(&model, &jade, &context);
                     assert_comments_agree(&model, &jade, &context);
+                    assert_formatting_agrees(&model, &jade, &context);
                     if let (Some(styles_before), Some(formats_before)) = (styles_before, formats_before) {
                         assert_formatted(
                             &before,
@@ -313,8 +295,20 @@ proptest! {
             }
         }
         // And the file jade writes reads back as the same document, with its
-        // notes and text boxes where the model has them.
-        let reloaded = JadeDocx::load(&jade.export().unwrap()).unwrap();
+        // notes and text boxes where the model has them, and the formatting
+        // the model gives each character.
+        let reloaded = JadeDocx::load(&jade.export(&model).unwrap()).unwrap();
+        let written = char_styles_in(&model, reloaded.word());
+        let formatted = formatted_char_styles(&model, &jade);
+        for (c, style) in &written {
+            for key in common::MARK_KEYS {
+                prop_assert_eq!(
+                    common::attribute(style, key),
+                    common::attribute(&formatted[c], key),
+                    "{:?} of {} in the written file", key, c
+                );
+            }
+        }
         let reloaded_model = DocxModel::from_word_document(reloaded.word()).unwrap();
         assert_same_order(&reloaded_model, &reloaded, &format!("{name} reloaded"));
         assert_same_order(&model, &reloaded, &format!("{name} against the reloaded file"));
@@ -436,7 +430,7 @@ fn table_structure_is_realised_in_jade() {
     assert!(model.paragraph_texts().contains(&"cell".to_string()));
     step(&mut model, &mut jade, DocxOp::DeleteTable { table });
     assert!(model.tables().is_empty());
-    let reloaded = JadeDocx::load(&jade.export().unwrap()).unwrap();
+    let reloaded = JadeDocx::load(&jade.export(&model).unwrap()).unwrap();
     assert_eq!(reloaded.paragraph_texts(), model.paragraph_texts());
 }
 
@@ -585,7 +579,7 @@ fn formatting_lands_on_exactly_the_resolved_characters() {
     );
 
     // Everything survives export.
-    let reloaded = JadeDocx::load(&jade.export().unwrap()).unwrap();
+    let reloaded = JadeDocx::load(&jade.export(&model).unwrap()).unwrap();
     let reloaded_model = DocxModel::from_word_document(reloaded.word()).unwrap();
     assert_eq!(
         marked(&reloaded_model, &reloaded, |s| s.highlight.as_deref()
@@ -712,7 +706,7 @@ fn comments_are_created_answered_resolved_and_deleted_in_jade() {
         ["H"]
     );
 
-    let reloaded = JadeDocx::load(&jade.export().unwrap()).unwrap();
+    let reloaded = JadeDocx::load(&jade.export(&model).unwrap()).unwrap();
     let texts: BTreeSet<String> = jade_comments(&reloaded)
         .into_iter()
         .map(|c| c.text)
@@ -835,4 +829,139 @@ fn anchor_layout(model: &DocxModel) -> Vec<String> {
             out
         })
         .collect()
+}
+
+/// Resolves `op` against `model` and commits every operation it gives.
+fn commit_intent(model: &mut DocxModel, jade: &mut JadeDocx, op: IntentOp, replica: u64) {
+    let mut next = model.max_lamport() + 1;
+    let ops = resolve(model, &op, &mut |n| {
+        let id = Id::new(next, ReplicaId(replica));
+        next += n;
+        id
+    })
+    .unwrap_or_else(|e| panic!("{op:?}: {e}"));
+    for op in ops {
+        commit(model, jade, op);
+    }
+}
+
+/// The characters the written file shows `pick` for.
+fn written(model: &DocxModel, jade: &JadeDocx, pick: impl Fn(&CharStyle) -> bool) -> String {
+    let reloaded = JadeDocx::load(&jade.export(model).unwrap()).unwrap();
+    let styles = char_styles_in(model, reloaded.word());
+    model
+        .paragraphs()
+        .iter()
+        .flat_map(|p| p.text.chars().zip(p.chars.clone()).collect::<Vec<_>>())
+        .filter(|(_, id)| pick(&styles[id]))
+        .map(|(c, _)| c)
+        .collect()
+}
+
+/// Text typed at a mark's edges is formatted as the expand rules say, in the
+/// file jade writes: at the end of bold text it is bold; right before it —
+/// at a paragraph's start, where jade's own typing would take the bold
+/// run's formatting — it is not.
+#[test]
+fn text_typed_at_a_marks_edges_follows_the_expand_rules_in_the_file() {
+    let (mut model, mut jade) = open("jade-core/hello.docx");
+    assert_eq!(model.paragraph_texts()[1], "World");
+    let format = |so, eo, change| IntentOp::Format {
+        start_paragraph: 1,
+        start_offset: so,
+        end_paragraph: 1,
+        end_offset: eo,
+        change,
+    };
+    let type_at = |offset, text: &str| IntentOp::InsertText {
+        paragraph: 1,
+        offset,
+        text: text.into(),
+    };
+    commit_intent(&mut model, &mut jade, format(0, 3, FormatChange::Bold { value: true }), 1);
+    commit_intent(&mut model, &mut jade, type_at(0, "x"), 2);
+    commit_intent(&mut model, &mut jade, type_at(4, "y"), 2);
+    commit_intent(&mut model, &mut jade, type_at(7, "z"), 2);
+    assert_eq!(model.paragraph_texts()[1], "xWoryldz");
+    let bold = |s: &CharStyle| s.style.bold == Some(true);
+    assert_eq!(written(&model, &jade, bold), "Wory");
+    // jade's own document holds no session formatting at all.
+    assert_eq!(marked(&model, &jade, bold), "");
+
+    // A newer "not bold" over part of it, and a clear that also takes the
+    // file's own formatting off.
+    commit_intent(&mut model, &mut jade, format(2, 3, FormatChange::Bold { value: false }), 3);
+    assert_eq!(written(&model, &jade, bold), "Wry");
+    commit_intent(
+        &mut model,
+        &mut jade,
+        format(1, 8, FormatChange::FontSize { half_points: 40 }),
+        3,
+    );
+    commit_intent(&mut model, &mut jade, format(0, 3, FormatChange::ClearFormatting), 4);
+    assert_eq!(written(&model, &jade, bold), "ry");
+    assert_eq!(
+        written(&model, &jade, |s| s.style.font_size == Some(20.0)),
+        "ryldz"
+    );
+}
+
+/// A mark and text typed concurrently at its end reach the server in either
+/// order; the file it writes is the same, and the text is bold.
+#[test]
+fn a_mark_and_concurrent_typing_at_its_end_write_the_same_file_in_either_order() {
+    use jade_collab_sync::sim::Simulation;
+    let mut files = Vec::new();
+    for mark_first in [true, false] {
+        let (model, jade) = open("jade-core/hello.docx");
+        let mut sim = Simulation::with_materializer(model, jade, 2);
+        let view = sim.client(0).view().clone();
+        let bold = resolve(
+            &view,
+            &IntentOp::Format {
+                start_paragraph: 1,
+                start_offset: 0,
+                end_paragraph: 1,
+                end_offset: 3,
+                change: FormatChange::Bold { value: true },
+            },
+            &mut |n| sim.client_mut(0).reserve(n),
+        )
+        .unwrap();
+        let typed = resolve(
+            &view,
+            &IntentOp::InsertText {
+                paragraph: 1,
+                offset: 3,
+                text: "XY".into(),
+            },
+            &mut |n| sim.client_mut(1).reserve(n),
+        )
+        .unwrap();
+        for op in bold {
+            sim.local(0, op).unwrap();
+        }
+        for op in typed {
+            sim.local(1, op).unwrap();
+        }
+        let order = if mark_first { [0, 1] } else { [1, 0] };
+        for client in order {
+            sim.deliver_up(client);
+        }
+        sim.quiesce().unwrap();
+        let server = sim.server();
+        assert!(server.faults().is_empty(), "{:?}", server.faults());
+        for client in 0..2 {
+            assert_eq!(sim.client(client).view(), server.document());
+        }
+        let (model, jade) = (server.document(), server.materializer());
+        assert_formatting_agrees(model, jade, "after the session");
+        assert_eq!(model.paragraph_texts()[1], "WorXYld");
+        assert_eq!(
+            written(model, jade, |s| s.style.bold == Some(true)),
+            "WorXY"
+        );
+        files.push(formatted_char_styles(model, jade));
+    }
+    assert_eq!(files[0], files[1]);
 }

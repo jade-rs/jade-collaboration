@@ -1,14 +1,18 @@
-//! Text edits and formatting interleaved across replicas. A format op names
-//! its range by character ids, so whatever happened to the text before it
-//! committed, it lands on exactly the characters that were in its range at
-//! its log position — on the server's jade document, whatever order the
-//! messages travelled in.
+//! Text edits and formatting interleaved across replicas. Character
+//! formatting is a convergent mark: every replica applies it at once, it
+//! commutes with every concurrent edit, and the server's file ends up
+//! showing, on every character, the formatting the model gives it —
+//! whatever order the messages travelled in. A clear is a mark plus a
+//! sequenced clear of the file's own formatting, which lands on exactly the
+//! characters in its range at its log position.
 
 mod common;
 
 use std::collections::BTreeMap;
 
-use common::{char_styles, generate, open};
+use common::{
+    assert_formatting_agrees, char_styles, formatted_char_styles, generate, open, shows,
+};
 use jade_collab_core::id::Id;
 use jade_collab_sync::sim::Simulation;
 use jade_collab_sync::{ApplyContext, Document};
@@ -36,28 +40,25 @@ fn steps() -> impl Strategy<Value = Vec<Step>> {
     )
 }
 
-const CHANGES: [FormatChange; 5] = [
-    FormatChange::Bold { value: true },
-    FormatChange::Bold { value: false },
-    FormatChange::Italic { value: true },
-    FormatChange::Italic { value: false },
-    FormatChange::ClearFormatting,
-];
-
-/// What a character must look like at the end: known, or left to jade
-/// (text typed next to formatted text takes its neighbour's formatting, as
-/// in Word; clearing restores whatever the style says).
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Expected {
-    bold: Option<bool>,
-    italic: Option<bool>,
+fn changes() -> [FormatChange; 7] {
+    [
+        FormatChange::Bold { value: true },
+        FormatChange::Bold { value: false },
+        FormatChange::Italic { value: true },
+        FormatChange::Italic { value: false },
+        FormatChange::FontSize { half_points: 30 },
+        FormatChange::Highlight {
+            color: "green".into(),
+        },
+        FormatChange::ClearFormatting,
+    ]
 }
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(48))]
 
     #[test]
-    fn formatting_lands_on_the_characters_in_range_at_its_log_position(
+    fn concurrent_formatting_converges_and_the_file_shows_the_model(
         fixture in prop::sample::select(vec!["jade-core/hello.docx", "table-cell-spacing.docx"]),
         steps in steps(),
     ) {
@@ -81,12 +82,13 @@ proptest! {
                     let q = (p + (choice as usize >> 16) % 3).min(paragraphs.len() - 1);
                     let so = (choice as usize >> 24) % (paragraphs[p].len() + 1);
                     let eo = (choice as usize >> 32) % (paragraphs[q].len() + 1);
+                    let changes = changes();
                     let intent = IntentOp::Format {
                         start_paragraph: p,
                         start_offset: so,
                         end_paragraph: q,
                         end_offset: eo,
-                        change: CHANGES[choice as usize % CHANGES.len()].clone(),
+                        change: changes[choice as usize % changes.len()].clone(),
                     };
                     // Offsets off a character boundary or ranges ending
                     // before they start are simply not made.
@@ -103,29 +105,33 @@ proptest! {
                     sim.deliver_down(client).unwrap();
                 }
             }
+            for client in 0..3 {
+                prop_assert_eq!(sim.client(client).view(), &sim.client(client).rebuilt_view());
+            }
         }
         sim.quiesce().unwrap();
         let server = sim.server();
         prop_assert!(server.faults().is_empty(), "materialization faults: {:?}", server.faults());
+        for client in 0..3 {
+            prop_assert_eq!(sim.client(client).view(), server.document());
+            prop_assert_eq!(
+                sim.client(client).view().character_formats(),
+                server.document().character_formats()
+            );
+        }
+        // The file shows the model's formatting.
+        assert_formatting_agrees(server.document(), server.materializer(), "after the session");
 
-        // Replay the log, resolving every format op where it committed.
+        // The sequenced clears land on exactly the characters in their range
+        // at their log position: replaying the log, a character the file
+        // formatted bold that no clear reached and no mark covers is still
+        // bold.
         let mut replay = model;
-        let mut expected: BTreeMap<Id, Expected> = initial
-            .iter()
-            .map(|(id, s)| (*id, Expected {
-                bold: Some(s.style.bold.unwrap_or(false)),
-                italic: Some(s.style.italic.unwrap_or(false)),
-            }))
-            .collect();
+        let mut cleared: BTreeMap<Id, ()> = BTreeMap::new();
         for committed in server.log() {
-            if let DocxOp::Format { story, start, end, change } = &committed.op {
+            if let DocxOp::Format { story, start, end, change: FormatChange::ClearFormatting } = &committed.op {
                 for c in replay.range_chars(*story, *start, *end).unwrap_or_default() {
-                    let e = expected.entry(c).or_insert(Expected { bold: None, italic: None });
-                    match change {
-                        FormatChange::Bold { value } => e.bold = Some(*value),
-                        FormatChange::Italic { value } => e.italic = Some(*value),
-                        _ => *e = Expected { bold: None, italic: None },
-                    }
+                    cleared.insert(c, ());
                 }
             }
             let ctx = ApplyContext {
@@ -136,18 +142,17 @@ proptest! {
             replay.apply(&committed.op, &ctx).expect("a committed op replays");
         }
         prop_assert_eq!(&replay, server.document());
-
-        let actual = char_styles(server.document(), server.materializer());
-        for (c, style) in &actual {
-            // Characters typed after the last format that covered them (or
-            // never covered) follow Word's typing rules, not the model's.
-            let Some(e) = expected.get(c) else { continue };
-            if let Some(bold) = e.bold {
-                prop_assert_eq!(style.style.bold.unwrap_or(false), bold, "bold of {}", c);
+        let formats = server.document().character_formats();
+        let actual = formatted_char_styles(server.document(), server.materializer());
+        for (c, before) in &initial {
+            let Some(after) = actual.get(c) else { continue };
+            if cleared.contains_key(c) || formats.contains_key(c) {
+                continue;
             }
-            if let Some(italic) = e.italic {
-                prop_assert_eq!(style.style.italic.unwrap_or(false), italic, "italic of {}", c);
-            }
+            prop_assert!(
+                shows(&FormatChange::Bold { value: before.style.bold.unwrap_or(false) }, after),
+                "bold of {} changed without a mark or a clear", c
+            );
         }
     }
 }
