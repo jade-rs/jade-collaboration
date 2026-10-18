@@ -25,6 +25,13 @@ impl Format {
             None
         }
     }
+
+    /// The format of the document a socket URL
+    /// (`ws://host/documents/{name}/ws`) names.
+    pub fn of_url(url: &str) -> Option<Self> {
+        let _ = url;
+        todo!()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

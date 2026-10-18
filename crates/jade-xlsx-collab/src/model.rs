@@ -299,6 +299,13 @@ impl XlsxModel {
             .get()
     }
 
+    /// The non-blank cells of `sheet` in its current grid, row by row, with
+    /// their A1 references.
+    pub fn filled_cells(&self, sheet: Id) -> Vec<(String, &CellInput)> {
+        let _ = sheet;
+        todo!()
+    }
+
     /// `(sheet, row, column)` ids of `reference` (`B3`) on the sheet named `sheet`.
     pub fn locate(&self, sheet: &str, reference: &str) -> Option<(Id, Id, Id)> {
         let s = self.sheets.iter().find(|s| s.name == sheet)?;
