@@ -366,15 +366,17 @@ impl JadeDocx {
         .map_err(|e| format!("{description}: {e}"))
     }
 
-    /// Runs `command(offset)`, which inserts a text box or note reference at
-    /// a rendered offset, so that it lands `offset` bytes into the paragraph
-    /// at surface `s` after `anchors` of its text boxes and note references.
+    /// Runs `command(offset)` — inserting a text box or note reference, or
+    /// splitting, at a rendered offset — so that it takes effect `offset`
+    /// bytes into the paragraph at surface `s` after `anchors` of its text
+    /// boxes and note references.
     ///
-    /// jade puts a new one before the anchors already at its offset. To put
-    /// it after some of them, the materializer types a placeholder after
-    /// those, inserts right after the placeholder — before the anchors that
-    /// moved on with it — and deletes the placeholder again.
-    fn insert_anchor(
+    /// jade inserts before the anchors already at an offset, and its split
+    /// takes them to the second half. To act after some of them, the
+    /// materializer types a placeholder after those, acts right after the
+    /// placeholder — before the anchors that moved on with it — and deletes
+    /// the placeholder again.
+    fn at_anchors(
         &mut self,
         s: usize,
         offset: usize,
@@ -527,26 +529,16 @@ impl JadeDocx {
                 offset,
                 anchors,
             } => {
-                let s = self.surface(&paragraph)?;
                 // jade's split takes the anchors at the offset along to the
-                // second half; it cannot end the first half with one.
-                let before = self
-                    .word
-                    .paragraph_anchors(s)
-                    .iter()
-                    .filter(|a| a.offset < offset)
-                    .count();
-                if anchors != before {
-                    return Err(format!(
-                        "jade cannot split {paragraph:?} after the text box or note reference \
-                         at offset {offset}: its split takes them to the next paragraph"
-                    ));
-                }
-                HeadlessCommand::InsertParagraphBreak {
-                    paragraph: s,
-                    offset: self.rendered(s, offset),
-                    count: 1,
-                }
+                // second half; a placeholder keeps the ones that stay.
+                let s = self.surface(&paragraph)?;
+                return self.at_anchors(s, offset, anchors, |offset| {
+                    HeadlessCommand::InsertParagraphBreak {
+                        paragraph: s,
+                        offset,
+                        count: 1,
+                    }
+                });
             }
             DocxEffect::JoinParagraph { paragraph, offset } => {
                 return self.join(&paragraph, offset)
@@ -691,7 +683,7 @@ impl JadeDocx {
             } => {
                 let s = self.surface(&paragraph)?;
                 let before = self.note_ids(kind);
-                self.insert_anchor(s, offset, anchors, |offset| match kind {
+                self.at_anchors(s, offset, anchors, |offset| match kind {
                     NoteKind::Footnote => HeadlessCommand::InsertFootnote {
                         paragraph: s,
                         offset,
@@ -764,7 +756,7 @@ impl JadeDocx {
                 height_px,
             } => {
                 let s = self.surface(&paragraph)?;
-                return self.insert_anchor(s, offset, anchors, |offset| {
+                return self.at_anchors(s, offset, anchors, |offset| {
                     HeadlessCommand::InsertShape {
                         paragraph: s,
                         offset,
