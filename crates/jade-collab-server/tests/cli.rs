@@ -276,7 +276,16 @@ fn serve_with_an_audit_log_and_an_outgoing_limit() {
     ]);
     let docx = format!("ws://{addr}/documents/hello.docx/ws");
     run(&["show", &docx]);
-    let text = std::fs::read_to_string(&log).unwrap();
+    // `show` is done once it has the document, which can be before the
+    // server has written the join down.
+    let mut text = String::new();
+    for _ in 0..100 {
+        text = std::fs::read_to_string(&log).unwrap_or_default();
+        if text.contains(r#""event":"joined""#) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
     assert!(text.contains(r#""event":"connected""#), "{text}");
     assert!(text.contains(r#""event":"joined""#), "{text}");
 }
