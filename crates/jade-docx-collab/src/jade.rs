@@ -324,10 +324,6 @@ impl JadeDocx {
             .ok_or_else(|| format!("jade has no paragraph {at:?}"))
     }
 
-    fn text_len(&self, surface: usize) -> usize {
-        self.word.paragraph_text_len_at(surface).unwrap_or(0)
-    }
-
     /// The rendered offset `offset` bytes into the paragraph at `surface`,
     /// after `anchors` of its text boxes and note references (and their
     /// marks). jade must have exactly that many at or before the offset.
@@ -393,9 +389,9 @@ impl JadeDocx {
     ///
     /// jade's own typing goes right after the character before the offset
     /// (before the anchors there), or at a paragraph's start after the
-    /// anchors there. Concurrent edits can order text otherwise around an
-    /// anchor; jade gets that order by a split before the anchors, typing at
-    /// the start of either half and joining the halves again.
+    /// anchors there. Concurrent edits can order text otherwise around the
+    /// anchors at an offset — after them, before them, or between two of
+    /// them; jade's `insert_text_among_anchors` names how many come first.
     fn insert_text(
         &mut self,
         at: &ParagraphStory,
@@ -416,42 +412,18 @@ impl JadeDocx {
             };
             return self.run(command);
         }
-        let in_text_box = matches!(at, ParagraphStory::TextBox { .. });
-        let half = if anchors == before + here && offset > 0 {
-            next_paragraph(at)
-        } else if anchors == 0 && offset == 0 {
-            at.clone()
-        } else {
+        if anchors < before || anchors > before + here {
             return Err(format!(
-                "jade cannot place text between the text boxes and note references at \
-                 offset {offset} of {at:?}"
-            ));
-        };
-        if in_text_box {
-            return Err(format!(
-                "jade cannot place text on that side of a note reference in text box {at:?}"
+                "jade has {before} text boxes or note references before offset {offset} of \
+                 {at:?} and {here} at it; the model has {anchors} before the text"
             ));
         }
-        let saved = self.word.clone();
-        let result = (|| {
-            self.run(HeadlessCommand::InsertParagraphBreak {
-                paragraph: s,
-                offset: self.rendered(s, offset),
-                count: 1,
-            })?;
-            let target = self.surface(&half)?;
-            self.run(HeadlessCommand::InsertText {
-                paragraph: target,
-                offset: self.rendered(target, 0),
-                text,
-            })?;
-            let first = self.surface(at)?;
-            self.join(at, self.text_len(first))
-        })();
-        if result.is_err() {
-            self.word = saved;
-        }
-        result
+        self.run(HeadlessCommand::InsertTextAmongAnchors {
+            paragraph: s,
+            offset: self.rendered(s, offset),
+            after_anchors: anchors - before,
+            text,
+        })
     }
 
     /// Applies one effect to jade.
