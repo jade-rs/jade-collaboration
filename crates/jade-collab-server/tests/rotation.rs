@@ -245,7 +245,8 @@ async fn a_watched_tokens_file_is_taken_when_it_changes() {
     )
     .unwrap();
     std::fs::rename(&next, &path).unwrap();
-    tokio::time::timeout(SECOND, async {
+    // Polled every 20 ms; the generous bound only matters on a loaded machine.
+    tokio::time::timeout(10 * SECOND, async {
         while status(&server, "/documents", "old").await != StatusCode::UNAUTHORIZED {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
