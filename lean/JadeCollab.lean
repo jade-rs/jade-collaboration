@@ -1,4 +1,5 @@
 import JadeCollab.Rga
+import JadeCollab.RgaWalk
 import JadeCollab.Lww
 import JadeCollab.Sequencer
 import JadeCollab.Reconcile
@@ -7,3 +8,4 @@ import JadeCollab.CellCommute
 import JadeCollab.Anchor
 import JadeCollab.Revision
 import JadeCollab.Marks
+import JadeCollab.MarksRga

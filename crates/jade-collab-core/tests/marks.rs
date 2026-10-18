@@ -643,10 +643,12 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
-    /// The RGA facts `Marks.lean` takes as hypotheses (`Extends`, `InGap`):
+    /// The RGA facts the expand rules rest on, on the production `Rga`:
     /// inserting keeps the relative order of the atoms that were there, and
     /// an atom typed after `l` with an id newer than everything lands right
-    /// after `l`.
+    /// after `l`. Lean proves them for the specification's walk
+    /// (`MarksRga.extends_order`, `MarksRga.inGap_order`); this checks the
+    /// chunked implementation agrees.
     #[test]
     fn rga_inserts_keep_the_order_and_typing_lands_right_after_its_parent(
         actions in prop::collection::vec(action(2), 0..60),

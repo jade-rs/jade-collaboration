@@ -348,11 +348,16 @@ these attributes, ends `before` the atom that followed `last` in the
 story's order — or at the story's end — so text typed at the end of
 formatted text takes its formatting, as in Word. A link-like attribute would
 end `after last` instead (`Expand::None` in the core; no docx attribute
-uses it yet). Lean proves the consequences for any concurrent insert: inside
-the range covered, right after the last character covered exactly when the
-attribute expands, right before the first never (`typed_inside`,
-`typed_after_end`, `typed_before_start`), and inserting never changes the
-formatting of existing text (`effective_preserved`). The model refuses a
+uses it yet). Lean proves the consequences for any insert, concurrent with
+the mark or not, whose typist had seen the atoms already typed after the same
+character: inside the range covered, right after the last character covered
+exactly when the attribute expands, right before the first never
+(`typed_inside_rga`, `typed_after_end_rga`, `typed_before_start_rga`), and
+inserting never changes the formatting of existing text
+(`effective_preserved_rga`, with no proviso). The proviso is the RGA's: a
+character typed after `last` by a replica that had not seen a newer
+character typed there lands after that one — after the mark's end, so it is
+not covered (`concurrent_typing_lands_after_unseen_sibling`). The model refuses a
 mark whose anchors it does not have, that covers nothing, that reuses an id
 or carries an invalid value — all decided the same way on every replica.
 
@@ -871,8 +876,14 @@ Tests are written first. Three layers:
    makes that means: inside the range covered, right after the end covered
    iff the attribute expands, right before the start never (`typed_inside`,
    `typed_after_end`, `typed_before_start`, `typed_at_story_start`). The
-   RGA's own part — that inserts keep the relative order of existing atoms —
-   is a hypothesis there, checked by property tests. `marks-oracle` runs the
+   RGA's own part is proved from `Rga.walk` (`RgaWalk.lean`,
+   `MarksRga.lean`) for every state `Rga::insert` can reach (unique ids,
+   parents present and older): a later state keeps the relative order of
+   existing atoms (`extends_order`), and an atom lands right after the atom
+   it was typed after when it is newer than the atoms already typed there
+   (`inGap_order`; `concurrent_typing_lands_after_unseen_sibling` shows the
+   proviso is needed), so the expand rules hold for RGA histories without
+   hypotheses (`typed_after_end_rga`, …). `marks-oracle` runs the
    Lean RGA walk and `effective`; a property test compares it with the Rust
    `Rga` + `MarkSet` on random concurrent histories (same CI job).
    For tracked changes (`Revision.lean`): a model of the per-character
@@ -1104,11 +1115,7 @@ Not yet:
   empty paragraph's mark (Word's paragraph-mark run properties). A jade
   editor client would realise marks the way the server's writer does
   (`JadeDocx::formatted`), not by applying them to its own document.
-  `read_document` (MCP) does not report formatting yet. In Lean the RGA's
-  part of the expand rules — an insert keeps the order of existing atoms
-  and lands right after its parent when its id is the newest — is a
-  hypothesis (`Extends`, `InGap`), checked by a property test rather than
-  proved from `Rga.walk`.
+  `read_document` (MCP) does not report formatting yet.
   Formatting a story's last paragraph while it is empty (it has no atom to
   name it by); comments in notes (jade-core's comment commands edit
   `document.xml` only, and note runs carry no XML binding) and headers.
