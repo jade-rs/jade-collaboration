@@ -132,12 +132,12 @@ fn typing_at_the_end_of_bold_text_is_bold_and_before_it_is_not() {
     let mut model = DocxModel::from_paragraphs(&["hello world", "next"]);
     intent(&mut model, format(0, 6, 0, 11, bold()), 1);
     // At the paragraph's end: the mark ends before the paragraph mark.
-    intent(&mut model, type_at(0, 11, "!"), 2);
+    intent(&mut model, type_at(0, 11, "s"), 2);
     // Right before the bold word.
     intent(&mut model, type_at(0, 6, "_"), 2);
     // Inside it.
     intent(&mut model, type_at(0, 9, "r"), 2);
-    assert_eq!(shown(&model, &bold()), ["hello _WORRLD!", "next"]);
+    assert_eq!(shown(&model, &bold()), ["hello _WORRLDS", "next"]);
 }
 
 #[test]
@@ -172,7 +172,7 @@ fn concurrent_marks_and_typing_commute() {
     let mut b = model.clone();
     let bold_ops = intent(&mut a, format(0, 1, 0, 3, bold()), 1);
     let italic_ops = intent(&mut b, format(0, 2, 0, 5, italic()), 2);
-    let typed = intent(&mut b, type_at(0, 3, "XY"), 2);
+    let typed = intent(&mut b, type_at(0, 3, "xy"), 2);
     for op in italic_ops.iter().chain(&typed) {
         apply(&mut a, op);
     }
@@ -181,7 +181,7 @@ fn concurrent_marks_and_typing_commute() {
     }
     assert_eq!(a, b);
     assert_eq!(a.character_formats(), b.character_formats());
-    // "XY" was typed right after "c": inside the italic range and right at
+    // "xy" was typed right after "c": inside the italic range and right at
     // the end of the bold one, which expands.
     assert_eq!(shown(&a, &bold()), ["aBCXYdef"]);
     assert_eq!(shown(&a, &italic()), ["abCXYDEf"]);
