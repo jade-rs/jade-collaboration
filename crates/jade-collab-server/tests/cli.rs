@@ -260,3 +260,23 @@ fn decks_are_served_and_edited_from_the_command_line() {
     let shown = run(&["show", &deck]);
     assert!(shown.contains("CLI note"), "{shown}");
 }
+
+#[test]
+fn serve_with_an_audit_log_and_an_outgoing_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../jade-core");
+    std::fs::copy(core.join("hello.docx"), dir.path().join("hello.docx")).unwrap();
+    let log = dir.path().join("audit.jsonl");
+    let (_server, addr) = serve(&[
+        "--audit-log".as_ref(),
+        log.as_os_str(),
+        "--outgoing-limit".as_ref(),
+        "64".as_ref(),
+        dir.path().join("hello.docx").as_os_str(),
+    ]);
+    let docx = format!("ws://{addr}/documents/hello.docx/ws");
+    run(&["show", &docx]);
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(text.contains(r#""event":"connected""#), "{text}");
+    assert!(text.contains(r#""event":"joined""#), "{text}");
+}

@@ -6,8 +6,8 @@
 mod common;
 
 use common::{
-    assert_comments_agree, assert_revisions_agree, assert_same_order, assert_stories_agree,
-    context, generate_as, jade_comments, model_marks, open,
+    assert_comments_agree, assert_formatting_agrees, assert_revisions_agree, assert_same_order,
+    assert_stories_agree, context, generate_as, jade_comments, model_marks, open,
 };
 use jade_collab_core::id::ReplicaId;
 use jade_collab_sync::sim::Simulation;
@@ -90,7 +90,8 @@ proptest! {
         assert_stories_agree(server.document(), server.materializer(), "after the session");
         assert_comments_agree(server.document(), server.materializer(), "after the session");
         assert_revisions_agree(server.document(), server.materializer(), "after the session");
-        let reloaded = JadeDocx::load(&server.materializer().export().unwrap()).unwrap();
+        assert_formatting_agrees(server.document(), server.materializer(), "after the session");
+        let reloaded = JadeDocx::load(&server.materializer().export(server.document()).unwrap()).unwrap();
         assert_same_order(server.document(), &reloaded, "against the reloaded file");
         let reloaded_model = DocxModel::from_word_document(reloaded.word()).unwrap();
         assert_same_order(&reloaded_model, &reloaded, "after reloading");

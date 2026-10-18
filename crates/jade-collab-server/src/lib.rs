@@ -11,10 +11,15 @@
 //! limited to some documents; the tokens can be replaced while the server
 //! runs ([`Server::set_tokens`], [`Server::watch_tokens`]). Replicas share
 //! ephemeral [`Presence`] (cursors, selections) through the same socket.
+//! A connection that stops reading is dropped once its bounded outgoing
+//! queue is full ([`Server::with_outgoing_limit`]), and every access can be
+//! written to an audit log ([`Server::with_audit_log`]).
 
+mod audit;
 mod auth;
 mod client;
 mod limits;
+mod outbox;
 mod room;
 mod server;
 mod storage;
@@ -23,6 +28,7 @@ pub mod wire;
 pub use auth::{DocumentRole, DocumentRule, Grant, Role, Tokens, TokensError};
 pub use client::{Client, ClientError, Presence};
 pub use limits::PresenceLimits;
+pub use outbox::DEFAULT_OUTGOING_LIMIT;
 pub use server::{Server, ServerError};
 pub use storage::{Fsync, StorageOptions};
 pub use wire::Format;

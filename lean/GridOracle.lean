@@ -22,7 +22,9 @@ u <top> <left>              Unmerge
 Output (stdout): `ok` or `err` per operation, then
 `rows <id>:<1|0> ...`, `cols <id>:<1|0> ...` (alive flags, every line ever
 inserted, in order), `merges <top>,<left>,<bottom>,<right> ...` (list order),
-and `valid` / `invalid` (`check`, equivalent to `Valid` by `check_iff_valid`).
+`cover <row>,<col>=<top>,<left> ...` (`mergeAt` of every alive cell a merge
+covers, row by row), and `valid` / `invalid` (`check`, equivalent to `Valid`
+by `check_iff_valid`).
 A malformed line is reported on stderr with exit code 2.
 -/
 
@@ -51,6 +53,13 @@ def showLines (tag : String) (ls : List Line) : String :=
 def showMerges (ms : List Merge) : String :=
   " ".intercalate ("merges" :: ms.map fun m => s!"{m.top},{m.left},{m.bottom},{m.right}")
 
+/-- `mergeAt` of every alive cell that has one, row by row. -/
+def showCover (g : Grid) : String :=
+  let alive := fun (ls : List Line) => (ls.filter (·.alive)).map (·.id)
+  let cells := (alive g.rows).flatMap fun r => (alive g.cols).filterMap fun c =>
+    (mergeAt g r c).map fun m => s!"{r},{c}={m.top},{m.left}"
+  " ".intercalate ("cover" :: cells)
+
 partial def readLines (h : IO.FS.Stream) (acc : Array String) : IO (Array String) := do
   let line ← h.getLine
   if line.isEmpty then return acc
@@ -77,6 +86,7 @@ def main : IO UInt32 := do
     out.putStrLn (showLines "rows" g.rows)
     out.putStrLn (showLines "cols" g.cols)
     out.putStrLn (showMerges g.merges)
+    out.putStrLn (showCover g)
     out.putStrLn (if check g then "valid" else "invalid")
     return 0
   | _ => fail "expected a `rows` line and a `cols` line first"

@@ -1,6 +1,6 @@
 name = "jade-collab-proofs"
 version = "0.1.0"
-defaultTargets = ["JadeCollab", "grid-oracle"]
+defaultTargets = ["JadeCollab", "grid-oracle", "marks-oracle"]
 
 [[lean_lib]]
 name = "JadeCollab"
@@ -8,3 +8,7 @@ name = "JadeCollab"
 [[lean_exe]]
 name = "grid-oracle"
 root = "GridOracle"
+
+[[lean_exe]]
+name = "marks-oracle"
+root = "MarksOracle"

@@ -81,7 +81,8 @@ fn layout(model: &DocxModel, paragraph: usize) -> String {
 }
 
 fn reloaded(jade: &JadeDocx) -> (DocxModel, JadeDocx) {
-    let jade = JadeDocx::load(&jade.export().unwrap()).unwrap();
+    // These tests check text and anchors, which the base file holds.
+    let jade = JadeDocx::load(&jade.export_base().unwrap()).unwrap();
     let model = DocxModel::from_word_document(jade.word()).unwrap();
     assert_same_order(&model, &jade, "after reloading");
     (model, jade)
@@ -442,10 +443,12 @@ fn text_box_text_is_editable_and_its_paragraphs_are_fixed() {
     assert_eq!(layouts(&again), layouts(&model));
 }
 
-/// Why text-box paragraphs are fixed: jade splits the paragraph in memory
-/// but writes the text box's original paragraphs.
+/// Why text-box paragraphs were made fixed: jade used to split the
+/// paragraph in memory but write the text box's original paragraphs. Since
+/// jade-rs/jade-core#20 it writes the split, so the model's restriction
+/// could be lifted (not done yet; see design.md §9).
 #[test]
-fn jade_drops_text_box_paragraph_breaks_on_export() {
+fn jade_writes_text_box_paragraph_breaks_on_export() {
     use jade_docx_document_core::headless_api::apply_headless_commands_to_document;
     use jade_docx_headless_api::{HeadlessCommand, HeadlessEditRequest};
     let (_, mut jade) = open("textbox.docx");
@@ -464,8 +467,8 @@ fn jade_drops_text_box_paragraph_breaks_on_export() {
     .unwrap();
     jade = JadeDocx::new(word);
     assert_eq!(jade.paragraph_texts(), ["Hello", "He", "llo", "World"]);
-    let reloaded = JadeDocx::load(&jade.export().unwrap()).unwrap();
-    assert_eq!(reloaded.paragraph_texts(), ["Hello", "Hello", "World"]);
+    let reloaded = JadeDocx::load(&jade.export_base().unwrap()).unwrap();
+    assert_eq!(reloaded.paragraph_texts(), ["Hello", "He", "llo", "World"]);
 }
 
 /// A comment in a text box works in jade; jade cannot anchor one in a note,
@@ -768,4 +771,86 @@ proptest! {
         prop_assert_eq!(stories, walked_stories(&base).0);
         prop_assert!(contiguous, "a note's or text box's paragraphs were split up");
     }
+}
+
+/// A jade-core bug the tracked-changes generator found (seed
+/// `f3a761c5…`, footnote.docx), with no tracked change in it: once the text
+/// before a lone note reference is deleted, text typed after the reference
+/// and the paragraph split after that text, splitting the note's paragraph
+/// loses track of the new body paragraph and writes the note's first half
+/// unchanged (the second half is added). Present on jade-core main before
+/// jade-rs/jade-core#30 too; without the deletion and typing it works.
+#[test]
+#[ignore = "jade-core: a note split after a body split behind a lone reference is mis-written"]
+fn a_note_split_after_a_body_split_behind_a_lone_reference_is_written() {
+    use jade_docx_document_core::headless_api::apply_headless_commands_to_document;
+    use jade_docx_document_core::selection::TextPosition;
+    use jade_docx_document_core::word_document::WordDocument;
+    use jade_docx_headless_api::{HeadlessCommand, HeadlessEditRequest};
+    let (_, jade) = open("footnote.docx");
+    let mut word = jade.word().clone();
+    let rendered = |word: &WordDocument, paragraph, offset| {
+        word.model_to_rendered_text_position(TextPosition::new(paragraph, offset))
+            .offset
+    };
+    let run = |word: &mut WordDocument, command| {
+        apply_headless_commands_to_document(
+            word,
+            &HeadlessEditRequest {
+                commands: vec![command],
+            },
+        )
+        .unwrap();
+    };
+    let (start, end) = (rendered(&word, 0, 0), rendered(&word, 0, 5));
+    run(
+        &mut word,
+        HeadlessCommand::ReplaceRange {
+            start_paragraph: 0,
+            start_offset: start,
+            end_paragraph: 0,
+            end_offset: end,
+            text: String::new(),
+        },
+    );
+    let at = rendered(&word, 0, 0);
+    run(
+        &mut word,
+        HeadlessCommand::InsertText {
+            paragraph: 0,
+            offset: at,
+            text: "a".into(),
+        },
+    );
+    let at = rendered(&word, 0, 1);
+    run(
+        &mut word,
+        HeadlessCommand::InsertParagraphBreak {
+            paragraph: 0,
+            offset: at,
+            count: 1,
+        },
+    );
+    // The note's paragraph is listed after the new body paragraph now.
+    let note = 2;
+    assert_eq!(
+        word.paragraph(note)
+            .map(|p| p.runs.iter().map(|r| r.text.as_str()).collect::<String>()),
+        Some(" Hello World".to_string())
+    );
+    let at = rendered(&word, note, 11);
+    run(
+        &mut word,
+        HeadlessCommand::InsertParagraphBreak {
+            paragraph: note,
+            offset: at,
+            count: 1,
+        },
+    );
+    let jade = JadeDocx::new(word);
+    let expected = ["a", " Hello Worl", "d", ""];
+    assert_eq!(jade.paragraph_texts()[..4], expected);
+    // The file loses the first half's truncation.
+    let reloaded = JadeDocx::load(&jade.export_base().unwrap()).unwrap();
+    assert_eq!(reloaded.paragraph_texts()[..4], expected);
 }

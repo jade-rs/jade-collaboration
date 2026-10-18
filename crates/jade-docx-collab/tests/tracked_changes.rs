@@ -1161,7 +1161,7 @@ fn edit(model: &mut DocxModel, jade: &mut JadeDocx, replica: u64, intent: Intent
 }
 
 fn reload_agrees(model: &DocxModel, jade: &JadeDocx) {
-    let reloaded = JadeDocx::load(&jade.export().unwrap()).unwrap();
+    let reloaded = JadeDocx::load(&jade.export(model).unwrap()).unwrap();
     assert_same_order(model, &reloaded, "against the reloaded file");
     let again = DocxModel::from_word_document(reloaded.word()).unwrap();
     assert_eq!(
@@ -1354,6 +1354,122 @@ fn a_deletion_cut_in_two_is_decided_whole() {
         assert_eq!(model.paragraph_texts()[0], expected);
         reload_agrees(&model, &jade);
     }
+}
+
+/// Convergent formatting marks and tracked changes together: a mark over
+/// inserted, deleted and nested text formats all of it, and the copy an
+/// export writes — marks applied over jade's base, which holds the
+/// revisions — keeps every revision (checked on every commit) and reads
+/// back with both; deciding the revisions afterwards keeps the formatting
+/// on what is left.
+#[test]
+fn formatting_marks_cover_tracked_text_and_keep_its_revisions() {
+    use common::{char_styles_in, shows};
+    use jade_docx_collab::FormatChange;
+    let (mut model, mut jade) = session("jade-core/hello.docx");
+    commit_as(
+        &mut model,
+        &mut jade,
+        DocxOp::SetTracking { on: true },
+        ReplicaId(1),
+    );
+    // "XYZWorld": Ann's "XYZ", Bob deletes "YZW" (two of them Ann's).
+    edit(
+        &mut model,
+        &mut jade,
+        1,
+        IntentOp::InsertText {
+            paragraph: 1,
+            offset: 0,
+            text: "XYZ".into(),
+        },
+    );
+    edit(
+        &mut model,
+        &mut jade,
+        2,
+        IntentOp::ReplaceRange {
+            start_paragraph: 1,
+            start_offset: 1,
+            end_paragraph: 1,
+            end_offset: 4,
+            text: String::new(),
+        },
+    );
+    assert_eq!(
+        shown(&model, 1),
+        [
+            "X+Ann",
+            "Y+Ann-Bob",
+            "Z+Ann-Bob",
+            "W-Bob",
+            "o",
+            "r",
+            "l",
+            "d"
+        ]
+    );
+    let bold = FormatChange::Bold { value: true };
+    edit(
+        &mut model,
+        &mut jade,
+        3,
+        IntentOp::Format {
+            start_paragraph: 1,
+            start_offset: 0,
+            end_paragraph: 1,
+            end_offset: 6,
+            change: bold.clone(),
+        },
+    );
+    let bold_in = |model: &DocxModel,
+                   word: &jade_docx_document_core::word_document::WordDocument| {
+        let styles = char_styles_in(model, word);
+        model.paragraphs()[1]
+            .chars
+            .iter()
+            .map(|c| shows(&bold, &styles[c]))
+            .collect::<Vec<bool>>()
+    };
+    let expected = [true, true, true, true, true, true, false, false];
+    assert_eq!(bold_in(&model, &jade.formatted(&model).unwrap()), expected);
+    reload_agrees(&model, &jade);
+    let reloaded = JadeDocx::load(&jade.export(&model).unwrap()).unwrap();
+    assert_eq!(bold_in(&model, reloaded.word()), expected);
+    // Reject Ann's insertion, accept Bob's deletion: "orld" is left, "or"
+    // still bold.
+    let decide = |kind: RevisionKind, model: &DocxModel| -> Vec<Id> {
+        model
+            .revisions()
+            .into_iter()
+            .filter(|r| r.revision.kind == kind)
+            .map(|r| r.id)
+            .collect()
+    };
+    let insertions = decide(RevisionKind::Insertion, &model);
+    commit_as(
+        &mut model,
+        &mut jade,
+        DocxOp::RejectRevisions {
+            revisions: insertions,
+        },
+        ReplicaId(1),
+    );
+    let deletions = decide(RevisionKind::Deletion, &model);
+    commit_as(
+        &mut model,
+        &mut jade,
+        DocxOp::AcceptRevisions {
+            revisions: deletions,
+        },
+        ReplicaId(1),
+    );
+    assert_eq!(model.paragraph_texts()[1], "orld");
+    assert_eq!(
+        bold_in(&model, &jade.formatted(&model).unwrap()),
+        [true, true, false, false]
+    );
+    reload_agrees(&model, &jade);
 }
 
 proptest! {

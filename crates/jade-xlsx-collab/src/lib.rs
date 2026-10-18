@@ -10,8 +10,9 @@
 //!
 //! Notes and formats are convergent too: a note is a last-writer-wins
 //! register per cell, a format one register per cell and attribute, so
-//! concurrent changes to different attributes of a cell compose. Both are
-//! realised with jade's own `set_note` / `delete_note` / `set_format`.
+//! concurrent changes to different attributes of a cell compose — each
+//! border edge is one such attribute, its style and colour together. Both
+//! are realised with jade's own `set_note` / `delete_note` / `set_format`.
 
 pub mod intent;
 mod jade;
@@ -19,8 +20,9 @@ mod model;
 
 pub use jade::JadeXlsx;
 pub use jade_xlsx_headless_api::CellInput;
-pub use jade_xlsx_headless_editor::FormatChange;
+pub use jade_xlsx_headless_editor::{BorderLine, BorderStyle, FormatChange};
 pub use jade_xlsx_reader::{HorizontalAlignment, VerticalAlignment};
 pub use model::{
-    column_label, parse_reference, LoadError, LoadOptions, SheetView, XlsxEffect, XlsxModel, XlsxOp,
+    column_label, parse_reference, LineAxis, LoadError, LoadOptions, RangeBorders, SheetView,
+    XlsxEffect, XlsxModel, XlsxOp,
 };

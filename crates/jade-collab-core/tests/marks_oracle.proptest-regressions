@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc eaa9dc5d4b950c6f4c47ef7b2fa2bc15a23c02b50f6d359391a195b83e625b52 # shrinks to choices = [Insert { peer: 0, at: 0 }, Insert { peer: 1, at: 0 }, Mark { peer: 1, from: 0, len: 0, key: 0, value: None, expand: false }]

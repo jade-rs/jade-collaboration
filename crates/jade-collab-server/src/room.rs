@@ -14,12 +14,12 @@ use jade_xlsx_collab::{JadeXlsx, LoadOptions, XlsxModel};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
-use tokio::sync::{mpsc::UnboundedSender, oneshot};
+use tokio::sync::oneshot;
 
 use crate::storage::{DocumentStore, StorageOptions};
 use crate::wire::{Format, ServerMessage};
 
-pub(crate) type Outbox = UnboundedSender<String>;
+pub(crate) use crate::outbox::Outbox;
 
 pub(crate) enum Command {
     Join {
@@ -76,7 +76,11 @@ trait Hosted: 'static {
     fn load(bytes: &[u8], model: &Self::Doc) -> Result<Self::Mat, String>;
     /// The real document and the model derived from it.
     fn open(bytes: &[u8]) -> Result<(Self::Doc, Self::Mat), String>;
-    fn export(materializer: &Self::Mat) -> Result<Vec<u8>, String>;
+    /// The file as users get it.
+    fn export(document: &Self::Doc, materializer: &Self::Mat) -> Result<Vec<u8>, String>;
+    /// The file a checkpoint stores next to the model, which `load` reads
+    /// back.
+    fn checkpoint_file(materializer: &Self::Mat) -> Result<Vec<u8>, String>;
 
     /// The operation the server commits, as the document's origin, before
     /// `op` from `replica` — whose token is named `author` — so that the
@@ -110,8 +114,13 @@ impl Hosted for Docx {
         Ok((model, jade))
     }
 
-    fn export(materializer: &JadeDocx) -> Result<Vec<u8>, String> {
-        materializer.export().map_err(|e| e.to_string())
+    fn export(model: &DocxModel, materializer: &JadeDocx) -> Result<Vec<u8>, String> {
+        materializer.export(model)
+    }
+
+    /// The base file: the model's marks are in the checkpoint's model.
+    fn checkpoint_file(materializer: &JadeDocx) -> Result<Vec<u8>, String> {
+        materializer.export_base().map_err(|e| e.to_string())
     }
 
     /// A tracked change by a replica the model does not know under its
@@ -152,7 +161,11 @@ impl Hosted for Xlsx {
         Ok((model, jade))
     }
 
-    fn export(materializer: &JadeXlsx) -> Result<Vec<u8>, String> {
+    fn export(_: &XlsxModel, materializer: &JadeXlsx) -> Result<Vec<u8>, String> {
+        materializer.export()
+    }
+
+    fn checkpoint_file(materializer: &JadeXlsx) -> Result<Vec<u8>, String> {
         materializer.export()
     }
 }
@@ -177,7 +190,11 @@ impl Hosted for Pptx {
         Ok((model, jade))
     }
 
-    fn export(materializer: &JadePptx) -> Result<Vec<u8>, String> {
+    fn export(_: &PptxModel, materializer: &JadePptx) -> Result<Vec<u8>, String> {
+        materializer.export()
+    }
+
+    fn checkpoint_file(materializer: &JadePptx) -> Result<Vec<u8>, String> {
         materializer.export()
     }
 }
@@ -274,7 +291,7 @@ impl<H: Hosted> Hosting<H> {
             } => {
                 let (document, materializer) = H::open(&bytes)?;
                 let sequencer = Sequencer::with_materializer(document, materializer);
-                let file = H::export(sequencer.materializer())?;
+                let file = H::checkpoint_file(sequencer.materializer())?;
                 let store =
                     DocumentStore::create(dir, H::FORMAT, options, &sequencer.checkpoint(), &file)?;
                 Hosting {
@@ -310,7 +327,7 @@ impl<H: Hosted> Hosting<H> {
         if store.append(&record)? {
             // A file that cannot be exported now is checkpointed later; the
             // journal keeps everything until then.
-            match H::export(self.sequencer.materializer()) {
+            match H::checkpoint_file(self.sequencer.materializer()) {
                 Ok(file) => {
                     let keep = store.keep_tail();
                     let log = self.sequencer.log();
@@ -328,12 +345,11 @@ impl<H: Hosted> Hosting<H> {
         let mut subscribers: BTreeMap<ReplicaId, Outbox> = BTreeMap::new();
         // Ephemeral: in memory only, gone when the connection is.
         let mut presence: BTreeMap<ReplicaId, ServerMessage> = BTreeMap::new();
-        let others = |subscribers: &BTreeMap<ReplicaId, Outbox>, replica, json: String| {
-            for (other, outbox) in subscribers {
-                if *other != replica {
-                    let _ = outbox.send(json.clone());
-                }
-            }
+        // A subscriber that cannot take a message is gone or too far behind:
+        // it is dropped, and its connection closes.
+        let others = |subscribers: &mut BTreeMap<ReplicaId, Outbox>, replica, json: String| {
+            subscribers
+                .retain(|other, outbox| *other == replica || outbox.send(json.clone()).is_ok());
         };
         while let Ok(command) = inbox.recv() {
             match command {
@@ -373,7 +389,7 @@ impl<H: Hosted> Hosting<H> {
                         // Whatever the replica's old connection showed is stale.
                         if presence.remove(&replica).is_some() {
                             let left = ServerMessage::PresenceLeft { replica }.to_json();
-                            others(&subscribers, replica, left);
+                            others(&mut subscribers, replica, left);
                         }
                         for message in presence.values() {
                             let _ = outbox.send(message.to_json());
@@ -466,7 +482,7 @@ impl<H: Hosted> Hosting<H> {
                             name,
                             state,
                         };
-                        others(&subscribers, replica, message.to_json());
+                        others(&mut subscribers, replica, message.to_json());
                         presence.insert(replica, message);
                     }
                 }
@@ -480,11 +496,14 @@ impl<H: Hosted> Hosting<H> {
                         subscribers.remove(&replica);
                         presence.remove(&replica);
                         let left = ServerMessage::PresenceLeft { replica }.to_json();
-                        others(&subscribers, replica, left);
+                        others(&mut subscribers, replica, left);
                     }
                 }
                 Command::Export { reply } => {
-                    let _ = reply.send(H::export(self.sequencer.materializer()));
+                    let _ = reply.send(H::export(
+                        self.sequencer.document(),
+                        self.sequencer.materializer(),
+                    ));
                 }
                 Command::Seq { reply } => {
                     let _ = reply.send(self.sequencer.seq());

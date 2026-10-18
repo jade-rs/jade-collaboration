@@ -14,13 +14,15 @@ use axum::routing::get;
 use axum::{Extension, Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc::unbounded_channel, oneshot, watch};
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
+use crate::audit::Audit;
 use crate::auth::{
     access, authenticate, forbidden, recheck, Grant, Presented, Role, Tokens, TokensError,
 };
 use crate::limits::{Bucket, PresenceLimits};
+use crate::outbox::{outbox, DEFAULT_OUTGOING_LIMIT};
 use crate::room::{self, Command, Source};
 use crate::storage::{newest_generation, StorageOptions};
 use crate::wire::{ClientMessage, Format, ServerMessage};
@@ -49,6 +51,8 @@ pub enum ServerError {
     NoTokens,
     #[error(transparent)]
     Tokens(#[from] TokensError),
+    #[error("audit log {path}: {message}")]
+    Audit { path: PathBuf, message: String },
 }
 
 struct RoomHandle {
@@ -70,6 +74,10 @@ pub struct Server {
     /// The tokens in force; every connection watches them.
     tokens: Option<Arc<watch::Sender<Arc<Tokens>>>>,
     presence: PresenceLimits,
+    /// How many messages may wait for one connection; the default when
+    /// `None`.
+    outgoing: Option<usize>,
+    audit: Audit,
 }
 
 /// A name that is a single plain file name, so it can name a directory too.
@@ -111,6 +119,8 @@ impl Server {
             })),
             tokens: None,
             presence: PresenceLimits::default(),
+            outgoing: None,
+            audit: Audit::default(),
         };
         let entries = std::fs::read_dir(&dir).map_err(|e| storage_error(e.to_string()))?;
         for entry in entries {
@@ -151,6 +161,35 @@ impl Server {
     pub fn with_presence_limits(mut self, limits: PresenceLimits) -> Self {
         self.presence = limits;
         self
+    }
+
+    /// Lets at most `limit` messages wait for one connection (instead of
+    /// [`DEFAULT_OUTGOING_LIMIT`]). A connection with more waiting reads too
+    /// slowly: it is told `overloaded` and closed, and the others never wait
+    /// for it.
+    pub fn with_outgoing_limit(mut self, limit: usize) -> Self {
+        self.outgoing = Some(limit.max(1));
+        self
+    }
+
+    /// Appends a line to the file at `path` for every access: sockets
+    /// connected, replicas joined, resumed and closed (and why), requests
+    /// refused, files uploaded and downloaded — by token name, never by
+    /// token.
+    pub fn with_audit_log(
+        mut self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, ServerError> {
+        let path = path.as_ref();
+        self.audit = Audit::open(path).map_err(|e| ServerError::Audit {
+            path: path.to_path_buf(),
+            message: e.to_string(),
+        })?;
+        Ok(self)
+    }
+
+    pub(crate) fn audit(&self) -> &Audit {
+        &self.audit
     }
 
     pub(crate) fn tokens(&self) -> Option<Arc<Tokens>> {
@@ -352,10 +391,17 @@ async fn download(
 ) -> Response {
     let grant = grant.map(|Extension(grant)| grant);
     if access(grant.as_ref(), &name).is_none() {
+        refused(&server, grant.as_ref(), &name, StatusCode::FORBIDDEN);
         return forbidden(&name);
     }
     match server.export(&name).await {
-        Ok(bytes) => ([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response(),
+        Ok(bytes) => {
+            server.audit().record(
+                "downloaded",
+                serde_json::json!({ "document": name, "token": token_name(grant.as_ref()) }),
+            );
+            ([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response()
+        }
         Err(error) => error_response(error),
     }
 }
@@ -370,11 +416,20 @@ async fn upload(
     match access(grant.as_ref(), &name) {
         Some(Role::Editor) => {}
         Some(Role::Viewer) => {
-            return (StatusCode::FORBIDDEN, "viewers cannot upload documents").into_response()
+            refused(&server, grant.as_ref(), &name, StatusCode::FORBIDDEN);
+            return (StatusCode::FORBIDDEN, "viewers cannot upload documents").into_response();
         }
-        None => return forbidden(&name),
+        None => {
+            refused(&server, grant.as_ref(), &name, StatusCode::FORBIDDEN);
+            return forbidden(&name);
+        }
     }
+    let audit = server.audit().clone();
+    let entry = serde_json::json!({ "document": name, "token": token_name(grant.as_ref()) });
     let opened = tokio::task::spawn_blocking(move || server.open(&name, body.to_vec())).await;
+    if matches!(opened, Ok(Ok(_))) {
+        audit.record("uploaded", entry);
+    }
     match opened {
         Ok(Ok(format)) => (
             StatusCode::CREATED,
@@ -396,6 +451,7 @@ async fn socket(
     let grant = grant.map(|Extension(grant)| grant);
     // Access is decided before anything else is looked at.
     let Some(role) = access(grant.as_ref(), &name) else {
+        refused(&server, grant.as_ref(), &name, StatusCode::FORBIDDEN);
         return forbidden(&name);
     };
     let upgrade = match upgrade {
@@ -410,7 +466,12 @@ async fn socket(
         }),
         _ => None,
     };
-    let limits = server.presence;
+    let settings = Settings {
+        document: name.clone(),
+        presence: server.presence,
+        outgoing: server.outgoing.unwrap_or(DEFAULT_OUTGOING_LIMIT),
+        audit: server.audit().clone(),
+    };
     match server.commands(&name) {
         Ok(commands) => upgrade.on_upgrade(move |socket| {
             connection(
@@ -421,7 +482,7 @@ async fn socket(
                     role,
                     tokens,
                 },
-                limits,
+                settings,
             )
         }),
         Err(error) => error_response(error),
@@ -469,30 +530,72 @@ impl Access {
     }
 }
 
+/// What a connection is held to, and where it is recorded.
+struct Settings {
+    document: String,
+    presence: PresenceLimits,
+    /// Messages that may wait for the connection.
+    outgoing: usize,
+    audit: Audit,
+}
+
+/// Why the server ends a connection.
+enum Ending {
+    /// The token was withdrawn or lost access to the document.
+    Revoked(String),
+    /// More waited for the connection than its queue holds.
+    Overloaded,
+    /// The document's thread is gone.
+    Stopped,
+}
+
+/// The token's name, for the audit log; never the token.
+fn token_name(grant: Option<&Grant>) -> serde_json::Value {
+    grant.map_or(serde_json::Value::Null, |grant| grant.name.clone().into())
+}
+
+/// Records that `grant` was refused `document` with `status`.
+fn refused(server: &Server, grant: Option<&Grant>, document: &str, status: StatusCode) {
+    server.audit().record(
+        "refused",
+        serde_json::json!({
+            "document": document,
+            "token": token_name(grant),
+            "status": status.as_u16(),
+        }),
+    );
+}
+
 /// One socket, doing what `access` allows and sharing presence within
-/// `limits`.
+/// the limits of `settings`.
 async fn connection(
     socket: WebSocket,
     commands: mpsc::Sender<Command>,
     mut access: Access,
-    limits: PresenceLimits,
+    settings: Settings,
 ) {
+    let Settings {
+        document,
+        presence: limits,
+        outgoing: limit,
+        audit,
+    } = settings;
     let (mut sink, mut stream) = socket.split();
-    let (outbox, mut outgoing) = unbounded_channel::<String>();
+    let (outbox, mut outgoing, overloaded) = outbox(limit);
     // The last word, if the server closes the socket: said, then closed.
-    let (closer, close) = oneshot::channel::<ServerMessage>();
+    let (closer, close) = oneshot::channel::<(ServerMessage, u16, &'static str)>();
     let mut writer = tokio::spawn(async move {
         tokio::pin!(close);
         loop {
             tokio::select! {
                 biased;
                 last = &mut close => {
-                    if let Ok(last) = last {
+                    if let Ok((last, code, reason)) = last {
                         let _ = sink.send(Message::Text(last.to_json().into())).await;
                         let _ = sink
                             .send(Message::Close(Some(CloseFrame {
-                                code: close_code::POLICY,
-                                reason: "access revoked".into(),
+                                code,
+                                reason: reason.into(),
                             })))
                             .await;
                     }
@@ -510,17 +613,29 @@ async fn connection(
     let say = |message: ServerMessage| {
         let _ = outbox.send(message.to_json());
     };
+    audit.record(
+        "connected",
+        serde_json::json!({
+            "document": document,
+            "token": token_name(access.grant.as_ref()),
+            "role": access.role,
+        }),
+    );
     let mut replica = None;
     let opened = std::time::Instant::now();
     let mut presence_rate = Bucket::new(limits);
     // The tokens may have changed since the request was let in.
-    let mut revoked = access.refresh().err();
-    while revoked.is_none() {
+    let mut ending = access.refresh().err().map(Ending::Revoked);
+    while ending.is_none() {
         let message = tokio::select! {
             // A change of tokens comes before anything sent after it.
             biased;
             () = access.changed() => {
-                revoked = access.refresh().err();
+                ending = access.refresh().err().map(Ending::Revoked);
+                continue;
+            }
+            () = overloaded.wait() => {
+                ending = Some(Ending::Overloaded);
                 continue;
             }
             message = stream.next() => message,
@@ -548,16 +663,24 @@ async fn connection(
             }
             ClientMessage::Join => {
                 let (reply, answer) = oneshot::channel();
-                if commands
-                    .send(Command::Join {
-                        outbox: outbox.clone(),
-                        reply,
-                    })
-                    .is_err()
-                {
-                    break;
+                let sent = commands.send(Command::Join {
+                    outbox: outbox.clone(),
+                    reply,
+                });
+                match (sent, answer.await) {
+                    (Ok(()), Ok(id)) => {
+                        replica = Some(id);
+                        audit.record(
+                            "joined",
+                            serde_json::json!({
+                                "document": document,
+                                "token": token_name(access.grant.as_ref()),
+                                "replica": id.0,
+                            }),
+                        );
+                    }
+                    _ => ending = Some(Ending::Stopped),
                 }
-                replica = answer.await.ok();
             }
             ClientMessage::Resume { replica: id, seq } => {
                 let (reply, answer) = oneshot::channel();
@@ -570,10 +693,22 @@ async fn connection(
                     })
                     .is_err()
                 {
-                    break;
+                    ending = Some(Ending::Stopped);
+                    continue;
                 }
                 match answer.await {
-                    Ok(Ok(())) => replica = Some(id),
+                    Ok(Ok(())) => {
+                        replica = Some(id);
+                        audit.record(
+                            "resumed",
+                            serde_json::json!({
+                                "document": document,
+                                "token": token_name(access.grant.as_ref()),
+                                "replica": id.0,
+                                "seq": seq,
+                            }),
+                        );
+                    }
                     Ok(Err(
                         error @ (SyncError::Compacted { .. } | SyncError::UnknownReplica(_)),
                     )) => say(ServerMessage::Rejoin {
@@ -582,7 +717,7 @@ async fn connection(
                     Ok(Err(error)) => say(ServerMessage::Error {
                         message: error.to_string(),
                     }),
-                    Err(_) => break,
+                    Err(_) => ending = Some(Ending::Stopped),
                 }
             }
             ClientMessage::Presence { state } => match replica {
@@ -608,7 +743,7 @@ async fn connection(
                         outbox: outbox.clone(),
                     };
                     if commands.send(command).is_err() {
-                        break;
+                        ending = Some(Ending::Stopped);
                     }
                 }
                 None => say(ServerMessage::Error {
@@ -623,15 +758,13 @@ async fn connection(
                     reason: Rejection::new("this token is read-only (viewer)"),
                 })),
                 Some(replica) => {
-                    if commands
-                        .send(Command::Submit {
-                            replica,
-                            author: access.grant.as_ref().map(|grant| grant.name.clone()),
-                            submission,
-                        })
-                        .is_err()
-                    {
-                        break;
+                    let command = Command::Submit {
+                        replica,
+                        author: access.grant.as_ref().map(|grant| grant.name.clone()),
+                        submission,
+                    };
+                    if commands.send(command).is_err() {
+                        ending = Some(Ending::Stopped);
                     }
                 }
                 None => say(ServerMessage::Error {
@@ -646,12 +779,48 @@ async fn connection(
             outbox: outbox.clone(),
         });
     }
-    if let Some(message) = revoked {
-        let _ = closer.send(ServerMessage::Revoked {
-            message: format!("access revoked: {message}"),
-        });
-        let _ = tokio::time::timeout(Duration::from_secs(5), &mut writer).await;
+    let reason = match &ending {
+        None => "client",
+        Some(Ending::Revoked(_)) => "revoked",
+        Some(Ending::Overloaded) => "overloaded",
+        Some(Ending::Stopped) => "stopped",
+    };
+    audit.record(
+        "closed",
+        serde_json::json!({
+            "document": document,
+            "token": token_name(access.grant.as_ref()),
+            "replica": replica.map(|replica| replica.0),
+            "reason": reason,
+        }),
+    );
+    let last = match ending {
+        Some(Ending::Revoked(message)) => Some((
+            ServerMessage::Revoked {
+                message: format!("access revoked: {message}"),
+            },
+            close_code::POLICY,
+            "access revoked",
+        )),
+        Some(Ending::Overloaded) => Some((
+            ServerMessage::Overloaded {
+                message: format!(
+                    "more than {limit} messages waited for this connection; resume to catch up"
+                ),
+            },
+            close_code::AGAIN,
+            "reading too slowly",
+        )),
+        None | Some(Ending::Stopped) => None,
+    };
+    if let Some(last) = last {
+        let _ = closer.send(last);
+        let _ = tokio::time::timeout(LAST_WORD_GRACE, &mut writer).await;
     }
     // The socket is gone; nothing more can be written to it.
     writer.abort();
 }
+
+/// How long a closing connection gets to take its last word before the
+/// socket is dropped anyway.
+const LAST_WORD_GRACE: Duration = Duration::from_secs(10);
