@@ -1,10 +1,12 @@
 //! Merged table cells in docx: merging shows the covered cells' content in
 //! the top-left cell (as jade concatenates it), unmerging gives the freed
 //! cells new empty stories, and text edits into any cell commute with both.
+//! Rows and columns go through merged cells as in Word and jade: a line
+//! inserted strictly inside a merge joins it, a deleted edge moves inward.
 
 mod common;
 
-use common::{jade_core, open};
+use common::{assert_tables_agree, jade_core, model_tables, open, TableLayout};
 use jade_collab_core::grid::{GridOp, Merge};
 use jade_collab_core::id::{Id, ReplicaId};
 use jade_collab_sync::{ApplyContext, Document, Lane, Materializer};
@@ -64,6 +66,28 @@ impl Session {
             self.jade.body_paragraph_texts(),
             "after {op:?}"
         );
+        assert_tables_agree(&self.model, &self.jade, &format!("after {op:?}"));
+    }
+
+    fn grid(&mut self, table: Id, op: GridOp) {
+        self.step(DocxOp::Table { table, op });
+    }
+
+    /// The first table as the model shows it (jade agrees, `step` checks).
+    fn layout(&self) -> TableLayout {
+        model_tables(&self.model).remove(0).expect("unlocked")
+    }
+
+    /// The file jade writes reads back as the same tables.
+    fn assert_round_trips(&self) {
+        let reloaded = JadeDocx::load(&self.jade.export().unwrap()).unwrap();
+        let model = DocxModel::from_word_document(reloaded.word()).unwrap();
+        assert_eq!(
+            reloaded.body_paragraph_texts(),
+            self.model.paragraph_texts()
+        );
+        assert_tables_agree(&model, &reloaded, "reloaded");
+        assert_eq!(model_tables(&model), model_tables(&self.model));
     }
 
     /// A 3 × 3 table after the first paragraph, with "r{row}c{col}" typed in
@@ -217,8 +241,16 @@ fn unmerging_keeps_the_content_and_frees_new_empty_cells() {
     assert_eq!(reloaded.body_paragraph_texts(), s.model.paragraph_texts());
 }
 
-#[test]
-fn rows_and_columns_through_a_merge_are_refused() {
+fn texts(layout: &TableLayout, row: usize, column: usize) -> Vec<&str> {
+    layout
+        .cells
+        .get(&(row, column))
+        .map(|t| t.iter().map(String::as_str).collect())
+        .unwrap_or_default()
+}
+
+/// A 3 × 3 table with its top-left 2 × 2 merged.
+fn merged_session() -> (Session, Id, Vec<Id>, Vec<Id>) {
     let mut s = Session::open("jade-core/hello.docx");
     let (table, rows, columns) = s.table();
     s.step(DocxOp::MergeCells {
@@ -226,51 +258,194 @@ fn rows_and_columns_through_a_merge_are_refused() {
         merge: region(&rows, &columns, 0, 0, 1, 1),
         first: Id::new(7_000_000, ReplicaId(3)),
     });
-    let refused = |s: &mut Session, op: GridOp| {
-        let before = s.model.clone();
-        let op = DocxOp::Table { table, op };
-        let err = s.jade.admit(&s.model, &op).err().or_else(|| {
-            s.model
-                .apply(
-                    &op,
-                    &ApplyContext {
-                        origin: ReplicaId(1),
-                        base_seq: 0,
-                        seq: None,
-                    },
-                )
-                .err()
-        });
-        assert!(err.is_some(), "{op:?} was accepted");
-        assert_eq!(s.model, before);
-    };
+    (s, table, rows, columns)
+}
+
+#[test]
+fn a_row_inserted_inside_a_merge_joins_it() {
+    let (mut s, table, rows, _) = merged_session();
     let id = s.id();
-    refused(
-        &mut s,
+    s.grid(
+        table,
         GridOp::InsertRow {
             id,
             after: Some(rows[0]),
         },
     );
-    refused(&mut s, GridOp::DeleteRow { id: rows[1] });
+    let layout = s.layout();
+    assert_eq!(layout.merges, vec![(0, 0, 2, 1)]);
+    // The new row's merged part is one empty follower, as Word makes it; the
+    // cell outside the merge is a new empty cell.
+    assert_eq!(texts(&layout, 1, 0), [""]);
+    assert!(!layout.cells.contains_key(&(1, 1)));
+    assert_eq!(texts(&layout, 1, 2), [""]);
+    assert_eq!(texts(&layout, 0, 0), ["r0c0", "r0c1", "r1c0", "r1c1"]);
+    s.assert_round_trips();
+}
+
+#[test]
+fn a_row_inserted_at_a_merge_edge_stays_out_of_it() {
+    let (mut s, table, rows, _) = merged_session();
+    let below = s.id();
+    s.grid(
+        table,
+        GridOp::InsertRow {
+            id: below,
+            after: Some(rows[1]),
+        },
+    );
+    let above = s.id();
+    s.grid(
+        table,
+        GridOp::InsertRow {
+            id: above,
+            after: None,
+        },
+    );
+    let layout = s.layout();
+    assert_eq!(layout.merges, vec![(1, 0, 2, 1)]);
+    assert_eq!(texts(&layout, 3, 0), [""]);
+    assert_eq!(texts(&layout, 3, 1), [""]);
+    s.assert_round_trips();
+}
+
+#[test]
+fn a_column_inserted_inside_a_merge_joins_it() {
+    let (mut s, table, _, columns) = merged_session();
     let id = s.id();
-    refused(
-        &mut s,
+    s.grid(
+        table,
         GridOp::InsertColumn {
             id,
             after: Some(columns[0]),
         },
     );
-    refused(&mut s, GridOp::DeleteColumn { id: columns[0] });
-    // Outside the merge they still work.
-    let id = s.id();
-    s.step(DocxOp::Table {
+    let at_edge = s.id();
+    s.grid(
         table,
-        op: GridOp::InsertRow {
-            id,
-            after: Some(rows[2]),
+        GridOp::InsertColumn {
+            id: at_edge,
+            after: Some(columns[1]),
         },
+    );
+    let layout = s.layout();
+    assert_eq!(layout.merges, vec![(0, 0, 1, 2)]);
+    assert!(!layout.cells.contains_key(&(0, 1)));
+    assert!(!layout.cells.contains_key(&(1, 1)));
+    // At the merge's right edge: new cells in every row.
+    assert_eq!(texts(&layout, 0, 3), [""]);
+    assert_eq!(texts(&layout, 1, 3), [""]);
+    assert_eq!(texts(&layout, 0, 4), ["r0c2"]);
+    s.assert_round_trips();
+}
+
+/// Deleting a merge's top row deletes what the merged cell shows (it lives
+/// in that row's `w:tc`, in Word as in jade); the follower below becomes the
+/// merged cell.
+#[test]
+fn deleting_a_merge_top_row_moves_it_down() {
+    let mut s = Session::open("jade-core/hello.docx");
+    let (table, rows, columns) = s.table();
+    s.step(DocxOp::MergeCells {
+        table,
+        merge: region(&rows, &columns, 0, 1, 2, 2),
+        first: Id::new(7_000_000, ReplicaId(3)),
     });
+    s.grid(table, GridOp::DeleteRow { id: rows[0] });
+    let layout = s.layout();
+    assert_eq!(layout.merges, vec![(0, 1, 1, 2)]);
+    assert_eq!(texts(&layout, 0, 1), [""]);
+    assert_eq!(texts(&layout, 0, 0), ["r1c0"]);
+    // Deleting the next one leaves a 1 × 2 merge, then none.
+    s.grid(table, GridOp::DeleteRow { id: rows[1] });
+    assert_eq!(s.layout().merges, vec![(0, 1, 0, 2)]);
+    s.grid(table, GridOp::DeleteColumn { id: columns[1] });
+    assert!(s.layout().merges.is_empty());
+    s.assert_round_trips();
+}
+
+/// Deleting a merge's left column keeps what the merged cell shows: its
+/// `w:tc` only spans one column fewer.
+#[test]
+fn deleting_a_merge_left_column_keeps_its_content() {
+    let (mut s, table, rows, columns) = merged_session();
+    s.grid(table, GridOp::DeleteColumn { id: columns[0] });
+    let layout = s.layout();
+    assert_eq!(layout.merges, vec![(0, 0, 1, 0)]);
+    assert_eq!(texts(&layout, 0, 0), ["r0c0", "r0c1", "r1c0", "r1c1"]);
+    assert_eq!(texts(&layout, 1, 0), [""]);
+    // Its last column on that axis... and then its last row: no merge.
+    s.grid(table, GridOp::DeleteRow { id: rows[1] });
+    let layout = s.layout();
+    assert!(layout.merges.is_empty());
+    assert_eq!(texts(&layout, 0, 0), ["r0c0", "r0c1", "r1c0", "r1c1"]);
+    s.assert_round_trips();
+}
+
+#[test]
+fn deleting_inner_lines_shrinks_a_merge() {
+    let mut s = Session::open("jade-core/hello.docx");
+    let (table, rows, columns) = s.table();
+    s.step(DocxOp::MergeCells {
+        table,
+        merge: region(&rows, &columns, 0, 0, 2, 2),
+        first: Id::new(7_000_000, ReplicaId(3)),
+    });
+    s.grid(table, GridOp::DeleteRow { id: rows[1] });
+    s.grid(table, GridOp::DeleteColumn { id: columns[1] });
+    let layout = s.layout();
+    assert_eq!(layout.merges, vec![(0, 0, 1, 1)]);
+    assert_eq!(layout.cells.len(), 2, "the merged cell and its follower");
+    s.assert_round_trips();
+}
+
+/// After rows and columns went through a merge, unmerging frees every cell
+/// it covers — the inserted ones too — and they take text.
+#[test]
+fn a_grown_merge_unmerges_into_fresh_cells() {
+    let (mut s, table, rows, columns) = merged_session();
+    let row = s.id();
+    s.grid(
+        table,
+        GridOp::InsertRow {
+            id: row,
+            after: Some(rows[0]),
+        },
+    );
+    let column = s.id();
+    s.grid(
+        table,
+        GridOp::InsertColumn {
+            id: column,
+            after: Some(columns[0]),
+        },
+    );
+    assert_eq!(s.layout().merges, vec![(0, 0, 2, 2)]);
+    let first = s.reserve(9);
+    s.step(DocxOp::UnmergeCells {
+        table,
+        top: rows[0],
+        left: columns[0],
+        first,
+    });
+    let layout = s.layout();
+    assert!(layout.merges.is_empty());
+    assert_eq!(layout.cells.len(), 16);
+    let freed = s
+        .model
+        .paragraphs()
+        .into_iter()
+        .filter(|p| matches!(p.story, StoryId::Split { .. }))
+        .last()
+        .expect("a freed cell");
+    let typed = s.reserve(2);
+    s.step(DocxOp::InsertText {
+        story: freed.story,
+        parent: None,
+        first: typed,
+        text: "ok".into(),
+    });
+    s.assert_round_trips();
 }
 
 #[test]

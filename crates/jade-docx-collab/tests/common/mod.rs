@@ -100,6 +100,130 @@ pub fn assert_stories_agree(model: &DocxModel, jade: &JadeDocx, context: &str) {
     }
 }
 
+/// (top, left, bottom, right) indices of a merged region.
+pub type Region = (usize, usize, usize, usize);
+
+/// What a table shows, cell by cell: the paragraph texts of each `w:tc`
+/// keyed by (row, first grid column), and its merged regions.
+#[derive(Debug, PartialEq)]
+pub struct TableLayout {
+    pub rows: usize,
+    pub columns: usize,
+    pub cells: BTreeMap<(usize, usize), Vec<String>>,
+    pub merges: Vec<Region>,
+}
+
+/// jade's top-level body tables as [`TableLayout`]s (`w:gridSpan` across,
+/// `w:vMerge` restart/continue down); `None` for a ragged one.
+pub fn jade_tables(jade: &JadeDocx) -> Vec<Option<TableLayout>> {
+    use jade_docx_document_core::document::BodyElement;
+    let Some(body) = jade.word().document.as_ref().and_then(|d| d.body.as_ref()) else {
+        return Vec::new();
+    };
+    body.elements
+        .iter()
+        .filter_map(|e| match e {
+            BodyElement::Table(t) => Some(t),
+            _ => None,
+        })
+        .map(|table| {
+            let mut cells = BTreeMap::new();
+            let mut merges: Vec<Region> = Vec::new();
+            let mut width = None;
+            for (r, row) in table.rows.iter().enumerate() {
+                let mut c = 0;
+                for cell in &row.cells {
+                    let span = cell.span.unwrap_or(1).max(1) as usize;
+                    let right = c + span - 1;
+                    let texts = cell
+                        .blocks
+                        .iter()
+                        .filter_map(|b| match b {
+                            BodyElement::Paragraph(p) => {
+                                Some(p.runs.iter().map(|r| r.text.as_str()).collect::<String>())
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    cells.insert((r, c), texts);
+                    match cell.vertical_merge.as_deref() {
+                        Some("continue") => {
+                            let above = merges
+                                .iter_mut()
+                                .find(|m| m.1 == c && m.3 == right && m.2 + 1 == r)?;
+                            above.2 = r;
+                        }
+                        Some(_) => merges.push((r, c, r, right)),
+                        None if right > c => merges.push((r, c, r, right)),
+                        None => {}
+                    }
+                    c = right + 1;
+                }
+                if *width.get_or_insert(c) != c {
+                    return None;
+                }
+            }
+            merges.retain(|(t, l, b, r)| (b - t + 1) * (r - l + 1) >= 2);
+            merges.sort();
+            Some(TableLayout {
+                rows: table.rows.len(),
+                columns: width.unwrap_or(0),
+                cells,
+                merges,
+            })
+        })
+        .collect()
+}
+
+/// The model's top-level body tables as [`TableLayout`]s: the paragraphs of
+/// the stories each alive cell position shows; `None` for a locked table.
+pub fn model_tables(model: &DocxModel) -> Vec<Option<TableLayout>> {
+    let paragraphs = model.paragraphs();
+    model
+        .tables()
+        .into_iter()
+        .map(|table| {
+            if table.locked {
+                return None;
+            }
+            let mut cells: BTreeMap<(usize, usize), Vec<String>> = BTreeMap::new();
+            for p in &paragraphs {
+                let Some((t, row, column)) = model.cell_of(p.story) else {
+                    continue;
+                };
+                if t != table.id {
+                    continue;
+                }
+                let r = table.rows.iter().position(|x| *x == row)?;
+                let c = table.columns.iter().position(|x| *x == column)?;
+                cells.entry((r, c)).or_default().push(p.text.clone());
+            }
+            let mut merges = table.merges.clone();
+            merges.sort();
+            Some(TableLayout {
+                rows: table.rows.len(),
+                columns: table.columns.len(),
+                cells,
+                merges,
+            })
+        })
+        .collect()
+}
+
+/// Every unlocked top-level table shows, cell by cell, what jade's does:
+/// the same cells at the same grid positions with the same paragraphs, and
+/// the same merged regions.
+pub fn assert_tables_agree(model: &DocxModel, jade: &JadeDocx, context: &str) {
+    let ours = model_tables(model);
+    let theirs = jade_tables(jade);
+    assert_eq!(ours.len(), theirs.len(), "table count {context}");
+    for (k, (ours, theirs)) in ours.iter().zip(&theirs).enumerate() {
+        if let Some(ours) = ours {
+            assert_eq!(Some(ours), theirs.as_ref(), "table {k} {context}");
+        }
+    }
+}
+
 /// jade's paragraph surface for a model paragraph.
 pub fn surface(jade: &JadeDocx, paragraph: &jade_docx_collab::Paragraph) -> usize {
     jade.word()
@@ -146,6 +270,7 @@ pub fn commit(model: &mut DocxModel, jade: &mut JadeDocx, op: DocxOp) -> Vec<Doc
     jade.materialize(model, effect.clone(), &ctx)
         .unwrap_or_else(|e| panic!("{op:?}: {e}"));
     assert_stories_agree(model, jade, &format!("after {op:?}"));
+    assert_tables_agree(model, jade, &format!("after {op:?}"));
     assert_comments_agree(model, jade, &format!("after {op:?}"));
     effect
 }

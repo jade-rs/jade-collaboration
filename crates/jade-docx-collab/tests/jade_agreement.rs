@@ -9,8 +9,9 @@ mod common;
 use std::collections::{BTreeMap, BTreeSet};
 
 use common::{
-    assert_comments_agree, assert_same_order, assert_stories_agree, char_styles, commit, generate,
-    jade_comments, jade_core, open, paragraph_formats, paragraph_snapshot, surface, CharStyle,
+    assert_comments_agree, assert_same_order, assert_stories_agree, assert_tables_agree,
+    char_styles, commit, generate, jade_comments, jade_core, open, paragraph_formats,
+    paragraph_snapshot, surface, CharStyle,
 };
 use jade_collab_core::id::{Id, ReplicaId};
 use jade_collab_sync::{ApplyContext, Document, Lane, Materializer};
@@ -23,6 +24,7 @@ use proptest::prelude::*;
 
 fn assert_agree(model: &DocxModel, jade: &JadeDocx, context: &str) {
     assert_stories_agree(model, jade, context);
+    assert_tables_agree(model, jade, context);
     let shapes: Vec<(usize, usize)> = model
         .tables()
         .iter()
