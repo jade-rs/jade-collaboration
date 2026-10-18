@@ -41,7 +41,9 @@ impl Session {
             seq: Some(self.seq + 1),
         };
         if XlsxModel::lane(&op) == Lane::Sequenced {
-            self.jade.admit(&self.model, &op).map_err(|e| e.to_string())?;
+            self.jade
+                .admit(&self.model, &op)
+                .map_err(|e| e.to_string())?;
         }
         let effect = self.model.apply(&op, &ctx).map_err(|e| e.to_string())?;
         self.seq += 1;
@@ -53,7 +55,10 @@ impl Session {
                 base_seq: self.seq - 1,
                 seq: Some(self.seq),
             };
-            let effect = self.model.apply(&derived, &ctx).map_err(|e| e.to_string())?;
+            let effect = self
+                .model
+                .apply(&derived, &ctx)
+                .map_err(|e| e.to_string())?;
             self.jade.materialize(&self.model, effect, &ctx)?;
         }
         assert_agree(&self.model, &self.jade, &format!("after {op:?}"));

@@ -88,6 +88,8 @@ pub enum XlsxIntentError {
     NoSuchSheet(String),
     #[error("{0} is outside the editable part of the sheet")]
     NoSuchCell(String),
+    #[error("{0} is an Excel table header: it holds the column's name, as text")]
+    HeaderText(String),
 }
 
 /// The rows and columns `range` (`B2:D5` or `B2`) covers, top-left first.
@@ -230,12 +232,28 @@ pub fn resolve(
             let (sheet, row, column) = view
                 .locate(sheet, reference)
                 .ok_or_else(|| XlsxIntentError::NoSuchCell(reference.clone()))?;
-            XlsxOp::SetCell {
-                sheet,
-                row,
-                column,
-                stamp: ids(1),
-                value: value.clone(),
+            // An Excel table's header names its column: a rename.
+            if view.is_table_header(sheet, row, column) {
+                let text = match value {
+                    CellInput::Text(text) => text.clone(),
+                    CellInput::Blank => String::new(),
+                    _ => return Err(XlsxIntentError::HeaderText(reference.clone())),
+                };
+                XlsxOp::SetHeader {
+                    sheet,
+                    row,
+                    column,
+                    stamp: ids(1),
+                    text,
+                }
+            } else {
+                XlsxOp::SetCell {
+                    sheet,
+                    row,
+                    column,
+                    stamp: ids(1),
+                    value: value.clone(),
+                }
             }
         }
         XlsxIntent::InsertRow { sheet, before } => {

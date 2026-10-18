@@ -165,6 +165,13 @@ proptest! {
                 Ok(effect) => {
                     jade.materialize(&model, effect, &ctx)
                         .unwrap_or_else(|e| panic!("{fixture}: jade refused {op:?}: {e}"));
+                    // As the sequencer does: what jade did on its own.
+                    for derived in jade.derived(&model, &op) {
+                        let ctx = ApplyContext { origin: ReplicaId::ORIGIN, base_seq: seq, seq: Some(seq) };
+                        let effect = model.apply(&derived, &ctx)
+                            .unwrap_or_else(|e| panic!("{fixture}: derived {derived:?}: {e}"));
+                        jade.materialize(&model, effect, &ctx).unwrap();
+                    }
                     assert_agree(&model, &jade, &format!("{fixture} after {op:?}"));
                 }
                 Err(_) => prop_assert_eq!(&model, &before),

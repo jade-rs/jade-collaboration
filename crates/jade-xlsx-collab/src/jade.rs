@@ -3,7 +3,10 @@
 use jade_collab_sync::{ApplyContext, Materializer};
 use jade_xlsx_headless_editor::HeadlessWorkbook;
 
-use crate::model::{column_label, XlsxEffect, XlsxModel};
+use crate::model::{column_label, from_view, XlsxEffect, XlsxModel, XlsxOp};
+use crate::CellInput;
+use jade_collab_core::id::{Id, ReplicaId};
+use jade_collab_sync::Document;
 
 /// The author jade records on notes written through the model; the model
 /// does not track authors. (jade's own MCP server uses the same default.)
@@ -36,6 +39,43 @@ impl JadeXlsx {
 }
 
 impl Materializer<XlsxModel> for JadeXlsx {
+    /// After a change that Excel follows up on its own inside a table — a
+    /// structural change or a header rename — every cell of the sheet's
+    /// tables is compared with the model; what jade holds differently (a new
+    /// column's `ColumnN` header, a normalised header, a filled calculated
+    /// column) comes back as derived operations.
+    fn derived(&mut self, model: &XlsxModel, cause: &XlsxOp) -> Vec<XlsxOp> {
+        let sheet = match cause {
+            XlsxOp::Structure { sheet, .. } | XlsxOp::SetHeader { sheet, .. } => *sheet,
+            _ => return Vec::new(),
+        };
+        let Some(name) = model.sheet_name(sheet) else {
+            return Vec::new();
+        };
+        let mut lamport = model.max_lamport();
+        let mut derived = Vec::new();
+        for (row, column, reference) in model.table_cells(sheet) {
+            let Ok(view) = self.book.cell(name, &reference) else {
+                continue;
+            };
+            let theirs = from_view(&view);
+            let ours = model
+                .value(sheet, row, column)
+                .filter(|v| **v != CellInput::Blank);
+            if theirs.as_ref() != ours {
+                lamport += 1;
+                derived.push(XlsxOp::Derived {
+                    sheet,
+                    row,
+                    column,
+                    stamp: Id::new(lamport, ReplicaId::ORIGIN),
+                    value: theirs.unwrap_or(CellInput::Blank),
+                });
+            }
+        }
+        derived
+    }
+
     fn materialize(
         &mut self,
         _: &XlsxModel,

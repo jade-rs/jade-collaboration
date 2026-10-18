@@ -312,10 +312,14 @@ impl Sheet {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct TableRegion {
     name: String,
+    /// The header row.
     top: Id,
+    /// The last row: the totals row when there is one.
     bottom: Id,
     left: Id,
     right: Id,
+    #[serde(default)]
+    totals: bool,
 }
 
 /// A change that rewrites formulas, at its place in the log, kept to rebase
@@ -439,6 +443,26 @@ pub enum XlsxOp {
     DeleteSheet { sheet: Id },
     /// Sequenced: to position `to` among the sheets.
     MoveSheet { sheet: Id, to: u32 },
+    /// Sequenced: renames an Excel table's column by writing its header cell
+    /// (Excel may adjust the name — a blank or repeated header — which then
+    /// arrives as a derived operation).
+    SetHeader {
+        sheet: Id,
+        row: Id,
+        column: Id,
+        stamp: Id,
+        text: String,
+    },
+    /// What jade put in a cell on its own (Excel naming a new table column,
+    /// filling a calculated column), committed by the server after the
+    /// operation that caused it; refused from anyone else.
+    Derived {
+        sheet: Id,
+        row: Id,
+        column: Id,
+        stamp: Id,
+        value: CellInput,
+    },
 }
 
 /// What jade must do; indices are 0-based.
@@ -545,7 +569,7 @@ fn normalize(value: &CellInput) -> CellInput {
     }
 }
 
-fn from_view(view: &CellView) -> Option<CellInput> {
+pub(crate) fn from_view(view: &CellView) -> Option<CellInput> {
     if let Some(formula) = &view.formula {
         return Some(CellInput::Formula(formula.clone()));
     }
@@ -636,11 +660,15 @@ impl XlsxModel {
             let column_ids = sheet.grid.columns();
             // Table name -> (top, bottom, left, right) indices.
             let mut tables: BTreeMap<String, (usize, usize, usize, usize)> = BTreeMap::new();
+            let mut with_totals: BTreeSet<String> = BTreeSet::new();
             for (r, cells) in range.rows.iter().enumerate() {
                 for (c, view) in cells.iter().enumerate() {
                     if let Some(table) = &view.table {
                         if table.header || table.totals {
                             sheet.protected.insert((row_ids[r], column_ids[c]));
+                        }
+                        if table.totals {
+                            with_totals.insert(table.name.clone());
                         }
                         let span = tables.entry(table.name.clone()).or_insert((r, r, c, c));
                         *span = (span.0.min(r), span.1.max(r), span.2.min(c), span.3.max(c));
@@ -684,6 +712,7 @@ impl XlsxModel {
             sheet.tables = tables
                 .into_iter()
                 .map(|(name, (top, bottom, left, right))| TableRegion {
+                    totals: with_totals.contains(&name),
                     name,
                     top: row_ids[top],
                     bottom: row_ids[bottom],
@@ -966,28 +995,67 @@ impl XlsxModel {
             }
         };
         let at = at.expect("the grid validated the line");
-        // Inside an Excel table: strictly below its header (an insert) or on
-        // any of its rows (a delete), and likewise for columns.
-        let inside = s.tables.iter().any(|t| {
+        // Inside an Excel table jade grows or shrinks the table, as Excel
+        // does; the header and totals rows stay, and a table keeps one data
+        // row and one column. What Excel fills in on its own (a new
+        // column's name) reaches the model as derived operations.
+        for t in &s.tables {
             let (first, last) = match axis {
                 Axis::Rows => (s.grid.row_index(t.top), s.grid.row_index(t.bottom)),
                 Axis::Columns => (s.grid.column_index(t.left), s.grid.column_index(t.right)),
             };
             let (Some(first), Some(last)) = (first, last) else {
-                return false;
+                continue;
             };
-            if inserted {
-                first < at && at <= last
-            } else {
-                first <= at && at <= last
+            if inserted || at < first || at > last {
+                continue;
             }
-        });
-        if inside {
-            return Err(reject(
-                "rows and columns inside an Excel table cannot be inserted or deleted yet",
-            ));
+            let refused = match axis {
+                Axis::Rows => {
+                    let data_rows = last - first - usize::from(t.totals);
+                    at == first || (t.totals && at == last) || data_rows <= 1
+                }
+                Axis::Columns => first == last,
+            };
+            if refused {
+                return Err(reject(
+                    "a table keeps its header and totals rows, one data row and one column",
+                ));
+            }
         }
-        self.sheets[index].grid = grid;
+        let new_header_cells: Vec<(Id, Id)> = match (axis, inserted, new) {
+            (Axis::Columns, true, Some(column)) => s
+                .tables
+                .iter()
+                .filter(|t| {
+                    let (first, last) = (s.grid.column_index(t.left), s.grid.column_index(t.right));
+                    matches!((first, last), (Some(first), Some(last)) if first < at && at <= last)
+                })
+                .flat_map(|t| {
+                    std::iter::once((t.top, column)).chain(t.totals.then_some((t.bottom, column)))
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        let sheet_mut = &mut self.sheets[index];
+        sheet_mut.grid = grid;
+        sheet_mut.protected.extend(new_header_cells);
+        if !inserted {
+            // A deleted edge line moves the table's edge to the next line in.
+            let grid = &sheet_mut.grid;
+            for t in &mut sheet_mut.tables {
+                if let Some((top, bottom)) =
+                    alive_between(&grid.all_rows(), &grid.rows(), t.top, t.bottom)
+                {
+                    (t.top, t.bottom) = (top, bottom);
+                }
+                if let Some((left, right)) =
+                    alive_between(&grid.all_columns(), &grid.columns(), t.left, t.right)
+                {
+                    (t.left, t.right) = (left, right);
+                }
+            }
+        }
         let at = at as u32;
         let change = StructureChange {
             sheet: name.clone(),
@@ -1009,7 +1077,115 @@ impl XlsxModel {
     }
 }
 
+/// The first and last alive line of `all` between `from` and `to`.
+fn alive_between(all: &[Id], alive: &[Id], from: Id, to: Id) -> Option<(Id, Id)> {
+    let a = all.iter().position(|l| *l == from)?;
+    let b = all.iter().position(|l| *l == to)?;
+    let mut inside = all[a.min(b)..=a.max(b)]
+        .iter()
+        .filter(|l| alive.contains(l));
+    let first = *inside.next()?;
+    Some((first, inside.next_back().copied().unwrap_or(first)))
+}
+
 impl XlsxModel {
+    /// Whether `(row, column)` is a header cell of one of the sheet's Excel
+    /// tables — what [`XlsxOp::SetHeader`] writes.
+    pub fn is_table_header(&self, sheet: Id, row: Id, column: Id) -> bool {
+        let Some(s) = self.sheets.iter().find(|s| s.id == sheet) else {
+            return false;
+        };
+        s.tables.iter().any(|t| {
+            t.top == row && lines_between(&s.grid.columns(), t.left, t.right).contains(&column)
+        })
+    }
+
+    /// The alive cells of the sheet's Excel tables, with their A1 references:
+    /// where Excel acts on its own, so where the server compares jade with
+    /// the model to derive operations.
+    pub(crate) fn table_cells(&self, sheet: Id) -> Vec<(Id, Id, String)> {
+        let Some(s) = self.sheets.iter().find(|s| s.id == sheet && !s.deleted) else {
+            return Vec::new();
+        };
+        let mut cells = Vec::new();
+        for t in &s.tables {
+            for row in lines_between(&s.grid.rows(), t.top, t.bottom) {
+                for column in lines_between(&s.grid.columns(), t.left, t.right) {
+                    if let Some(reference) = s.reference(row, column) {
+                        cells.push((row, column, reference));
+                    }
+                }
+            }
+        }
+        cells
+    }
+
+    pub(crate) fn sheet_name(&self, sheet: Id) -> Option<&str> {
+        self.sheets
+            .iter()
+            .find(|s| s.id == sheet)
+            .map(|s| s.name.as_str())
+    }
+
+    fn set_header(
+        &mut self,
+        sheet: Id,
+        row: Id,
+        column: Id,
+        stamp: Id,
+        text: &str,
+    ) -> Result<Vec<XlsxEffect>, Rejection> {
+        let index = self.alive_sheet(sheet)?;
+        if !self.is_table_header(sheet, row, column) {
+            return Err(reject("not a header cell of an Excel table"));
+        }
+        self.max_lamport = self.max_lamport.max(stamp.lamport);
+        let value = normalize(&CellInput::Text(text.to_string()));
+        let s = &mut self.sheets[index];
+        if !s
+            .cells
+            .entry((row, column))
+            .or_default()
+            .apply(stamp, value.clone())
+        {
+            return Ok(Vec::new());
+        }
+        Ok(s.reference(row, column)
+            .map(|reference| XlsxEffect::SetCell {
+                sheet: s.name.clone(),
+                reference,
+                value,
+            })
+            .into_iter()
+            .collect())
+    }
+
+    /// A value jade put in a cell on its own; only the server commits these.
+    fn derived(
+        &mut self,
+        sheet: Id,
+        row: Id,
+        column: Id,
+        stamp: Id,
+        value: &CellInput,
+        ctx: &ApplyContext,
+    ) -> Result<Vec<XlsxEffect>, Rejection> {
+        if ctx.origin != ReplicaId::ORIGIN {
+            return Err(reject("only the server commits what jade derived"));
+        }
+        let index = self.sheet_index(sheet)?;
+        if !self.sheets[index].contains(row, column) {
+            return Err(reject("no such cell"));
+        }
+        self.max_lamport = self.max_lamport.max(stamp.lamport);
+        self.sheets[index]
+            .cells
+            .entry((row, column))
+            .or_default()
+            .apply(stamp, normalize(value));
+        Ok(Vec::new())
+    }
+
     fn alive_sheet(&self, sheet: Id) -> Result<usize, Rejection> {
         let index = self.sheet_index(sheet)?;
         if self.sheets[index].deleted {
@@ -1352,7 +1528,9 @@ impl Document for XlsxModel {
             | XlsxOp::AddSheet { .. }
             | XlsxOp::RenameSheet { .. }
             | XlsxOp::DeleteSheet { .. }
-            | XlsxOp::MoveSheet { .. } => Lane::Sequenced,
+            | XlsxOp::MoveSheet { .. }
+            | XlsxOp::SetHeader { .. }
+            | XlsxOp::Derived { .. } => Lane::Sequenced,
             // Id-keyed last-writer-wins registers (per attribute for
             // formats) commute and do not depend on the log position.
             XlsxOp::SetNote { .. } | XlsxOp::SetFormat { .. } => Lane::Convergent,
@@ -1399,6 +1577,20 @@ impl Document for XlsxModel {
             XlsxOp::RenameSheet { sheet, name } => self.rename_sheet(*sheet, name, ctx),
             XlsxOp::DeleteSheet { sheet } => self.delete_sheet(*sheet, ctx),
             XlsxOp::MoveSheet { sheet, to } => self.move_sheet(*sheet, *to),
+            XlsxOp::SetHeader {
+                sheet,
+                row,
+                column,
+                stamp,
+                text,
+            } => self.set_header(*sheet, *row, *column, *stamp, text),
+            XlsxOp::Derived {
+                sheet,
+                row,
+                column,
+                stamp,
+                value,
+            } => self.derived(*sheet, *row, *column, *stamp, value, ctx),
         }
     }
 

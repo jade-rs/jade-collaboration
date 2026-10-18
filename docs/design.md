@@ -268,11 +268,16 @@ rebased through them in log order, under the name its sheet had at each
 change. A deleted sheet stays in the model, invisible, so a convergent
 write made before the deletion was seen still lands and commutes.
 
-Excel tables (ListObjects) rewrite what is typed into their header and totals
-rows (a blank header becomes `Column1`) and name or fill new rows and columns
-inserted inside them. The model cannot predict that, so those cells are
-read-only and structure inside a table is refused — on every replica, from
-state loaded with the file, so the refusal never needs the server.
+Excel tables (ListObjects) do things on their own: a column inserted inside
+a table gets a `ColumnN` header, a blank or repeated header is renamed, a
+calculated column fills new rows. Rows and columns may be inserted and
+deleted inside a table — the table grows and shrinks with them, its header
+and totals rows stay, and it keeps one data row and one column — and a
+header is renamed with the sequenced `SetHeader` (an intent's `set_cell` on
+a header cell becomes one). Whatever Excel then fills in reaches the model
+as **derived operations** (§5): the server compares the sheet's table cells
+in jade with the model after each such change and commits the differences.
+Writing a header or totals cell as a plain value stays refused.
 
 ### Presentations (`jade-pptx-collab`)
 
@@ -334,6 +339,17 @@ UTF-16 ranges on jade's own text.
 Clients do not need jade: an AI agent, a CLI or a test works on the model. A
 jade editor client additionally applies the same effects to its local
 `WordDocument`.
+
+**Derived operations.** The real document also *does* things the model
+cannot predict (Excel naming a new table column). After committing an
+operation the sequencer asks the materializer what jade did on its own
+(`Materializer::derived`) and commits each answer as an operation of the
+document's origin (replica 0), right after its cause; the server journals
+and broadcasts them like any commit, and a replayed journal applies them
+without asking again. Only the origin may commit them (the model refuses
+them from anyone else), and they carry no effect — jade already holds what
+it derived. Replicas need nothing new: a derived operation is a remote
+sequenced operation like any other.
 
 The real document can know things the model does not. A `Materializer` may
 therefore **refuse a sequenced operation before it is applied**
@@ -560,7 +576,6 @@ Not yet:
   comments; note authors are not modelled (jade records `jade`).
 * docx structure of ragged and nested tables (their text is editable),
   rows/columns through merged regions, text boxes, notes, tracked changes.
-* Excel table (ListObject) structure and header edits.
 * Access and durability: a connection's outgoing queue is unbounded (a
   client that stops reading makes it grow), there is no audit log of who
   connected with which token, and reloading tokens on SIGHUP is Unix-only

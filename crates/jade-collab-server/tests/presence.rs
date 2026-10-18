@@ -349,9 +349,12 @@ async fn a_default_server_limits_a_presence_flood_and_keeps_every_operation() {
             type_at_end(&a, "a");
         }
     }
+    // One more operation: its acknowledgement comes after the answers to
+    // every presence update sent before it, rejections included.
+    type_at_end(&flooder, "f");
     settled(&flooder).await;
     settled(&a).await;
-    assert_eq!(server.seq("hello.docx").await.unwrap(), 40);
+    assert_eq!(server.seq("hello.docx").await.unwrap(), 41);
     let rejected = flooder.take_presence_rejections();
     assert!(rejected.len() > 300, "{} rejected", rejected.len());
     // A huge state is refused whatever the rate.
@@ -361,7 +364,7 @@ async fn a_default_server_limits_a_presence_flood_and_keeps_every_operation() {
     let rejected = flooder.take_presence_rejections();
     assert_eq!(rejected.len(), 1, "{rejected:?}");
     assert!(rejected[0].contains("bytes"), "{rejected:?}");
-    tokio::time::timeout(Duration::from_secs(20), a.wait_for_seq(41))
+    tokio::time::timeout(Duration::from_secs(20), a.wait_for_seq(42))
         .await
         .unwrap()
         .unwrap();

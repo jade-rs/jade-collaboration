@@ -230,3 +230,36 @@ fn merge_and_sheet_intents() {
     apply(&mut model, r#"{"type":"delete_sheet","sheet":"S"}"#).unwrap();
     assert!(apply(&mut model, r#"{"type":"delete_sheet","sheet":"Totals"}"#).is_err());
 }
+
+#[test]
+fn setting_a_table_header_renames_the_column() {
+    use jade_xlsx_collab::XlsxOp;
+    let bytes = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../jade-core/public/fixtures/grid-operations-workbook.xlsx"
+    ))
+    .unwrap();
+    let jade = jade_xlsx_collab::JadeXlsx::open(&bytes).unwrap();
+    let model = XlsxModel::from_workbook(jade.workbook(), Default::default()).unwrap();
+    let intent: XlsxIntent = serde_json::from_str(
+        r#"{"type":"set_cell","sheet":"Operations","reference":"A1","value":{"kind":"text","value":"Label"}}"#,
+    )
+    .unwrap();
+    let mut next = model.max_lamport() + 1;
+    let op = resolve(&model, &intent, &mut |n| {
+        let id = Id::new(next, ReplicaId(3));
+        next += n;
+        id
+    })
+    .unwrap();
+    assert!(
+        matches!(op, XlsxOp::SetHeader { ref text, .. } if text == "Label"),
+        "{op:?}"
+    );
+    // A header holds text only.
+    let number: XlsxIntent = serde_json::from_str(
+        r#"{"type":"set_cell","sheet":"Operations","reference":"A1","value":{"kind":"number","value":1}}"#,
+    )
+    .unwrap();
+    assert!(resolve(&model, &number, &mut |_| Id::new(1, ReplicaId(3))).is_err());
+}

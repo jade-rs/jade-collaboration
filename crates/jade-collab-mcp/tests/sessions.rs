@@ -196,36 +196,32 @@ async fn edits_the_document_refuses_are_reported_as_rejected() {
     let hosted = Hosted::start().await;
     let mut agent = Agent::new();
 
-    // Excel rewrites a table's header row, and rows inside a table cannot
-    // be deleted yet.
+    // Writing a table's header renames its column; its header row cannot be
+    // deleted.
     let book = agent.join(&hosted.url(XLSX)).await;
     let applied = agent
         .apply(
             &book,
             json!([
                 { "type": "set_cell", "sheet": "Operations", "reference": "A1", "value": { "kind": "text", "value": "Who" } },
-                { "type": "delete_row", "sheet": "Operations", "row": 3 },
+                { "type": "delete_row", "sheet": "Operations", "row": 1 },
                 { "type": "set_cell", "sheet": "Operations", "reference": "B3", "value": { "kind": "number", "value": 7 } },
             ]),
         )
         .await;
     assert_eq!(
         statuses(&applied),
-        ["rejected", "rejected", "applied"],
+        ["applied", "rejected", "applied"],
         "{applied}"
     );
-    assert!(applied["results"][0]["reason"]
-        .as_str()
-        .unwrap()
-        .contains("read-only"));
     assert!(applied["results"][1]["reason"]
         .as_str()
         .unwrap()
-        .contains("Excel table"));
+        .contains("header"));
     let read = agent.read_all(&book).await;
     assert_eq!(
         read["sheets"][0]["cells"]["A1"],
-        json!({ "kind": "text", "value": "Name" })
+        json!({ "kind": "text", "value": "Who" })
     );
 
     // Someone else puts a table after the first paragraph; joining the

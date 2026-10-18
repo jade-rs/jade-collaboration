@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 164a4e4e1d40f1d13b63ed872ecf1e6aebac2399519f1e28759b5799dc4fa42a # shrinks to steps = [Bad(Object {"arguments": Object {"url": String("ws://127.0.0.1:1/documents/x.pptx/ws")}, "name": String("join_document")})]
+cc 846610dc14b124ec4f8c938a6550f9d3eeca1b7fc734f167b12be879815a729d # shrinks to steps = [Join { xlsx: true }, Apply { session: 0, edits: [(Object {"offset": Number(0), "paragraph": Number(0), "text": String(""), "type": String("insert_text")}, Object {"reference": String("A1"), "sheet": String("Operations"), "type": String("set_cell"), "value": Object {"kind": String("blank")}}, false)] }]

@@ -303,7 +303,22 @@ async fn run(steps: Vec<Step>) {
                     let applied = agent.apply(id, json!(edits)).await;
                     assert_eq!(statuses(&applied), expected, "{applied}");
                     assert_eq!(applied["pending"], json!(0), "{applied}");
-                    assert_eq!(content(agent.read_all(id).await), after);
+                    if *name == DOCX {
+                        assert_eq!(content(agent.read_all(id).await), after);
+                    } else {
+                        // The server may follow an edit with what jade did on
+                        // its own (Excel naming a new table column): the
+                        // session must read what the independent replica
+                        // reads once both have the whole log.
+                        let seq = hosted.server.seq(name).await.unwrap();
+                        agent.catch_up(id, seq).await;
+                        hosted.catch_up(XLSX, &xlsx).await;
+                        assert_eq!(
+                            content(agent.read_all(id).await),
+                            read_xlsx(&xlsx.view(), 0, usize::MAX)
+                        );
+                        let _ = after;
+                    }
                 }
             }
             Step::Wait { session, after } => {
