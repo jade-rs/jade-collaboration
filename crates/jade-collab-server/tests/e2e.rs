@@ -53,8 +53,8 @@ where
 async fn a_person_and_an_agent_edit_a_docx_together() {
     let (server, base) = start().await;
     let url = format!("{base}/hello.docx/ws");
-    let person: Client<DocxModel> = Client::connect(&url).await.unwrap();
-    let agent: Client<DocxModel> = Client::connect(&url).await.unwrap();
+    let person: Client<DocxModel> = Client::connect(&url, None).await.unwrap();
+    let agent: Client<DocxModel> = Client::connect(&url, None).await.unwrap();
     assert_ne!(person.id(), agent.id());
     assert_eq!(person.view(), agent.view());
     let original = person.view().paragraphs()[0].text.clone();
@@ -137,8 +137,8 @@ async fn a_person_and_an_agent_edit_a_docx_together() {
 async fn a_rejected_structural_edit_comes_back_to_its_author() {
     let (server, base) = start().await;
     let url = format!("{base}/hello.docx/ws");
-    let a: Client<DocxModel> = Client::connect(&url).await.unwrap();
-    let b: Client<DocxModel> = Client::connect(&url).await.unwrap();
+    let a: Client<DocxModel> = Client::connect(&url, None).await.unwrap();
+    let b: Client<DocxModel> = Client::connect(&url, None).await.unwrap();
 
     // A splits the first paragraph and the split reaches everyone.
     let end = a.view().paragraphs()[0].chars.last().copied();
@@ -172,7 +172,7 @@ async fn a_rejected_structural_edit_comes_back_to_its_author() {
     a.settle().await.unwrap();
 
     // Back online, B's join reaches the server after the table: refused.
-    let b: Client<DocxModel> = Client::resume(&url, offline).await.unwrap();
+    let b: Client<DocxModel> = Client::resume(&url, offline, None).await.unwrap();
     b.settle().await.unwrap();
     let events = b.take_events();
     assert!(
@@ -191,8 +191,8 @@ async fn a_rejected_structural_edit_comes_back_to_its_author() {
 async fn spreadsheet_cells_and_rows_converge() {
     let (server, base) = start().await;
     let url = format!("{base}/book.xlsx/ws");
-    let a: Client<XlsxModel> = Client::connect(&url).await.unwrap();
-    let b: Client<XlsxModel> = Client::connect(&url).await.unwrap();
+    let a: Client<XlsxModel> = Client::connect(&url, None).await.unwrap();
+    let b: Client<XlsxModel> = Client::connect(&url, None).await.unwrap();
 
     let view = a.view();
     let (sheet, row6, e) = view.locate("Operations", "E6").unwrap();
@@ -263,8 +263,8 @@ async fn spreadsheet_cells_and_rows_converge() {
 async fn a_client_that_drops_resumes_where_it_left_off() {
     let (server, base) = start().await;
     let url = format!("{base}/hello.docx/ws");
-    let a: Client<DocxModel> = Client::connect(&url).await.unwrap();
-    let b: Client<DocxModel> = Client::connect(&url).await.unwrap();
+    let a: Client<DocxModel> = Client::connect(&url, None).await.unwrap();
+    let b: Client<DocxModel> = Client::connect(&url, None).await.unwrap();
     let replica = a.disconnect().await;
 
     // While A is away, B edits.
@@ -278,7 +278,7 @@ async fn a_client_that_drops_resumes_where_it_left_off() {
     .unwrap();
     b.settle().await.unwrap();
 
-    let a = Client::resume(&url, replica).await.unwrap();
+    let a = Client::resume(&url, replica, None).await.unwrap();
     catch_up(&server, "hello.docx", &a).await;
     assert_eq!(a.view(), b.view());
 }
@@ -287,6 +287,6 @@ async fn a_client_that_drops_resumes_where_it_left_off() {
 async fn unknown_documents_are_refused() {
     let (_server, base) = start().await;
     let result: Result<Client<DocxModel>, _> =
-        Client::connect(&format!("{base}/missing.docx/ws")).await;
+        Client::connect(&format!("{base}/missing.docx/ws"), None).await;
     assert!(result.is_err());
 }

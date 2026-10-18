@@ -112,10 +112,10 @@ async fn a_restarted_server_resumes_every_replica_where_it_was() {
     let docx = format!("{base}/hello.docx/ws");
     let xlsx = format!("{base}/book.xlsx/ws");
 
-    let a: Client<DocxModel> = Client::connect(&docx).await.unwrap();
-    let b: Client<DocxModel> = Client::connect(&docx).await.unwrap();
-    let c: Client<XlsxModel> = Client::connect(&xlsx).await.unwrap();
-    let d: Client<XlsxModel> = Client::connect(&xlsx).await.unwrap();
+    let a: Client<DocxModel> = Client::connect(&docx, None).await.unwrap();
+    let b: Client<DocxModel> = Client::connect(&docx, None).await.unwrap();
+    let c: Client<XlsxModel> = Client::connect(&xlsx, None).await.unwrap();
+    let d: Client<XlsxModel> = Client::connect(&xlsx, None).await.unwrap();
     type_text(&a, 0, "[a] ");
     type_text(&b, 0, "[b] ");
     set_cell(&c, "E6", CellInput::Number(7.0));
@@ -158,16 +158,16 @@ async fn a_restarted_server_resumes_every_replica_where_it_was() {
     let (base, _task) = listen(&server).await;
     let docx = format!("{base}/hello.docx/ws");
     let xlsx = format!("{base}/book.xlsx/ws");
-    let a = Client::resume(&docx, a).await.unwrap();
-    let b = Client::resume(&docx, b).await.unwrap();
-    let c = Client::resume(&xlsx, c).await.unwrap();
-    let d = Client::resume(&xlsx, d).await.unwrap();
+    let a = Client::resume(&docx, a, None).await.unwrap();
+    let b = Client::resume(&docx, b, None).await.unwrap();
+    let c = Client::resume(&xlsx, c, None).await.unwrap();
+    let d = Client::resume(&xlsx, d, None).await.unwrap();
     assert_eq!(a.view(), view_before, "the model itself was restored");
 
     // Editing goes on, and a newcomer gets a fresh replica id.
     type_text(&b, 1, "after ");
     set_cell(&c, "E7", CellInput::Text("after".into()));
-    let e: Client<DocxModel> = Client::connect(&docx).await.unwrap();
+    let e: Client<DocxModel> = Client::connect(&docx, None).await.unwrap();
     assert!(
         e.id() > a.id() && e.id() > b.id(),
         "replica ids are not reused"
@@ -204,10 +204,10 @@ async fn checkpoints_bound_the_log_and_replicas_behind_them_must_rejoin() {
     let (base, task) = listen(&server).await;
     let url = format!("{base}/hello.docx/ws");
 
-    let writer: Client<DocxModel> = Client::connect(&url).await.unwrap();
-    let idle: Client<DocxModel> = Client::connect(&url).await.unwrap();
+    let writer: Client<DocxModel> = Client::connect(&url, None).await.unwrap();
+    let idle: Client<DocxModel> = Client::connect(&url, None).await.unwrap();
     let idle = idle.disconnect().await;
-    let idle_live: Client<DocxModel> = Client::connect(&url).await.unwrap();
+    let idle_live: Client<DocxModel> = Client::connect(&url, None).await.unwrap();
     let idle_live = idle_live.disconnect().await;
     for i in 0..10 {
         type_text(&writer, 0, &format!("{i}"));
@@ -215,7 +215,7 @@ async fn checkpoints_bound_the_log_and_replicas_behind_them_must_rejoin() {
     }
     catch_up(&server, "hello.docx", &writer).await;
     // A running server forgets the log before its checkpoint too.
-    let error = Client::resume(&url, idle_live)
+    let error = Client::resume(&url, idle_live, None)
         .await
         .err()
         .expect("refused");
@@ -246,13 +246,16 @@ async fn checkpoints_bound_the_log_and_replicas_behind_them_must_rejoin() {
     let (base, _task) = listen(&server).await;
     let url = format!("{base}/hello.docx/ws");
 
-    let writer = Client::resume(&url, writer).await.unwrap();
+    let writer = Client::resume(&url, writer, None).await.unwrap();
     assert_eq!(writer.seq(), 10);
     // The idle replica was at log position 0, long compacted away.
-    let error = Client::resume(&url, idle).await.err().expect("refused");
+    let error = Client::resume(&url, idle, None)
+        .await
+        .err()
+        .expect("refused");
     assert!(matches!(error, ClientError::Rejoin(_)), "{error}");
     assert!(error.to_string().contains("join again"), "{error}");
-    let rejoined: Client<DocxModel> = Client::connect(&url).await.unwrap();
+    let rejoined: Client<DocxModel> = Client::connect(&url, None).await.unwrap();
     assert_eq!(rejoined.view(), writer.view());
 }
 
@@ -262,7 +265,7 @@ async fn a_torn_last_journal_line_is_dropped() {
     let server = Server::with_storage(dir.path()).unwrap();
     server.open("hello.docx", fixture("hello.docx")).unwrap();
     let (base, task) = listen(&server).await;
-    let writer: Client<DocxModel> = Client::connect(&format!("{base}/hello.docx/ws"))
+    let writer: Client<DocxModel> = Client::connect(&format!("{base}/hello.docx/ws"), None)
         .await
         .unwrap();
     type_text(&writer, 0, "kept ");
@@ -291,7 +294,7 @@ async fn a_torn_last_journal_line_is_dropped() {
     assert_eq!(server.export("hello.docx").await.unwrap(), before);
     // And the journal goes on from there.
     let (base, _task) = listen(&server).await;
-    let writer: Client<DocxModel> = Client::connect(&format!("{base}/hello.docx/ws"))
+    let writer: Client<DocxModel> = Client::connect(&format!("{base}/hello.docx/ws"), None)
         .await
         .unwrap();
     type_text(&writer, 0, "more ");
