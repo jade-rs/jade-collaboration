@@ -13,7 +13,8 @@ use jade_docx_document_core::word_document::{
 };
 use jade_docx_document_core::Options;
 use jade_docx_headless_api::{
-    HeadlessCommand, HeadlessEditRequest, HeadlessShapeKind, HeadlessTableCellSelection,
+    HeadlessCommand, HeadlessDeleteDirection, HeadlessEditRequest, HeadlessShapeKind,
+    HeadlessTableCellSelection,
 };
 
 use crate::model::{DocxEffect, DocxModel, DocxOp, FormatChange, NoteKind, Numbered, StoryId};
@@ -365,6 +366,61 @@ impl JadeDocx {
         .map_err(|e| format!("{description}: {e}"))
     }
 
+    /// Runs `command(offset)`, which inserts a text box or note reference at
+    /// a rendered offset, so that it lands `offset` bytes into the paragraph
+    /// at surface `s` after `anchors` of its text boxes and note references.
+    ///
+    /// jade puts a new one before the anchors already at its offset. To put
+    /// it after some of them, the materializer types a placeholder after
+    /// those, inserts right after the placeholder — before the anchors that
+    /// moved on with it — and deletes the placeholder again.
+    fn insert_anchor(
+        &mut self,
+        s: usize,
+        offset: usize,
+        anchors: usize,
+        command: impl FnOnce(usize) -> HeadlessCommand,
+    ) -> Result<(), String> {
+        let before = self
+            .word
+            .paragraph_anchors(s)
+            .iter()
+            .filter(|a| a.offset < offset)
+            .count();
+        if anchors == before {
+            let at = self.rendered(s, offset);
+            return self.run(command(at));
+        }
+        let Some(after) = anchors.checked_sub(before) else {
+            return Err(format!(
+                "jade has {before} text boxes or note references before offset {offset} of \
+                 paragraph {s}; the model has {anchors}"
+            ));
+        };
+        let saved = self.word.clone();
+        let result = (|| {
+            self.run(HeadlessCommand::InsertTextAmongAnchors {
+                paragraph: s,
+                offset: self.rendered(s, offset),
+                after_anchors: after,
+                text: PLACEHOLDER.to_string(),
+            })?;
+            self.run(command(self.rendered(s, offset + PLACEHOLDER.len())))?;
+            let start = self.rendered_after(s, offset, anchors)?;
+            self.run(HeadlessCommand::ReplaceRange {
+                start_paragraph: s,
+                start_offset: start,
+                end_paragraph: s,
+                end_offset: start + PLACEHOLDER.len(),
+                text: String::new(),
+            })
+        })();
+        if result.is_err() {
+            self.word = saved;
+        }
+        result
+    }
+
     /// Joins the paragraph at `at` (its text `len` bytes long) with the next
     /// paragraph of its story, which jade must list right after it.
     fn join(&mut self, at: &ParagraphStory, len: usize) -> Result<(), String> {
@@ -373,6 +429,22 @@ impl JadeDocx {
             return Err(format!(
                 "jade lists a text box or note between {at:?} and the next paragraph"
             ));
+        }
+        // A ranged join starts at the first paragraph's rendered end, before
+        // a trailing text box or note reference, and would drop it; deleting
+        // the break from the second paragraph's start keeps it.
+        let trailing = self
+            .word
+            .paragraph_anchors(first)
+            .iter()
+            .any(|a| a.offset == len);
+        if trailing {
+            return self.run(HeadlessCommand::DeleteText {
+                paragraph: second,
+                offset: self.rendered(second, 0),
+                direction: HeadlessDeleteDirection::Backward,
+                count: 1,
+            });
         }
         let command = HeadlessCommand::ReplaceRange {
             start_paragraph: first,
@@ -618,9 +690,8 @@ impl JadeDocx {
                 text,
             } => {
                 let s = self.surface(&paragraph)?;
-                let offset = self.rendered_after(s, offset, anchors)?;
                 let before = self.note_ids(kind);
-                let command = match kind {
+                self.insert_anchor(s, offset, anchors, |offset| match kind {
                     NoteKind::Footnote => HeadlessCommand::InsertFootnote {
                         paragraph: s,
                         offset,
@@ -631,8 +702,7 @@ impl JadeDocx {
                         offset,
                         text,
                     },
-                };
-                self.run(command)?;
+                })?;
                 let mut new = self
                     .note_ids(kind)
                     .into_iter()
@@ -694,17 +764,19 @@ impl JadeDocx {
                 height_px,
             } => {
                 let s = self.surface(&paragraph)?;
-                HeadlessCommand::InsertShape {
-                    paragraph: s,
-                    offset: self.rendered_after(s, offset, anchors)?,
-                    shape: HeadlessShapeKind::Rectangle,
-                    width_px: f64::from(width_px),
-                    height_px: f64::from(height_px),
-                    fill_color: None,
-                    border_color: Some("000000".to_string()),
-                    border_width_px: 1.0,
-                    text,
-                }
+                return self.insert_anchor(s, offset, anchors, |offset| {
+                    HeadlessCommand::InsertShape {
+                        paragraph: s,
+                        offset,
+                        shape: HeadlessShapeKind::Rectangle,
+                        width_px: f64::from(width_px),
+                        height_px: f64::from(height_px),
+                        fill_color: None,
+                        border_color: Some("000000".to_string()),
+                        border_width_px: 1.0,
+                        text,
+                    }
+                });
             }
             DocxEffect::DeleteTextBox {
                 paragraph,
@@ -728,6 +800,10 @@ impl JadeDocx {
         self.run(command)
     }
 }
+
+/// Typed and deleted again to put a text box or note reference after some
+/// of the anchors at an offset.
+const PLACEHOLDER: &str = "X";
 
 /// The paragraph after `at` in its story.
 fn next_paragraph(at: &ParagraphStory) -> ParagraphStory {

@@ -425,8 +425,8 @@ pub enum FormatChange {
     },
 }
 
-/// The sizes a new text box may have, in pixels.
-const TEXT_BOX_PX: std::ops::RangeInclusive<u32> = 1..=10_000;
+/// The sizes jade draws a new text box at, in pixels.
+const TEXT_BOX_PX: std::ops::RangeInclusive<u32> = 12..=4096;
 
 /// Word's limits: 1pt to 1638pt.
 const FONT_HALF_POINTS: std::ops::RangeInclusive<u32> = 2..=3276;
@@ -586,8 +586,7 @@ pub enum DocxOp {
     },
     /// Sequenced. Deletes `mark`, joining its paragraph with the next one.
     /// Refused while a table, or a text box or footnote the paragraph
-    /// places, follows the paragraph, and while the paragraph ends with a
-    /// text box or note reference (jade's join drops it).
+    /// places, follows the paragraph.
     JoinParagraph { story: StoryId, mark: Id },
     /// Sequenced. A new empty table in the body.
     InsertTable {
@@ -654,10 +653,7 @@ pub enum DocxOp {
     /// note is a new story keyed by `id` holding one paragraph with a tab
     /// and `text` (what jade writes into a new note), its characters
     /// `id.offset(1)`, `id.offset(2)`, …. Refused where jade cannot put the
-    /// reference (in a text box or a note) and where a text box or note
-    /// reference already sits: jade types only before or after all the
-    /// anchors at an offset, and concurrent typing at the caret could land
-    /// between the new reference and the old one.
+    /// reference: in a text box or a note.
     InsertNote {
         kind: NoteKind,
         story: StoryId,
@@ -817,8 +813,7 @@ pub enum DocxEffect {
         text: String,
     },
     /// A new note `note` at `offset` of `paragraph`, after `anchors` of its
-    /// text boxes and note references (all those before the offset; none
-    /// sits at it).
+    /// text boxes and note references.
     InsertNote {
         kind: NoteKind,
         note: Id,
@@ -833,7 +828,7 @@ pub enum DocxEffect {
         note: Id,
     },
     /// A new text box at `offset` of `paragraph`, after `anchors` of its
-    /// text boxes and note references (none sits at the offset).
+    /// text boxes and note references.
     InsertTextBox {
         paragraph: ParagraphStory,
         offset: usize,
@@ -1441,20 +1436,6 @@ impl DocxModel {
             if paragraphs.get(p + 1).map(|q| q.story) != Some(story_id) {
                 return Err(reject(
                     "a text box or a note sits between the paragraphs; they cannot be joined",
-                ));
-            }
-        }
-        // jade's join starts at the paragraph's rendered end, before a
-        // trailing note reference or text box, and drops it.
-        if let Some(p) = ordinal {
-            let paragraph = &paragraphs[p];
-            if paragraph
-                .anchors
-                .last()
-                .is_some_and(|a| a.offset == paragraph.text.len())
-            {
-                return Err(reject(
-                    "a paragraph ending with a text box or note reference cannot be joined with the next",
                 ));
             }
         }
@@ -2100,30 +2081,12 @@ impl DocxModel {
                 "jade puts notes and text boxes in body paragraphs and table cells only",
             ));
         }
+        // It goes wherever its parent puts it, among the anchors at its
+        // offset too: whether it is accepted must not depend on the text
+        // around it, which concurrent convergent edits change.
         let host = self.editable_story(story)?;
         let mut flow = host.flow.clone();
         flow.insert(id, parent, Atom::Anchor(placement))?;
-        // jade puts a new anchor before the ones already at its offset and
-        // types only before or after all of them: text typed at this caret
-        // concurrently could land between the new anchor and an old one,
-        // which jade cannot write. So no other anchor may sit right next
-        // to it.
-        let index = flow.visible_index(id).expect("just inserted");
-        let neighbours = [
-            index.checked_sub(1).and_then(|i| flow.visible_id_at(i)),
-            flow.visible_id_at(index + 1),
-        ];
-        let anchor = |id: Option<Id>| {
-            matches!(
-                id.and_then(|id| flow.get(id)).map(|n| &n.value),
-                Some(Atom::Anchor(_))
-            )
-        };
-        if neighbours.into_iter().any(anchor) {
-            return Err(reject(
-                "a note or text box cannot go where a text box or note reference already sits",
-            ));
-        }
         let host = std::mem::replace(&mut self.story_mut(story).expect("checked").flow, flow);
         let located = self.paragraphs().into_iter().find_map(|p| {
             let at = p.anchors.iter().position(|a| a.id == id)?;
