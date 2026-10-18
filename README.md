@@ -30,6 +30,7 @@ crates/
   jade-docx-collab     docx model, jade materializer, paragraph/offset intent API
   jade-xlsx-collab     xlsx model, jade materializer, A1 intent API
   jade-collab-server   WebSocket server, client, and the `jade-collab` CLI
+  jade-collab-mcp      MCP server through which AI agents join as replicas
 lean/                  Lean 4 proofs of the specifications
 jade-core/             the engine (git submodule)
 ```
@@ -67,6 +68,29 @@ jade-collab apply ws://127.0.0.1:8787/documents/budget.xlsx/ws \
 uploads a new one. Programs use `jade_collab_server::Client<DocxModel>` /
 `Client<XlsxModel>`, which keep an optimistic replica in step in the
 background.
+
+## Agents (MCP)
+
+`jade-collab-mcp` is an MCP server on stdio. An agent that loads it joins
+hosted documents as a replica, next to people and other agents, without a
+shell:
+
+```sh
+cargo install --path crates/jade-collab-mcp
+claude mcp add jade-collab -- jade-collab-mcp   # or any MCP client's config
+```
+
+| Tool | What it does |
+| --- | --- |
+| `list_documents` | `{server: "http://host:port"}` → names, formats and socket URLs |
+| `join_document` | `{url: "ws://…/documents/<name>/ws"}` → `session_id`, format, replica id, seq |
+| `read_document` | the session's view, paged: docx paragraphs (with their story) and tables, xlsx non-blank cells in A1 form |
+| `apply_edits` | the CLI's edit JSON, applied in order; each reported `applied`, `rejected` (reason), `invalid` (error) or `pending` |
+| `wait_for_changes` | returns once someone's edit arrives (seq > `after_seq`) or on timeout |
+| `leave_document` | disconnects the session |
+
+One process holds any number of sessions. The full schemas are in
+`tools/list`.
 
 ## How it is verified
 

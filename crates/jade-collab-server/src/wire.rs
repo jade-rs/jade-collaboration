@@ -25,6 +25,14 @@ impl Format {
             None
         }
     }
+
+    /// The format of the document a socket URL
+    /// (`ws://host/documents/{name}/ws`) names.
+    pub fn of_url(url: &str) -> Option<Self> {
+        let path = url.trim_end_matches('/');
+        let path = path.strip_suffix("/ws").unwrap_or(path);
+        Self::of(path.rsplit('/').next()?)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

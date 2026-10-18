@@ -10,7 +10,7 @@ use jade_collab_sync::ReplicaEvent;
 use jade_docx_collab::intent::{resolve, IntentOp};
 use jade_docx_collab::DocxModel;
 use jade_xlsx_collab::intent::{resolve as resolve_cell, XlsxIntent};
-use jade_xlsx_collab::{column_label, XlsxModel};
+use jade_xlsx_collab::XlsxModel;
 use serde_json::{json, Value};
 
 #[derive(Parser)]
@@ -42,13 +42,7 @@ enum Cli {
 }
 
 fn format_of(url: &str) -> Result<Format, String> {
-    let name = url
-        .trim_end_matches('/')
-        .trim_end_matches("/ws")
-        .rsplit('/')
-        .next()
-        .unwrap_or_default();
-    Format::of(name).ok_or_else(|| format!("{url} does not name a .docx or .xlsx document"))
+    Format::of_url(url).ok_or_else(|| format!("{url} does not name a .docx or .xlsx document"))
 }
 
 fn edits<T: serde::de::DeserializeOwned>(text: &str) -> Result<Vec<T>, String> {
@@ -80,18 +74,16 @@ fn xlsx_json(model: &XlsxModel) -> Value {
         .sheets()
         .iter()
         .map(|sheet| {
-            let mut cells = serde_json::Map::new();
-            for (r, row) in sheet.rows.iter().enumerate() {
-                for (c, column) in sheet.columns.iter().enumerate() {
-                    if let Some(value) = model.value(sheet.id, *row, *column) {
-                        let reference = format!("{}{}", column_label(c as u32), r + 1);
-                        cells.insert(
-                            reference,
-                            serde_json::to_value(value).expect("values serialize"),
-                        );
-                    }
-                }
-            }
+            let cells: serde_json::Map<String, Value> = model
+                .filled_cells(sheet.id)
+                .into_iter()
+                .map(|(reference, value)| {
+                    (
+                        reference,
+                        serde_json::to_value(value).expect("values serialize"),
+                    )
+                })
+                .collect();
             json!({ "name": sheet.name, "cells": cells })
         })
         .collect::<Vec<_>>();
