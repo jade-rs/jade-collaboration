@@ -8,18 +8,43 @@ use jade_collab_core::grid::{Grid, GridOp, Merge};
 use jade_collab_core::id::{Id, ReplicaId};
 use jade_collab_core::lww::LwwRegister;
 use jade_collab_core::rga::Rga;
-use jade_collab_sync::{ApplyContext, Document, Lane, Rejection, Replica};
+use jade_collab_sync::{ApplyContext, Document, Lane, Materializer, Rejection, Replica};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToyDoc {
     pub text: Rga<char>,
     pub grid: Grid,
+    #[serde(with = "pairs")]
     pub cells: BTreeMap<(Id, Id), LwwRegister<i64>>,
     /// The log position each grid op was applied at (`None` while
     /// tentative) — state that depends on the apply context, like the xlsx
     /// model's structure log.
     pub grid_log: Vec<Option<u64>>,
+}
+
+/// JSON keys are strings; a map keyed by id pairs is stored as a list.
+mod pairs {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+
+    pub fn serialize<K: Serialize, V: Serialize, S: Serializer>(
+        map: &BTreeMap<K, V>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(map.iter())
+    }
+
+    pub fn deserialize<'de, K, V, D>(deserializer: D) -> Result<BTreeMap<K, V>, D::Error>
+    where
+        K: Deserialize<'de> + Ord,
+        V: Deserialize<'de>,
+        D: Deserializer<'de>,
+    {
+        Ok(Vec::<(K, V)>::deserialize(deserializer)?
+            .into_iter()
+            .collect())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -203,5 +228,45 @@ pub fn generate(replica: &mut Replica<ToyDoc>, choice: u64) -> ToyOp {
                 },
             })
         }
+    }
+}
+
+/// A materializer standing in for a real file: it mirrors the text, refuses
+/// structure while the mirrored text's length is a multiple of three, and
+/// reports a fault whenever an operation leaves it a multiple of five. Its
+/// "file" is the mirrored text.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Mirror {
+    pub text: String,
+}
+
+impl Mirror {
+    pub fn load(file: &str) -> Self {
+        Self {
+            text: file.to_string(),
+        }
+    }
+
+    pub fn export(&self) -> String {
+        self.text.clone()
+    }
+}
+
+impl Materializer<ToyDoc> for Mirror {
+    fn admit(&self, _: &ToyDoc, op: &ToyOp) -> Result<(), Rejection> {
+        match op {
+            ToyOp::Grid(_) if self.text.chars().count().is_multiple_of(3) => {
+                Err(Rejection::new("the file is busy"))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn materialize(&mut self, document: &ToyDoc, _: (), _: &ApplyContext) -> Result<(), String> {
+        self.text = document.string();
+        if self.text.chars().count().is_multiple_of(5) {
+            return Err(format!("{} is five-ish", self.text));
+        }
+        Ok(())
     }
 }

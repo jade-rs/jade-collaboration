@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 pub use replica::{Replica, ReplicaEvent};
-pub use sequencer::{Sequencer, SubmitOutcome};
+pub use sequencer::{Checkpoint, Record, Sequencer, SubmitOutcome};
 
 /// How an operation is reconciled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -131,6 +131,13 @@ pub enum SyncError {
     UnknownReplica(ReplicaId),
     #[error("cannot resume from log position {requested}; the log is at {current}")]
     FutureSeq { requested: u64, current: u64 },
+    #[error(
+        "cannot resume from log position {requested}; the log before {oldest} was \
+         compacted into a checkpoint, so join again as a new replica"
+    )]
+    Compacted { requested: u64, oldest: u64 },
+    #[error("the journal does not fit this sequencer: {reason}")]
+    Journal { reason: String },
     #[error("expected log position {expected}, received {received}")]
     OutOfOrder { expected: u64, received: u64 },
     #[error("the server answered submission {client_seq}, which is not the oldest pending one")]

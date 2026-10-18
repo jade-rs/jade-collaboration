@@ -197,6 +197,7 @@ fn tools() -> Vec<Tool> {
             description: "List the documents a jade-collab server hosts, with the ws:// URL to join each.",
             input: object("Arguments.", json!({
                 "server": string("The server's address, `http://host:port`."),
+                "token": string("Access token, when the server requires one (defaults to $JADE_COLLAB_TOKEN)."),
             }), &["server"]),
             output: object("The hosted documents.", json!({
                 "documents": {
@@ -219,6 +220,7 @@ fn tools() -> Vec<Tool> {
             description: "Join a hosted document as a new replica and return the `session_id` the other tools take. The format comes from the document's name.",
             input: object("Arguments.", json!({
                 "url": string("The document's socket, `ws://host:port/documents/<name>/ws` (as list_documents gives it)."),
+                "token": string("Access token, when the server requires one (defaults to $JADE_COLLAB_TOKEN)."),
             }), &["url"]),
             output: object("The new session.", json!({
                 "session_id": session_id(),

@@ -96,3 +96,81 @@ fn serve_apply_and_show() {
         .unwrap();
     assert!(!output.status.success());
 }
+
+fn serve(args: &[&std::ffi::OsStr]) -> (Serve, String) {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let server = Serve(
+        bin()
+            .args(["serve", "--addr", &addr])
+            .args(args)
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while std::net::TcpStream::connect(&addr).is_err() {
+        assert!(Instant::now() < deadline, "server did not start");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    (server, addr)
+}
+
+#[test]
+fn serve_with_a_data_directory_survives_a_kill() {
+    let dir = std::env::temp_dir().join(format!("jade-collab-cli-data-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let core = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../jade-core");
+    let file = dir.join("hello.docx");
+    std::fs::copy(core.join("hello.docx"), &file).unwrap();
+    let data = dir.join("data");
+
+    let (server, addr) = serve(&["--data".as_ref(), data.as_os_str(), file.as_os_str()]);
+    let docx = format!("ws://{addr}/documents/hello.docx/ws");
+    run(&[
+        "apply",
+        &docx,
+        r#"{"type":"insert_text","paragraph":0,"offset":0,"text":"Durable: "}"#,
+    ]);
+    drop(server); // killed, never saved
+
+    // The stored document wins over the file it was first opened from.
+    let (_server, addr) = serve(&["--data".as_ref(), data.as_os_str(), file.as_os_str()]);
+    let docx = format!("ws://{addr}/documents/hello.docx/ws");
+    let shown = run(&["show", &docx]);
+    assert!(shown.contains("Durable: Hello"), "{shown}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn serve_with_tokens() {
+    let dir = std::env::temp_dir().join(format!("jade-collab-cli-tokens-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let core = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../jade-core");
+    let file = dir.join("hello.docx");
+    std::fs::copy(core.join("hello.docx"), &file).unwrap();
+    let tokens = dir.join("tokens.json");
+    std::fs::write(
+        &tokens,
+        r#"{"ed": {"name": "Ed", "role": "editor"}, "vi": {"name": "Vi", "role": "viewer"}}"#,
+    )
+    .unwrap();
+
+    let (_server, addr) = serve(&["--tokens".as_ref(), tokens.as_os_str(), file.as_os_str()]);
+    let docx = format!("ws://{addr}/documents/hello.docx/ws");
+    let edit = r#"{"type":"insert_text","paragraph":0,"offset":0,"text":"Signed: "}"#;
+    let refused = bin().args(["show", &docx]).output().unwrap();
+    assert!(!refused.status.success(), "no token");
+    let refused = bin()
+        .args(["apply", "--token", "vi", &docx, edit])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success(), "a viewer cannot edit");
+    run(&["apply", "--token", "ed", &docx, edit]);
+    let shown = run(&["show", "--token", "vi", &docx]);
+    assert!(shown.contains("Signed: Hello"), "{shown}");
+    assert!(!shown.contains("Signed: Signed:"), "{shown}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -61,12 +61,25 @@ fn timeout(ms: Option<u64>) -> Duration {
 #[serde(deny_unknown_fields)]
 struct ListArgs {
     server: String,
+    #[serde(default)]
+    token: Option<String>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct JoinArgs {
     url: String,
+    #[serde(default)]
+    token: Option<String>,
+}
+
+/// The access token to present: the call's own, else `JADE_COLLAB_TOKEN`.
+fn token(given: Option<String>) -> Option<String> {
+    given.or_else(|| {
+        std::env::var("JADE_COLLAB_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty())
+    })
 }
 
 #[derive(Deserialize)]
@@ -191,7 +204,7 @@ impl McpServer {
     }
 
     async fn join(&mut self, args: Value) -> Result<Value, CallError> {
-        let JoinArgs { url } = arguments(args)?;
+        let JoinArgs { url, token: given } = arguments(args)?;
         if !(url.starts_with("ws://") || url.starts_with("wss://")) {
             return Err(CallError::Invalid(format!(
                 "{url} is not a ws:// URL (list_documents gives each document's)"
@@ -200,7 +213,7 @@ impl McpServer {
         let format = Format::of_url(&url).ok_or_else(|| {
             CallError::Invalid(format!("{url} does not name a .docx or .xlsx document"))
         })?;
-        let session = Session::join(&url, format)
+        let session = Session::join(&url, format, token(given).as_deref())
             .await
             .map_err(CallError::Failed)?;
         let path = url.trim_end_matches('/');
@@ -273,7 +286,10 @@ impl McpServer {
 }
 
 async fn list_documents(args: Value) -> Result<Value, CallError> {
-    let ListArgs { server } = arguments(args)?;
+    let ListArgs {
+        server,
+        token: given,
+    } = arguments(args)?;
     let authority = server
         .strip_prefix("http://")
         .map(|rest| rest.trim_end_matches('/'))
@@ -283,7 +299,7 @@ async fn list_documents(args: Value) -> Result<Value, CallError> {
                 "{server} is not a server address (http://host:port)"
             ))
         })?;
-    let documents = http::documents(authority)
+    let documents = http::documents(authority, token(given).as_deref())
         .await
         .map_err(CallError::Failed)?;
     Ok(json!({

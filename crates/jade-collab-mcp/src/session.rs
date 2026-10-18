@@ -164,11 +164,15 @@ where
 }
 
 impl Session {
-    pub(crate) async fn join(url: &str, format: Format) -> Result<Self, String> {
+    pub(crate) async fn join(
+        url: &str,
+        format: Format,
+        token: Option<&str>,
+    ) -> Result<Self, String> {
         let connect = |e: ClientError| format!("cannot join {url}: {e}");
         Ok(match format {
-            Format::Docx => Session::Docx(Client::connect(url).await.map_err(connect)?),
-            Format::Xlsx => Session::Xlsx(Client::connect(url).await.map_err(connect)?),
+            Format::Docx => Session::Docx(Client::connect(url, token).await.map_err(connect)?),
+            Format::Xlsx => Session::Xlsx(Client::connect(url, token).await.map_err(connect)?),
         })
     }
 

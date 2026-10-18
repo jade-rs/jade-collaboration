@@ -61,7 +61,7 @@ impl Hosted {
         D: Document + DeserializeOwned + Send + 'static,
         D::Op: Serialize + DeserializeOwned + Send + 'static,
     {
-        let client = Client::<D>::connect(&self.url(name)).await.unwrap();
+        let client = Client::<D>::connect(&self.url(name), None).await.unwrap();
         self.catch_up(name, &client).await;
         client
     }

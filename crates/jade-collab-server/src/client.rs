@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use futures_util::stream::{SplitSink, SplitStream};
@@ -11,6 +12,8 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::{header, HeaderValue};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
@@ -24,15 +27,26 @@ pub enum ClientError {
     Connect(String),
     #[error("protocol error: {0}")]
     Protocol(String),
+    #[error("the server cannot resume this replica: {0}")]
+    Rejoin(String),
     #[error(transparent)]
     Sync(#[from] SyncError),
     #[error("the connection closed")]
     Closed,
 }
 
+/// What another replica shares about itself.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Presence {
+    /// Its token's name, on a server with tokens.
+    pub name: Option<String>,
+    pub state: serde_json::Value,
+}
+
 struct Shared<D: Document> {
     replica: Mutex<Replica<D>>,
     events: Mutex<Vec<ReplicaEvent<D::Op>>>,
+    presence: Mutex<BTreeMap<ReplicaId, Presence>>,
     error: Mutex<Option<String>>,
     changed: Notify,
 }
@@ -52,6 +66,22 @@ fn text(message: &ClientMessage) -> Message {
             .expect("client messages serialize")
             .into(),
     )
+}
+
+/// Opens the socket, presenting `token` as a bearer token if there is one.
+async fn open(url: &str, token: Option<&str>) -> Result<Socket, ClientError> {
+    let mut request = url
+        .into_client_request()
+        .map_err(|e| ClientError::Connect(e.to_string()))?;
+    if let Some(token) = token {
+        let value = HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|e| ClientError::Connect(format!("unusable token: {e}")))?;
+        request.headers_mut().insert(header::AUTHORIZATION, value);
+    }
+    let (socket, _) = connect_async(request)
+        .await
+        .map_err(|e| ClientError::Connect(e.to_string()))?;
+    Ok(socket)
 }
 
 async fn next_message(stream: &mut SplitStream<Socket>) -> Result<ServerMessage, ClientError> {
@@ -89,11 +119,11 @@ where
     D: Document + DeserializeOwned + Send + 'static,
     D::Op: Serialize + DeserializeOwned + Send + 'static,
 {
-    /// Joins the document at `url` (`ws://host/documents/{name}/ws`) as a new replica.
-    pub async fn connect(url: &str) -> Result<Self, ClientError> {
-        let (socket, _) = connect_async(url)
-            .await
-            .map_err(|e| ClientError::Connect(e.to_string()))?;
+    /// Joins the document at `url` (`ws://host/documents/{name}/ws`) as a
+    /// new replica. `token` is sent as a bearer token; a server with tokens
+    /// also takes one in the URL (`…/ws?token=…`).
+    pub async fn connect(url: &str, token: Option<&str>) -> Result<Self, ClientError> {
+        let socket = open(url, token).await?;
         let (mut sink, mut stream) = socket.split();
         sink.send(text(&ClientMessage::Join))
             .await
@@ -116,11 +146,15 @@ where
     }
 
     /// Reconnects a replica taken from [`Client::disconnect`]: catches up
-    /// on what it missed and resends what the server never answered.
-    pub async fn resume(url: &str, mut replica: Replica<D>) -> Result<Self, ClientError> {
-        let (socket, _) = connect_async(url)
-            .await
-            .map_err(|e| ClientError::Connect(e.to_string()))?;
+    /// on what it missed and resends what the server never answered. Fails
+    /// with [`ClientError::Rejoin`] when the server can no longer resume it;
+    /// [`Client::connect`] then joins as a new replica.
+    pub async fn resume(
+        url: &str,
+        mut replica: Replica<D>,
+        token: Option<&str>,
+    ) -> Result<Self, ClientError> {
+        let socket = open(url, token).await?;
         let (mut sink, mut stream) = socket.split();
         sink.send(text(&ClientMessage::Resume {
             replica: replica.id(),
@@ -142,6 +176,7 @@ where
                     missed,
                 })?
             }
+            ServerMessage::Rejoin { message } => return Err(ClientError::Rejoin(message)),
             ServerMessage::Error { message } => return Err(ClientError::Protocol(message)),
             other => {
                 return Err(ClientError::Protocol(format!(
@@ -174,6 +209,7 @@ where
         let shared = Arc::new(Shared {
             replica: Mutex::new(replica),
             events: Mutex::new(events),
+            presence: Mutex::new(BTreeMap::new()),
             error: Mutex::new(None),
             changed: Notify::new(),
         });
@@ -214,6 +250,19 @@ where
                 Downstream::Committed(decode_committed(committed)?)
             }
             ServerMessage::Rejected(rejected) => Downstream::Rejected(rejected),
+            ServerMessage::Presence {
+                replica,
+                name,
+                state,
+            } => {
+                let presence = Presence { name, state };
+                shared.presence.lock().unwrap().insert(replica, presence);
+                return Ok(());
+            }
+            ServerMessage::PresenceLeft { replica } => {
+                shared.presence.lock().unwrap().remove(&replica);
+                return Ok(());
+            }
             ServerMessage::Error { message } => return Err(ClientError::Protocol(message)),
             other => return Err(ClientError::Protocol(format!("unexpected {other:?}"))),
         };
@@ -263,12 +312,12 @@ where
         std::mem::take(&mut *self.shared.events.lock().unwrap())
     }
 
-    async fn wait_until(&self, done: impl Fn(&Replica<D>) -> bool) -> Result<(), ClientError> {
+    async fn wait_until(&self, done: impl Fn(&Shared<D>) -> bool) -> Result<(), ClientError> {
         loop {
             let notified = self.shared.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if done(&self.shared.replica.lock().unwrap()) {
+            if done(&self.shared) {
                 return Ok(());
             }
             if let Some(error) = self.shared.error.lock().unwrap().clone() {
@@ -278,14 +327,38 @@ where
         }
     }
 
+    /// Shares `state` with the other replicas, replacing what this one
+    /// shared before. Ephemeral: never logged, gone when the connection is.
+    pub fn set_presence(&self, state: serde_json::Value) {
+        let message = serde_json::to_string(&ClientMessage::Presence { state })
+            .expect("client messages serialize");
+        let _ = self.outgoing.send(message);
+    }
+
+    /// What the other replicas currently share.
+    pub fn presence(&self) -> BTreeMap<ReplicaId, Presence> {
+        self.shared.presence.lock().unwrap().clone()
+    }
+
+    /// Waits until the others' presence satisfies `done`.
+    pub async fn wait_for_presence(
+        &self,
+        done: impl Fn(&BTreeMap<ReplicaId, Presence>) -> bool,
+    ) -> Result<(), ClientError> {
+        self.wait_until(|shared| done(&shared.presence.lock().unwrap()))
+            .await
+    }
+
     /// Waits until the server has answered every local operation.
     pub async fn settle(&self) -> Result<(), ClientError> {
-        self.wait_until(|replica| replica.pending_len() == 0).await
+        self.wait_until(|shared| shared.replica.lock().unwrap().pending_len() == 0)
+            .await
     }
 
     /// Waits until the replica has received the log up to `seq`.
     pub async fn wait_for_seq(&self, seq: u64) -> Result<(), ClientError> {
-        self.wait_until(|replica| replica.seq() >= seq).await
+        self.wait_until(|shared| shared.replica.lock().unwrap().seq() >= seq)
+            .await
     }
 
     /// Closes the connection and hands back the replica, pending operations

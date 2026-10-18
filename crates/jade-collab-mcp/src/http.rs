@@ -19,13 +19,13 @@ pub(crate) struct Listed {
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The documents the server at `authority` (`host:port`) hosts.
-pub(crate) async fn documents(authority: &str) -> Result<Vec<Listed>, String> {
-    tokio::time::timeout(TIMEOUT, fetch(authority))
+pub(crate) async fn documents(authority: &str, token: Option<&str>) -> Result<Vec<Listed>, String> {
+    tokio::time::timeout(TIMEOUT, fetch(authority, token))
         .await
         .map_err(|_| format!("{authority} did not answer within {TIMEOUT:?}"))?
 }
 
-async fn fetch(authority: &str) -> Result<Vec<Listed>, String> {
+async fn fetch(authority: &str, token: Option<&str>) -> Result<Vec<Listed>, String> {
     let stream = TcpStream::connect(authority)
         .await
         .map_err(|e| format!("cannot connect to {authority}: {e}"))?;
@@ -33,8 +33,11 @@ async fn fetch(authority: &str) -> Result<Vec<Listed>, String> {
         .await
         .map_err(|e| format!("cannot talk HTTP to {authority}: {e}"))?;
     tokio::spawn(connection);
-    let request = Request::get("/documents")
-        .header(header::HOST, authority)
+    let mut request = Request::get("/documents").header(header::HOST, authority);
+    if let Some(token) = token {
+        request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+    }
+    let request = request
         .body(Empty::<Bytes>::new())
         .map_err(|e| e.to_string())?;
     let response = sender

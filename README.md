@@ -94,6 +94,53 @@ claude mcp add jade-collab -- jade-collab-mcp   # or any MCP client's config
 
 One process holds any number of sessions. The full schemas are in
 `tools/list`.
+### Durable documents
+
+```sh
+jade-collab serve --data ./collab-data contract.docx budget.xlsx
+```
+
+With `--data DIR` (`Server::with_storage(dir)`) every document lives in
+`DIR/<name>/`: a snapshot of the collaborative model and of the file at one
+log position, and a journal (`log-<n>.jsonl`) of everything after it. Kill
+the server and start it again on the same directory and every document comes
+back as it was; connected programs call `Client::resume` and carry on. A file
+named on the command line is only read the first time — after that the
+stored document wins. `--checkpoint-every N` (default 1000) bounds the
+journal; a replica that was offline for longer than a checkpoint is told to
+join again (`ClientError::Rejoin`).
+
+### Access tokens
+
+```sh
+cat > tokens.json <<'JSON'
+{
+  "s3cret-alice": { "name": "alice", "role": "editor" },
+  "s3cret-bot":   { "name": "review-bot", "role": "viewer" }
+}
+JSON
+jade-collab serve --tokens tokens.json contract.docx
+jade-collab apply --token s3cret-alice ws://127.0.0.1:8787/documents/contract.docx/ws '…'
+```
+
+With `--tokens FILE` (`Server::with_tokens`) every route and the WebSocket
+answer 401 unless the request carries a listed token, as
+`Authorization: Bearer <token>` or as `?token=<token>` (for browsers, which
+cannot set headers on a WebSocket). Viewers can join, read and follow along;
+their edits are rejected by the server and never applied, and they cannot
+upload. `Client::connect(url, Some(token))` / `Client::resume(url, replica,
+Some(token))` send the header.
+
+### Presence
+
+Cursors, selections and the like travel as presence: a client sends
+`{"type":"presence","state":<any JSON>}` and the other replicas of the
+document receive `{"type":"presence","replica":3,"name":"alice","state":…}`
+(`name` comes from the token, when there are tokens), and
+`{"type":"presence_left","replica":3}` when its connection closes. Newcomers
+are told the current presence of everyone. Presence is never logged or
+stored and never reorders operations. In Rust: `client.set_presence(json)`,
+`client.presence()`, `client.wait_for_presence(…)`.
 
 ## How it is verified
 
@@ -106,10 +153,12 @@ Tests come first. Three layers:
   sound.
 * **Property-based tests** check the RGA implementation against its
   specification, random multi-client sessions over a simulated network for
-  convergence, grid invariants under random structure edits, and the model
+  convergence, grid invariants under random structure edits, the model
   against jade after random edits on real fixtures (every fixture in
-  jade-core is loaded and compared).
-* **End-to-end tests** run real WebSocket sessions and the CLI.
+  jade-core is loaded and compared), and a server restarted from its
+  checkpoint and journal against one that never stopped.
+* **End-to-end tests** run real WebSocket sessions and the CLI, including a
+  server restarted from its storage directory, tokens and presence.
 
 ## License
 
