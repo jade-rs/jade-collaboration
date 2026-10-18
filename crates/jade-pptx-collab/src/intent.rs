@@ -14,7 +14,7 @@ use jade_collab_core::id::Id;
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    Alignment, CharFormat, Geometry, GeometryEdit, Paragraph, PptxModel, PptxOp, StoryId,
+    Alignment, CharFormat, Geometry, GeometryEdit, Image, Paragraph, PptxModel, PptxOp, StoryId,
 };
 
 fn one() -> usize {
@@ -78,7 +78,10 @@ pub enum PptxIntent {
         #[serde(default = "one")]
         count: usize,
     },
-    /// EMU; rotation in 60000ths of a degree. Omitted attributes stay.
+    /// EMU; rotation in 60000ths of a degree. Omitted attributes stay. A
+    /// shape whose aspect ratio is locked (a picture) keeps it: a width or
+    /// height alone scales the other side, and the size travels as a
+    /// sequenced resize.
     SetGeometry {
         slide: usize,
         shape: u32,
@@ -141,6 +144,19 @@ pub enum PptxIntent {
         end_paragraph: usize,
         alignment: Alignment,
     },
+    /// A PNG or JPEG picture (base64 on the wire), on top of the slide.
+    /// Without a width and height it takes its pixel size at 96 dpi; with
+    /// one of them, the other follows the image's ratio.
+    InsertPicture {
+        slide: usize,
+        x: i64,
+        y: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        width: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        height: Option<i64>,
+        image: Image,
+    },
     /// Hides a slide from the slide show, or shows it again.
     SetSlideHidden {
         slide: usize,
@@ -168,7 +184,25 @@ pub enum IntentError {
     NothingToFormat,
     #[error("invalid format: {0}")]
     InvalidFormat(String),
+    #[error("invalid picture: {0}")]
+    InvalidPicture(String),
 }
+
+/// `known_other * given / known`, rounded: the side that keeps a ratio.
+fn scaled(given: i64, known: i64, known_other: i64) -> i64 {
+    if known == 0 {
+        return known_other;
+    }
+    let (n, d) = (
+        i128::from(given) * i128::from(known_other),
+        i128::from(known),
+    );
+    let rounded = (2 * n + d.signum() * d) / (2 * d);
+    i64::try_from(rounded).unwrap_or(i64::MAX)
+}
+
+/// EMU per pixel at 96 dpi.
+const EMU_PER_PIXEL: i64 = 9525;
 
 fn slide_id(view: &PptxModel, number: usize) -> Result<Id, IntentError> {
     number
@@ -367,19 +401,49 @@ pub fn resolve(
             height,
             rotation,
         } => {
+            let number = *slide;
             let (slide, shape) = shape_id(view, *slide, *shape)?;
-            Ok(vec![PptxOp::SetGeometry {
-                slide,
-                shape,
-                stamp: ids(1),
-                edit: GeometryEdit {
-                    x: *x,
-                    y: *y,
-                    width: *width,
-                    height: *height,
-                    rotation: *rotation,
-                },
-            }])
+            let view_shape = view.slides()[number - 1]
+                .shapes
+                .iter()
+                .find(|s| s.id == shape)
+                .cloned()
+                .expect("resolved");
+            let locked = view_shape.aspect_locked;
+            let mut ops = Vec::new();
+            let edit = GeometryEdit {
+                x: *x,
+                y: *y,
+                width: if locked { None } else { *width },
+                height: if locked { None } else { *height },
+                rotation: *rotation,
+            };
+            if edit != GeometryEdit::default() || !locked {
+                ops.push(PptxOp::SetGeometry {
+                    slide,
+                    shape,
+                    stamp: ids(1),
+                    edit,
+                });
+            }
+            if let (true, Some(current)) = (locked, view_shape.geometry) {
+                let size = match (*width, *height) {
+                    (Some(w), Some(h)) => Some((w, h)),
+                    (Some(w), None) => Some((w, scaled(w, current.width, current.height))),
+                    (None, Some(h)) => Some((scaled(h, current.height, current.width), h)),
+                    (None, None) => None,
+                };
+                if let Some((width, height)) = size {
+                    ops.push(PptxOp::ResizeShape {
+                        slide,
+                        shape,
+                        stamp: ids(1),
+                        width,
+                        height,
+                    });
+                }
+            }
+            Ok(ops)
         }
         PptxIntent::InsertSlide { at } => {
             let slides = view.slides();
@@ -501,6 +565,40 @@ pub fn resolve(
                 from: after(*start_paragraph),
                 to: after(*end_paragraph),
                 alignment: *alignment,
+            }])
+        }
+        PptxIntent::InsertPicture {
+            slide,
+            x,
+            y,
+            width,
+            height,
+            image,
+        } => {
+            let slide = slide_id(view, *slide)?;
+            let info = jade_pptx_writer::picture_info(&image.0)
+                .map_err(|e| IntentError::InvalidPicture(e.to_string()))?;
+            let (pw, ph) = (
+                i64::from(info.width) * EMU_PER_PIXEL,
+                i64::from(info.height) * EMU_PER_PIXEL,
+            );
+            let (width, height) = match (*width, *height) {
+                (Some(w), Some(h)) => (w, h),
+                (Some(w), None) => (w, scaled(w, pw, ph)),
+                (None, Some(h)) => (scaled(h, ph, pw), h),
+                (None, None) => (pw, ph),
+            };
+            Ok(vec![PptxOp::InsertPicture {
+                slide,
+                id: ids(1),
+                geometry: Geometry {
+                    x: *x,
+                    y: *y,
+                    width,
+                    height,
+                    rotation: 0,
+                },
+                image: image.clone(),
             }])
         }
         PptxIntent::SetSlideHidden { slide, hidden } => Ok(vec![PptxOp::SetSlideHidden {

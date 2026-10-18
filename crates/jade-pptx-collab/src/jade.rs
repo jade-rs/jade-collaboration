@@ -436,6 +436,22 @@ impl JadePptx {
                 }
                 Ok(())
             }
+            PptxEffect::InsertPicture {
+                slide,
+                shape,
+                geometry,
+                image,
+            } => {
+                let t = transform(geometry).ok_or("rotation is out of range")?;
+                let inserted = self
+                    .session
+                    .insert_picture(slide, t, &image.0)
+                    .map_err(|e| e.to_string())?;
+                if inserted.id != shape.number {
+                    self.ids.insert((shape.slide, shape.shape), inserted.id);
+                }
+                Ok(())
+            }
             PptxEffect::DeleteShape { slide, shape } => self
                 .session
                 .delete_shape(slide, self.file_id(shape))
@@ -478,6 +494,24 @@ impl Materializer<PptxModel> for JadePptx {
                     // Invalid geometry is the model's to refuse.
                     if jade_pptx_writer::validate_text_box(t, "", &format).is_ok() {
                         jade_pptx_writer::insert_text_box(bytes, index, t, "", &format)
+                            .map_err(refused)?;
+                    }
+                }
+            }
+            PptxOp::InsertPicture {
+                slide,
+                geometry,
+                image,
+                ..
+            } => {
+                if let (Some(index), Some(t)) = (model.slide_index(*slide), transform(*geometry)) {
+                    // Invalid geometry is the model's to refuse; decoding
+                    // the image is jade's.
+                    if jade_pptx_writer::validate_transform(t).is_ok()
+                        && geometry.width > 0
+                        && geometry.height > 0
+                    {
+                        jade_pptx_writer::insert_picture(bytes, index, t, &image.0)
                             .map_err(refused)?;
                     }
                 }

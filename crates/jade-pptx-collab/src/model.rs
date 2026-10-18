@@ -311,10 +311,16 @@ impl Story {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Locks {
     pub(crate) can_move: bool,
+    /// Width and height may be written one at a time.
     pub(crate) can_resize: bool,
     pub(crate) can_rotate: bool,
     /// A group's extent must stay positive.
     pub(crate) group: bool,
+    /// The aspect ratio is locked (`noChangeAspect`) on a shape that may
+    /// otherwise be resized: only a sequenced resize that keeps the ratio,
+    /// by jade's check against the current size, changes its extent.
+    #[serde(default)]
+    pub(crate) aspect: bool,
 }
 
 impl Locks {
@@ -323,7 +329,67 @@ impl Locks {
         can_resize: true,
         can_rotate: true,
         group: false,
+        aspect: false,
     };
+
+    /// How jade inserts a picture: free but for its ratio.
+    pub(crate) const PICTURE: Locks = Locks {
+        can_resize: false,
+        aspect: true,
+        ..Locks::NONE
+    };
+}
+
+/// The most image bytes one picture may carry: the bytes travel inline, in
+/// the operation (base64 on the wire, about 11 MiB of JSON at most), and
+/// stay in the log and its journal.
+pub const MAX_PICTURE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Image bytes inside an operation, base64 on the wire.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Image(pub Vec<u8>);
+
+impl std::fmt::Debug for Image {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Image({} bytes)", self.0.len())
+    }
+}
+
+impl Serialize for Image {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use base64::Engine;
+        serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(&self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for Image {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use base64::Engine;
+        let text = String::deserialize(deserializer)?;
+        base64::engine::general_purpose::STANDARD
+            .decode(text)
+            .map(Image)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// What every replica checks of a picture: its size and that it claims to
+/// be a PNG or JPEG — cheap, so a pending insertion can be replayed on
+/// every rebuild of a view. Whether jade can decode it is decided once, by
+/// the server's materializer, before the insertion commits.
+fn check_image(image: &[u8]) -> Result<(), Rejection> {
+    if image.len() > MAX_PICTURE_BYTES {
+        return Err(reject(format!(
+            "the picture has {} bytes; at most {MAX_PICTURE_BYTES} travel in an operation",
+            image.len()
+        )));
+    }
+    let png = image.starts_with(b"\x89PNG\r\n\x1a\n");
+    let jpeg = image.starts_with(&[0xff, 0xd8, 0xff]);
+    if !png && !jpeg {
+        return Err(reject("only PNG and JPEG pictures are supported"));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -472,6 +538,9 @@ pub struct ShapeView {
     pub editable: bool,
     /// Top-level shapes jade can place.
     pub geometry: Option<Geometry>,
+    /// The aspect ratio is locked: the shape is resized (keeping it) by a
+    /// sequenced `ResizeShape`, not by geometry writes.
+    pub aspect_locked: bool,
     pub deletable: bool,
 }
 
@@ -600,6 +669,28 @@ pub enum PptxOp {
         to: Option<Id>,
         alignment: Alignment,
     },
+    /// Sequenced. A picture on top of the slide, its image bytes inline
+    /// (at most [`MAX_PICTURE_BYTES`]). Like a text box, jade picks its
+    /// file id (and the media part, named by the bytes' hash) at that point
+    /// of the log and may refuse the slide or the image.
+    InsertPicture {
+        slide: Id,
+        id: Id,
+        geometry: Geometry,
+        image: Image,
+    },
+    /// Sequenced. Writes both extent registers of a top-level shape at
+    /// once. For a shape whose ratio is locked (every picture jade
+    /// inserts) jade checks the new size against the current one, so the
+    /// writes have to be checked in log order; it is refused unless it
+    /// keeps the ratio within jade's tolerance.
+    ResizeShape {
+        slide: Id,
+        shape: Id,
+        stamp: Id,
+        width: i64,
+        height: i64,
+    },
     /// Sequenced. Deletes a top-level shape (a group with its children).
     /// jade refuses shapes other parts of the slide depend on in ways it
     /// cannot untangle, which only the file shows.
@@ -684,6 +775,12 @@ pub enum PptxEffect {
     DeleteShape {
         slide: usize,
         shape: ShapeRef,
+    },
+    InsertPicture {
+        slide: usize,
+        shape: ShapeRef,
+        geometry: Geometry,
+        image: Image,
     },
 }
 
@@ -875,6 +972,7 @@ impl PptxModel {
                             text: shape.text.as_ref().map(|s| joined(&s.flow)),
                             editable: shape.text.as_ref().is_some_and(|s| s.editable),
                             geometry: shape.placement.as_ref().map(Placement::geometry),
+                            aspect_locked: shape.placement.as_ref().is_some_and(|p| p.locks.aspect),
                             deletable: shape.deletable,
                         })
                         .collect(),
@@ -1611,6 +1709,130 @@ impl PptxModel {
         }])
     }
 
+    fn insert_picture(
+        &mut self,
+        slide_id: Id,
+        id: Id,
+        geometry: Geometry,
+        image: &Image,
+    ) -> Result<Vec<PptxEffect>, Rejection> {
+        let index = self.visible_slide(slide_id)?;
+        check_geometry(geometry)?;
+        if geometry.width <= 0 || geometry.height <= 0 {
+            return Err(reject("a picture needs a positive size"));
+        }
+        check_image(&image.0)?;
+        let slide = self.slides.get_mut(&slide_id).expect("checked");
+        if slide.shape(id).is_some() {
+            return Err(reject(format!("shape {id} already exists")));
+        }
+        let number = slide.next_number;
+        slide.next_number += 1;
+        slide.shapes.push((
+            id,
+            Shape {
+                number,
+                kind: ShapeKind::Picture,
+                group: None,
+                text: None,
+                placement: Some(Placement::new(id, geometry, Locks::PICTURE)),
+                deletable: true,
+                deleted: false,
+            },
+        ));
+        self.observe([id]);
+        Ok(vec![PptxEffect::InsertPicture {
+            slide: index,
+            shape: ShapeRef {
+                slide: slide_id,
+                shape: id,
+                number,
+            },
+            geometry,
+            image: image.clone(),
+        }])
+    }
+
+    /// Writes both extent registers, in log order; on copies the author
+    /// had not seen too, where the size still allows it.
+    fn resize(
+        &mut self,
+        slide_id: Id,
+        shape_id: Id,
+        stamp: Id,
+        width: i64,
+        height: i64,
+        ctx: &ApplyContext,
+    ) -> Result<Vec<PptxEffect>, Rejection> {
+        let shape = self
+            .slides
+            .get(&slide_id)
+            .and_then(|s| s.shape(shape_id))
+            .ok_or_else(|| reject(format!("shape {shape_id} does not exist")))?;
+        let placement = shape
+            .placement
+            .as_ref()
+            .ok_or_else(|| reject("jade cannot place this shape"))?;
+        check_geometry(Geometry {
+            x: 0,
+            y: 0,
+            width,
+            height,
+            rotation: 0,
+        })?;
+        let fits = |placement: &Placement| -> Result<(), Rejection> {
+            let locks = placement.locks;
+            if !locks.can_resize && !locks.aspect {
+                return Err(reject("the shape locks its size"));
+            }
+            if locks.group && (width <= 0 || height <= 0) {
+                return Err(reject("a group must keep a positive size"));
+            }
+            let current = placement.geometry();
+            let (w, h) = (i128::from(current.width), i128::from(current.height));
+            // jade's own tolerance for a locked ratio.
+            if locks.aspect
+                && (w * i128::from(height) - h * i128::from(width)).abs() > w.max(0) + h.max(0)
+            {
+                return Err(reject("the shape's aspect ratio is locked"));
+            }
+            Ok(())
+        };
+        fits(placement)?;
+        let story = StoryId::Shape {
+            slide: slide_id,
+            shape: shape_id,
+        };
+        let mut effects = Vec::new();
+        for target in self.reach(story, ctx) {
+            let Some(placement) = self
+                .slides
+                .get_mut(&target.slide())
+                .and_then(|s| s.shape_mut(shape_id))
+                .and_then(|s| s.placement.as_mut())
+            else {
+                continue;
+            };
+            if fits(placement).is_err() {
+                continue;
+            }
+            let changed = placement.registers[2].apply(stamp, width)
+                | placement.registers[3].apply(stamp, height);
+            let geometry = placement.geometry();
+            if let (true, Some((index, TextTarget::Shape(shape)))) =
+                (changed, self.realised(target))
+            {
+                effects.push(PptxEffect::SetTransform {
+                    slide: index,
+                    shape,
+                    geometry,
+                });
+            }
+        }
+        self.observe([stamp]);
+        Ok(effects)
+    }
+
     fn delete_shape(&mut self, slide_id: Id, shape_id: Id) -> Result<Vec<PptxEffect>, Rejection> {
         let index = self.visible_slide(slide_id)?;
         let slide = self.slides.get_mut(&slide_id).expect("checked");
@@ -1682,6 +1904,8 @@ impl Document for PptxModel {
             | PptxOp::MoveSlide { .. }
             | PptxOp::DuplicateSlide { .. }
             | PptxOp::InsertTextBox { .. }
+            | PptxOp::InsertPicture { .. }
+            | PptxOp::ResizeShape { .. }
             | PptxOp::DeleteShape { .. } => Lane::Sequenced,
         }
     }
@@ -1731,6 +1955,19 @@ impl Document for PptxModel {
                 geometry,
             } => self.insert_text_box(*slide, *id, *geometry),
             PptxOp::DeleteShape { slide, shape } => self.delete_shape(*slide, *shape),
+            PptxOp::InsertPicture {
+                slide,
+                id,
+                geometry,
+                image,
+            } => self.insert_picture(*slide, *id, *geometry, image),
+            PptxOp::ResizeShape {
+                slide,
+                shape,
+                stamp,
+                width,
+                height,
+            } => self.resize(*slide, *shape, *stamp, *width, *height, ctx),
         }
     }
 

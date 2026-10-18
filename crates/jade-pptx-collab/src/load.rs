@@ -122,6 +122,7 @@ impl Loader<'_> {
                         can_resize: info.can_resize && !info.lock_aspect_ratio,
                         can_rotate: info.can_rotate,
                         group: info.kind == "group",
+                        aspect: info.can_resize && info.lock_aspect_ratio,
                     },
                 ))
             });

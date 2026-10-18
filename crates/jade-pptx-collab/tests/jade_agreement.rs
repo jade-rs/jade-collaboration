@@ -612,7 +612,10 @@ fn pictures_are_realised_in_jade() {
     assert_eq!(picture.kind, ShapeKind::Picture);
     assert!(picture.aspect_locked);
     let g = picture.geometry.unwrap();
-    assert_eq!((g.x, g.y, g.width, g.height), (914_400, 457_200, 9525, 9525));
+    assert_eq!(
+        (g.x, g.y, g.width, g.height),
+        (914_400, 457_200, 9525, 9525)
+    );
     // Moving and resizing by width: the height follows the ratio.
     s.intent(PptxIntent::SetGeometry {
         slide: 1,
@@ -671,6 +674,9 @@ fn jade_refuses_a_picture_it_cannot_decode() {
         base_seq: 0,
         seq: Some(1),
     };
-    assert!(model.clone().apply(&op, &ctx).is_ok(), "the model alone would take it");
+    assert!(
+        model.clone().apply(&op, &ctx).is_ok(),
+        "the model alone would take it"
+    );
     assert!(jade.admit(&model, &op).is_err());
 }

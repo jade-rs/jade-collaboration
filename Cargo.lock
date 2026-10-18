@@ -1303,6 +1303,7 @@ dependencies = [
 name = "jade-pptx-collab"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "jade-collab-core",
  "jade-collab-sync",
  "jade-opc",
