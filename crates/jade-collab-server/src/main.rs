@@ -4,8 +4,8 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::Parser;
-use jade_collab_server::{Client, Format, Server, StorageOptions, Tokens};
+use clap::{Parser, ValueEnum};
+use jade_collab_server::{Client, Format, Fsync, Server, StorageOptions, Tokens};
 use jade_collab_sync::ReplicaEvent;
 use jade_docx_collab::intent::{resolve, IntentOp};
 use jade_docx_collab::DocxModel;
@@ -40,6 +40,11 @@ enum Cli {
         /// (default 1000).
         #[arg(long, value_name = "N", requires = "data")]
         keep_tail: Option<usize>,
+        /// With --data, when the journal is synced to the disk: after every
+        /// record, before anyone hears of it, or only at checkpoints (the
+        /// default; the process dying loses nothing, a power failure can).
+        #[arg(long, value_enum, value_name = "WHEN", requires = "data")]
+        fsync: Option<FsyncArg>,
         /// Require a bearer token on every request. The file is a JSON
         /// object: {"<token>": {"name": "alice", "role": "editor"|"viewer"}}.
         #[arg(long, value_name = "FILE")]
@@ -68,6 +73,12 @@ enum Cli {
         url: String,
         edits: String,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum FsyncArg {
+    Every,
+    Checkpoint,
 }
 
 fn format_of(url: &str) -> Result<Format, String> {
@@ -264,6 +275,7 @@ struct ServeOptions {
     data: Option<PathBuf>,
     checkpoint_every: Option<u64>,
     keep_tail: Option<usize>,
+    fsync: Option<FsyncArg>,
     tokens: Option<PathBuf>,
     files: Vec<PathBuf>,
 }
@@ -275,6 +287,7 @@ async fn serve(options: ServeOptions) -> Result<(), String> {
         data,
         checkpoint_every,
         keep_tail,
+        fsync,
         tokens,
         files,
     } = options;
@@ -292,6 +305,10 @@ async fn serve(options: ServeOptions) -> Result<(), String> {
             if let Some(n) = keep_tail {
                 storage.keep_tail = n;
             }
+            storage.sync = match fsync {
+                Some(FsyncArg::Every) => Fsync::EveryRecord,
+                Some(FsyncArg::Checkpoint) | None => Fsync::Checkpoints,
+            };
             let server = Server::with_storage_options(dir, storage).map_err(|e| e.to_string())?;
             for (name, _) in server.documents() {
                 println!("serving ws://{addr}/documents/{name}/ws (stored)");
@@ -346,6 +363,7 @@ async fn main() -> ExitCode {
             data,
             checkpoint_every,
             keep_tail,
+            fsync,
             tokens,
             files,
         } => {
@@ -355,6 +373,7 @@ async fn main() -> ExitCode {
                 data,
                 checkpoint_every,
                 keep_tail,
+                fsync,
                 tokens,
                 files,
             })

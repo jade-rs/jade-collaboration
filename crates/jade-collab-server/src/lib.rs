@@ -20,5 +20,5 @@ pub mod wire;
 pub use auth::{Grant, Role, Tokens, TokensError};
 pub use client::{Client, ClientError, Presence};
 pub use server::{Server, ServerError};
-pub use storage::StorageOptions;
+pub use storage::{Fsync, StorageOptions};
 pub use wire::Format;

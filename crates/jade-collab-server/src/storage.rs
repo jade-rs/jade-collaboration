@@ -12,14 +12,15 @@
 //! again from the exported file would not match the ids every replica holds.
 //! The tail is the last committed operations before the checkpoint, kept so
 //! that replicas slightly behind it can still resume.
-//! A record is appended (and handed to the operating system) before anyone
-//! hears of it, so no replica can be ahead of the disk. A new checkpoint is
-//! complete once its `.json` is renamed into place; older generations are
-//! then removed.
+//! A record is appended (handed to the operating system and, with
+//! [`Fsync::EveryRecord`], synced to the disk) before anyone hears of it, so
+//! no replica can be ahead of the journal. A new checkpoint is complete once
+//! its `.json` is renamed into place; older generations are then removed.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use jade_collab_sync::protocol::Committed;
 use jade_collab_sync::{Checkpoint, Record};
@@ -27,6 +28,19 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::wire::Format;
+
+/// When the journal is synced to the disk.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Fsync {
+    /// After every record, before anyone hears of it: an operation that was
+    /// acknowledged survives a power failure. One `fsync` per record.
+    EveryRecord,
+    /// Only checkpoints are synced. Records are handed to the operating
+    /// system at once, so they survive the server process dying, but a
+    /// power failure can lose the records since the last checkpoint.
+    #[default]
+    Checkpoints,
+}
 
 /// How a durable server keeps its documents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,6 +52,7 @@ pub struct StorageOptions {
     /// memory and in the snapshot, so that a replica at most this far
     /// behind can always resume instead of joining again.
     pub keep_tail: usize,
+    pub sync: Fsync,
 }
 
 impl Default for StorageOptions {
@@ -45,8 +60,35 @@ impl Default for StorageOptions {
         Self {
             checkpoint_every: 1000,
             keep_tail: 1000,
+            sync: Fsync::default(),
         }
     }
+}
+
+/// Where journal records go: a file, or in tests something that watches
+/// what is done to one.
+pub(crate) trait JournalFile {
+    /// Hands `bytes` to the operating system.
+    fn append(&mut self, bytes: &[u8]) -> io::Result<()>;
+    /// Waits until everything appended is on the disk.
+    fn sync(&mut self) -> io::Result<()>;
+}
+
+impl JournalFile for File {
+    fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.write_all(bytes).and_then(|()| self.flush())
+    }
+
+    fn sync(&mut self) -> io::Result<()> {
+        self.sync_data()
+    }
+}
+
+/// Turns each journal file a store opens into what it appends to.
+pub(crate) type JournalOpener = Arc<dyn Fn(File) -> Box<dyn JournalFile>>;
+
+fn plain_journal() -> JournalOpener {
+    Arc::new(|file| Box::new(file))
 }
 
 #[derive(Serialize)]
@@ -80,7 +122,8 @@ pub(crate) struct DocumentStore {
     format: Format,
     options: StorageOptions,
     generation: u64,
-    log: File,
+    log: Box<dyn JournalFile>,
+    journal: JournalOpener,
     records: u64,
 }
 
@@ -183,6 +226,18 @@ impl DocumentStore {
         checkpoint: &Checkpoint<D>,
         file: &[u8],
     ) -> Result<Self, String> {
+        Self::create_with(dir, format, options, checkpoint, file, plain_journal())
+    }
+
+    /// [`DocumentStore::create`], appending through `journal`.
+    pub fn create_with<D: Serialize>(
+        dir: PathBuf,
+        format: Format,
+        options: StorageOptions,
+        checkpoint: &Checkpoint<D>,
+        file: &[u8],
+        journal: JournalOpener,
+    ) -> Result<Self, String> {
         if newest_generation(&dir)?.is_some() {
             return Err(format!("{} already holds a document", dir.display()));
         }
@@ -193,7 +248,8 @@ impl DocumentStore {
             format,
             options,
             generation: 1,
-            log,
+            log: journal(log),
+            journal,
             records: 0,
         })
     }
@@ -204,6 +260,16 @@ impl DocumentStore {
         dir: PathBuf,
         format: Format,
         options: StorageOptions,
+    ) -> Result<(Self, Stored<D, Op>), String> {
+        Self::open_with(dir, format, options, plain_journal())
+    }
+
+    /// [`DocumentStore::open`], appending through `journal`.
+    pub fn open_with<D: DeserializeOwned, Op: DeserializeOwned>(
+        dir: PathBuf,
+        format: Format,
+        options: StorageOptions,
+        opener: JournalOpener,
     ) -> Result<(Self, Stored<D, Op>), String> {
         let generation = newest_generation(&dir)?
             .ok_or_else(|| format!("{} holds no snapshot", dir.display()))?;
@@ -227,14 +293,14 @@ impl DocumentStore {
             Err(e) => return Err(error(&log_path, e)),
         };
         let complete = text.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
-        let mut journal = Vec::new();
+        let mut records = Vec::new();
         for (number, line) in text[..complete].split(|b| *b == b'\n').enumerate() {
             if line.is_empty() {
                 continue;
             }
             let record = serde_json::from_slice(line)
                 .map_err(|e| error(&log_path, format!("line {}: {e}", number + 1)))?;
-            journal.push(record);
+            records.push(record);
         }
         let log = OpenOptions::new()
             .create(true)
@@ -250,8 +316,9 @@ impl DocumentStore {
             format,
             options,
             generation,
-            log,
-            records: journal.len() as u64,
+            log: opener(log),
+            journal: opener,
+            records: records.len() as u64,
         };
         store.remove_older_generations()?;
         Ok((
@@ -260,20 +327,21 @@ impl DocumentStore {
                 checkpoint: snapshot.checkpoint,
                 tail: snapshot.tail,
                 file,
-                journal,
+                journal: records,
             },
         ))
     }
 
-    /// Appends a record. Returns whether a checkpoint is due.
+    /// Appends a record, and syncs it if the options say so. Returns whether
+    /// a checkpoint is due.
     pub fn append<Op: Serialize>(&mut self, record: &Record<Op>) -> Result<bool, String> {
         let mut line = serde_json::to_vec(record).expect("records serialize");
         line.push(b'\n');
         let path = self.dir.join(log_name(self.generation));
-        self.log
-            .write_all(&line)
-            .and_then(|()| self.log.flush())
-            .map_err(|e| error(&path, e))?;
+        self.log.append(&line).map_err(|e| error(&path, e))?;
+        if self.options.sync == Fsync::EveryRecord {
+            self.log.sync().map_err(|e| error(&path, e))?;
+        }
         self.records += 1;
         Ok(self.records >= self.options.checkpoint_every)
     }
@@ -292,7 +360,8 @@ impl DocumentStore {
         file: &[u8],
     ) -> Result<(), String> {
         let generation = self.generation + 1;
-        self.log = write_generation(&self.dir, self.format, generation, checkpoint, tail, file)?;
+        let log = write_generation(&self.dir, self.format, generation, checkpoint, tail, file)?;
+        self.log = (self.journal)(log);
         self.generation = generation;
         self.records = 0;
         self.remove_older_generations()
