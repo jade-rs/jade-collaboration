@@ -174,3 +174,36 @@ fn serve_with_tokens() {
     assert!(!shown.contains("Signed: Signed:"), "{shown}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn decks_are_served_and_edited_from_the_command_line() {
+    let dir = std::env::temp_dir().join(format!("jade-collab-cli-pptx-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let core = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../jade-core");
+    std::fs::copy(core.join("public/fixtures/sample-deck.pptx"), dir.join("deck.pptx")).unwrap();
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let _server = Serve(
+        bin()
+            .args(["serve", "--addr", &addr])
+            .arg(dir.join("deck.pptx"))
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while std::net::TcpStream::connect(&addr).is_err() {
+        assert!(Instant::now() < deadline, "server did not start");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let deck = format!("ws://{addr}/documents/deck.pptx/ws");
+    let before = run(&["show", &deck]);
+    assert!(before.contains("\"format\": \"pptx\""), "{before}");
+    run(&[
+        "apply",
+        &deck,
+        r#"[{"type":"insert_slide","at":1},{"type":"insert_text","slide":2,"target":"notes","paragraph":0,"offset":0,"text":"CLI note"}]"#,
+    ]);
+    let shown = run(&["show", &deck]);
+    assert!(shown.contains("CLI note"), "{shown}");
+}
