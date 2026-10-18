@@ -61,7 +61,9 @@ fn hiding_reports_the_slides_position_once_the_value_changes() {
         vec![]
     );
     assert_eq!(
-        model.apply(&hide(id(0, 2), false), &at(2, 0, None)).unwrap(),
+        model
+            .apply(&hide(id(0, 2), false), &at(2, 0, None))
+            .unwrap(),
         vec![]
     );
     assert_eq!(hidden(&model), [false, true]);

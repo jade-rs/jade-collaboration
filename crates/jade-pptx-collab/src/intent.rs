@@ -120,6 +120,11 @@ pub enum PptxIntent {
         slide: usize,
         shape: u32,
     },
+    /// Hides a slide from the slide show, or shows it again.
+    SetSlideHidden {
+        slide: usize,
+        hidden: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -412,5 +417,10 @@ pub fn resolve(
             let (slide, shape) = shape_id(view, *slide, *shape)?;
             Ok(vec![PptxOp::DeleteShape { slide, shape }])
         }
+        PptxIntent::SetSlideHidden { slide, hidden } => Ok(vec![PptxOp::SetSlideHidden {
+            slide: slide_id(view, *slide)?,
+            stamp: ids(1),
+            hidden: *hidden,
+        }]),
     }
 }

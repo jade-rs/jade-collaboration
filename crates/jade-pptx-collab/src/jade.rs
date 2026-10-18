@@ -166,6 +166,14 @@ impl JadePptx {
         }
     }
 
+    /// Whether slide `index` is hidden from the slide show.
+    pub fn hidden(&self, index: usize) -> bool {
+        self.deck()
+            .slides
+            .get(index)
+            .is_some_and(|s| s.content.hidden)
+    }
+
     /// Where jade places top-level shape `id` (inherited placement resolved).
     pub fn geometry(&self, index: usize, id: u32) -> Option<Geometry> {
         self.editable_shapes(index)
@@ -325,6 +333,11 @@ impl JadePptx {
                     .map(drop)
                     .map_err(|e| e.to_string())
             }
+            PptxEffect::SetSlideHidden { slide, hidden } => self
+                .session
+                .set_slide_hidden(slide, hidden)
+                .map(drop)
+                .map_err(|e| e.to_string()),
             PptxEffect::InsertSlide { at } => self
                 .session
                 .insert_slide(at)

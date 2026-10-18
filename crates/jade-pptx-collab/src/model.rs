@@ -204,6 +204,10 @@ pub(crate) struct Slide {
     pub(crate) next_number: u32,
     pub(crate) copies: Vec<CopyMade>,
     pub(crate) deleted: bool,
+    /// `show="0"`: skipped in a slide show. Unwritten (older checkpoints,
+    /// new slides) reads as shown.
+    #[serde(default)]
+    pub(crate) hidden: LwwRegister<bool>,
 }
 
 impl Slide {
@@ -220,6 +224,10 @@ impl Slide {
 
     fn visible_shapes(&self) -> impl Iterator<Item = &(Id, Shape)> {
         self.shapes.iter().filter(|(_, s)| !s.deleted)
+    }
+
+    pub(crate) fn is_hidden(&self) -> bool {
+        self.hidden.get().copied().unwrap_or(false)
     }
 }
 
@@ -282,6 +290,8 @@ pub struct SlideView {
     /// Speaker notes, paragraphs joined with `\n`.
     pub notes: String,
     pub notes_editable: bool,
+    /// Skipped in a slide show (`show="0"`).
+    pub hidden: bool,
 }
 
 /// A shape as the materializer needs it: by identity, and by the number the
@@ -362,6 +372,12 @@ pub enum PptxOp {
         id: Id,
         geometry: Geometry,
     },
+    /// Convergent. Hides a slide from the slide show (or shows it again):
+    /// one last-writer-wins register per slide. Any combination of hidden
+    /// slides is a valid deck and jade sets `show` on any slide, so
+    /// concurrent writes need no coordination; the newest stamp wins, as
+    /// for geometry.
+    SetSlideHidden { slide: Id, stamp: Id, hidden: bool },
     /// Sequenced. Deletes a top-level shape (a group with its children).
     /// jade refuses shapes other parts of the slide depend on in ways it
     /// cannot untangle, which only the file shows.
@@ -408,6 +424,11 @@ pub enum PptxEffect {
         slide: usize,
         shape: ShapeRef,
         geometry: Geometry,
+    },
+    /// The slide's `show` attribute after the write.
+    SetSlideHidden {
+        slide: usize,
+        hidden: bool,
     },
     InsertSlide {
         at: usize,
@@ -599,6 +620,7 @@ impl PptxModel {
                     layout: None,
                     copies: Vec::new(),
                     deleted: false,
+                    hidden: LwwRegister::default(),
                 },
             );
         }
@@ -629,6 +651,7 @@ impl PptxModel {
                         .collect(),
                     notes: joined(&slide.notes.flow),
                     notes_editable: slide.notes.editable,
+                    hidden: slide.is_hidden(),
                 }
             })
             .collect()
@@ -1013,6 +1036,35 @@ impl PptxModel {
         Ok(effects)
     }
 
+    fn set_hidden(
+        &mut self,
+        slide: Id,
+        stamp: Id,
+        hidden: bool,
+        ctx: &ApplyContext,
+    ) -> Result<Vec<PptxEffect>, Rejection> {
+        if !self.slides.contains_key(&slide) {
+            return Err(reject(format!("slide {slide} does not exist")));
+        }
+        let mut effects = Vec::new();
+        for target in self.reach(StoryId::Notes { slide }, ctx) {
+            let Some(s) = self.slides.get_mut(&target.slide()) else {
+                continue;
+            };
+            let before = s.is_hidden();
+            s.hidden.apply(stamp, hidden);
+            let after = s.is_hidden();
+            if let (true, Some(index)) = (before != after, self.slide_index(target.slide())) {
+                effects.push(PptxEffect::SetSlideHidden {
+                    slide: index,
+                    hidden: after,
+                });
+            }
+        }
+        self.observe([stamp]);
+        Ok(effects)
+    }
+
     fn visible_slide(&self, slide: Id) -> Result<usize, Rejection> {
         match self.slides.get(&slide) {
             None => Err(reject(format!("slide {slide} does not exist"))),
@@ -1066,6 +1118,7 @@ impl PptxModel {
                 next_number,
                 copies: Vec::new(),
                 deleted: false,
+                hidden: LwwRegister::default(),
             },
         );
         self.order.insert(at, id);
@@ -1116,6 +1169,7 @@ impl PptxModel {
             next_number: original.next_number,
             copies: Vec::new(),
             deleted: false,
+            hidden: original.hidden.clone(),
         };
         self.slides.insert(id, copy);
         self.slides
@@ -1237,7 +1291,8 @@ impl Document for PptxModel {
             PptxOp::InsertText { .. }
             | PptxOp::DeleteText { .. }
             | PptxOp::SplitParagraph { .. }
-            | PptxOp::SetGeometry { .. } => Lane::Convergent,
+            | PptxOp::SetGeometry { .. }
+            | PptxOp::SetSlideHidden { .. } => Lane::Convergent,
             PptxOp::JoinParagraph { .. }
             | PptxOp::InsertSlide { .. }
             | PptxOp::DeleteSlide { .. }
@@ -1264,6 +1319,11 @@ impl Document for PptxModel {
                 stamp,
                 edit,
             } => self.set_geometry(*slide, *shape, *stamp, edit, ctx),
+            PptxOp::SetSlideHidden {
+                slide,
+                stamp,
+                hidden,
+            } => self.set_hidden(*slide, *stamp, *hidden, ctx),
             PptxOp::JoinParagraph { story, mark } => self.join(*story, *mark, ctx),
             PptxOp::InsertSlide { id, after } => self.insert_slide(*id, *after),
             PptxOp::DeleteSlide { slide } => self.delete_slide(*slide),

@@ -416,7 +416,11 @@ fn deck_with_hidden_slide() -> Vec<u8> {
     let mut package = jade_opc::OpcPackage::open_preserving(&bytes).unwrap();
     let part = "ppt/slides/slide2.xml";
     let xml = package.required_part_str(part).unwrap();
-    package.replace(part, xml.replacen("<p:sld ", "<p:sld show=\"0\" ", 1).into_bytes());
+    package.replace(
+        part,
+        xml.replacen("<p:sld ", "<p:sld show=\"0\" ", 1)
+            .into_bytes(),
+    );
     package.write().unwrap()
 }
 
@@ -442,7 +446,11 @@ fn hidden_slides_are_loaded_and_realised() {
     s.intent(PptxIntent::InsertSlide { at: 2 });
     s.intent(PptxIntent::DuplicateSlide { slide: 3 });
     assert_eq!(
-        s.model.slides().iter().map(|s| s.hidden).collect::<Vec<_>>(),
+        s.model
+            .slides()
+            .iter()
+            .map(|s| s.hidden)
+            .collect::<Vec<_>>(),
         [false, false, true, true, false]
     );
     s.intent(PptxIntent::SetSlideHidden {
@@ -454,7 +462,11 @@ fn hidden_slides_are_loaded_and_realised() {
         hidden: true,
     });
     assert_eq!(
-        s.model.slides().iter().map(|s| s.hidden).collect::<Vec<_>>(),
+        s.model
+            .slides()
+            .iter()
+            .map(|s| s.hidden)
+            .collect::<Vec<_>>(),
         [true, false, false, true, false]
     );
     let reopened = JadePptx::open(&s.jade.export().unwrap()).unwrap();
