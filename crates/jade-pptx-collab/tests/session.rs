@@ -90,7 +90,8 @@ proptest! {
         let server = sim.server();
         prop_assert!(server.faults().is_empty(), "materialization faults: {:?}", server.faults());
         assert_agree(server.document(), server.materializer(), "after the session");
-        let reopened = JadePptx::open(&server.materializer().export().unwrap()).unwrap();
+        common::assert_formatted(server.document(), server.materializer(), "after the session");
+        let reopened = JadePptx::open(&server.materializer().export(server.document()).unwrap()).unwrap();
         assert_agree_with(server.document(), server.materializer(), &reopened, "after export");
     }
 }

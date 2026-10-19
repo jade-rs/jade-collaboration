@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use jade_collab_core::id::{Id, ReplicaId};
+use jade_collab_core::lww::LwwRegister;
 use jade_pptx_reader::{Deck, ShapeItem};
 use jade_pptx_writer::{EditSession, ShapeTransformInfo};
 
@@ -121,6 +122,7 @@ impl Loader<'_> {
                         can_resize: info.can_resize && !info.lock_aspect_ratio,
                         can_rotate: info.can_rotate,
                         group: info.kind == "group",
+                        aspect: info.can_resize && info.lock_aspect_ratio,
                     },
                 ))
             });
@@ -196,6 +198,7 @@ impl PptxModel {
         for (index, layout) in layouts.iter().enumerate() {
             let (shapes, notes) = loader.slide(index)?;
             let id = loader.id();
+            let hidden = LwwRegister::new(loader.id(), loader.deck.slides[index].content.hidden);
             let next_number = shapes.iter().map(|(_, s)| s.number).max().unwrap_or(1) + 1;
             model.order.push(id);
             model.slides.insert(
@@ -207,6 +210,7 @@ impl PptxModel {
                     next_number,
                     copies: Vec::new(),
                     deleted: false,
+                    hidden,
                 },
             );
         }

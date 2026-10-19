@@ -16,7 +16,8 @@ mod model;
 
 pub use jade::JadePptx;
 pub use load::LoadError;
+pub use model::MAX_PICTURE_BYTES;
 pub use model::{
-    Atom, Geometry, GeometryEdit, Paragraph, PptxEffect, PptxModel, PptxOp, ShapeKind, ShapeRef,
-    ShapeView, SlideView, StoryId, TextTarget,
+    Alignment, Atom, CharFormat, FormatRun, Geometry, GeometryEdit, Image, MarkKey, Paragraph,
+    PptxEffect, PptxModel, PptxOp, ShapeKind, ShapeRef, ShapeView, SlideView, StoryId, TextTarget,
 };

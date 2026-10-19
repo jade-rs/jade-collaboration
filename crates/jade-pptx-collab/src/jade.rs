@@ -7,7 +7,8 @@ use std::rc::Rc;
 use jade_collab_core::id::{Id, ReplicaId};
 use jade_collab_sync::{ApplyContext, Materializer, Rejection};
 use jade_pptx_writer::{
-    EditSession, NotesInputEdit, ShapeTransformInfo, TextFormat, TextRangeEdit,
+    EditSession, NotesInputEdit, ParagraphFormat, ParagraphFormatEdit, ShapeTransformInfo,
+    TextFormat, TextFormatEdit, TextRangeEdit,
 };
 
 use crate::load::{geometry_of, shape_tree};
@@ -96,8 +97,37 @@ impl JadePptx {
         self.session.bytes()
     }
 
-    pub fn export(&self) -> Result<Vec<u8>, String> {
-        Ok(self.session.bytes().to_vec())
+    /// The file with the model's character formatting: what users
+    /// download. A copy of jade's deck gets every run of characters a mark
+    /// sets (`PptxModel::formatting`) as an explicit value; everything else
+    /// keeps jade's own formatting.
+    pub fn export(&self, model: &PptxModel) -> Result<Vec<u8>, String> {
+        let mut bytes = self.bytes().to_vec();
+        for run in model.formatting() {
+            let target = TextTarget::Shape(run.shape);
+            // Formatting never changes the text, so positions read on the
+            // base hold on every intermediate copy.
+            let start = self.position(run.slide, &target, run.paragraph, run.start)?;
+            let end = self.position(run.slide, &target, run.paragraph, run.end)?;
+            bytes = jade_pptx_writer::format_text_range(
+                &bytes,
+                run.slide,
+                &TextFormatEdit {
+                    shape_id: self.file_id(run.shape),
+                    start,
+                    end,
+                    format: run.format.to_jade(),
+                },
+            )
+            .map_err(|e| format!("formatting {run:?}: {e}"))?;
+        }
+        Ok(bytes)
+    }
+
+    /// jade's deck without the model's marks: what a checkpoint stores next
+    /// to the model, which holds the marks.
+    pub fn export_base(&self) -> Vec<u8> {
+        self.session.bytes().to_vec()
     }
 
     /// The file's id for a shape the model names.
@@ -164,6 +194,14 @@ impl JadePptx {
                 .and_then(|s| s.notes.clone())
                 .unwrap_or_default(),
         }
+    }
+
+    /// Whether slide `index` is hidden from the slide show.
+    pub fn hidden(&self, index: usize) -> bool {
+        self.deck()
+            .slides
+            .get(index)
+            .is_some_and(|s| s.content.hidden)
     }
 
     /// Where jade places top-level shape `id` (inherited placement resolved).
@@ -325,6 +363,35 @@ impl JadePptx {
                     .map(drop)
                     .map_err(|e| e.to_string())
             }
+            PptxEffect::AlignParagraph {
+                slide,
+                shape,
+                paragraph,
+                alignment,
+            } => {
+                // A caret in the paragraph formats exactly that paragraph.
+                let at = self.position(slide, &TextTarget::Shape(shape), paragraph, 0)?;
+                self.session
+                    .format_paragraphs(
+                        slide,
+                        &ParagraphFormatEdit {
+                            shape_id: self.file_id(shape),
+                            start: at,
+                            end: at,
+                            format: ParagraphFormat {
+                                alignment: Some(alignment.to_jade()),
+                                ..ParagraphFormat::default()
+                            },
+                        },
+                    )
+                    .map(drop)
+                    .map_err(|e| e.to_string())
+            }
+            PptxEffect::SetSlideHidden { slide, hidden } => self
+                .session
+                .set_slide_hidden(slide, hidden)
+                .map(drop)
+                .map_err(|e| e.to_string()),
             PptxEffect::InsertSlide { at } => self
                 .session
                 .insert_slide(at)
@@ -366,6 +433,22 @@ impl JadePptx {
                     .map_err(|e| e.to_string())?;
                 if id != shape.number {
                     self.ids.insert((shape.slide, shape.shape), id);
+                }
+                Ok(())
+            }
+            PptxEffect::InsertPicture {
+                slide,
+                shape,
+                geometry,
+                image,
+            } => {
+                let t = transform(geometry).ok_or("rotation is out of range")?;
+                let inserted = self
+                    .session
+                    .insert_picture(slide, t, &image.0)
+                    .map_err(|e| e.to_string())?;
+                if inserted.id != shape.number {
+                    self.ids.insert((shape.slide, shape.shape), inserted.id);
                 }
                 Ok(())
             }
@@ -411,6 +494,24 @@ impl Materializer<PptxModel> for JadePptx {
                     // Invalid geometry is the model's to refuse.
                     if jade_pptx_writer::validate_text_box(t, "", &format).is_ok() {
                         jade_pptx_writer::insert_text_box(bytes, index, t, "", &format)
+                            .map_err(refused)?;
+                    }
+                }
+            }
+            PptxOp::InsertPicture {
+                slide,
+                geometry,
+                image,
+                ..
+            } => {
+                if let (Some(index), Some(t)) = (model.slide_index(*slide), transform(*geometry)) {
+                    // Invalid geometry is the model's to refuse; decoding
+                    // the image is jade's.
+                    if jade_pptx_writer::validate_transform(t).is_ok()
+                        && geometry.width > 0
+                        && geometry.height > 0
+                    {
+                        jade_pptx_writer::insert_picture(bytes, index, t, &image.0)
                             .map_err(refused)?;
                     }
                 }

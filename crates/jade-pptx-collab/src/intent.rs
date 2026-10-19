@@ -13,7 +13,9 @@
 use jade_collab_core::id::Id;
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Geometry, GeometryEdit, Paragraph, PptxModel, PptxOp, StoryId};
+use crate::model::{
+    Alignment, CharFormat, Geometry, GeometryEdit, Image, Paragraph, PptxModel, PptxOp, StoryId,
+};
 
 fn one() -> usize {
     1
@@ -76,7 +78,10 @@ pub enum PptxIntent {
         #[serde(default = "one")]
         count: usize,
     },
-    /// EMU; rotation in 60000ths of a degree. Omitted attributes stay.
+    /// EMU; rotation in 60000ths of a degree. Omitted attributes stay. A
+    /// shape whose aspect ratio is locked (a picture) keeps it: a width or
+    /// height alone scales the other side, and the size travels as a
+    /// sequenced resize.
     SetGeometry {
         slide: usize,
         shape: u32,
@@ -120,6 +125,43 @@ pub enum PptxIntent {
         slide: usize,
         shape: u32,
     },
+    /// Gives the characters between two carets of a shape's text one
+    /// attribute (a convergent mark: text typed at its end takes it too).
+    FormatText {
+        slide: usize,
+        shape: u32,
+        start_paragraph: usize,
+        start_offset: usize,
+        end_paragraph: usize,
+        end_offset: usize,
+        format: CharFormat,
+    },
+    /// Aligns paragraphs `start_paragraph..=end_paragraph` of a shape.
+    AlignParagraphs {
+        slide: usize,
+        shape: u32,
+        start_paragraph: usize,
+        end_paragraph: usize,
+        alignment: Alignment,
+    },
+    /// A PNG or JPEG picture (base64 on the wire), on top of the slide.
+    /// Without a width and height it takes its pixel size at 96 dpi; with
+    /// one of them, the other follows the image's ratio.
+    InsertPicture {
+        slide: usize,
+        x: i64,
+        y: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        width: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        height: Option<i64>,
+        image: Image,
+    },
+    /// Hides a slide from the slide show, or shows it again.
+    SetSlideHidden {
+        slide: usize,
+        hidden: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -138,7 +180,29 @@ pub enum IntentError {
     InvertedRange,
     #[error("there is no slide position {0}")]
     BadPosition(usize),
+    #[error("the range holds no characters to format")]
+    NothingToFormat,
+    #[error("invalid format: {0}")]
+    InvalidFormat(String),
+    #[error("invalid picture: {0}")]
+    InvalidPicture(String),
 }
+
+/// `known_other * given / known`, rounded: the side that keeps a ratio.
+fn scaled(given: i64, known: i64, known_other: i64) -> i64 {
+    if known == 0 {
+        return known_other;
+    }
+    let (n, d) = (
+        i128::from(given) * i128::from(known_other),
+        i128::from(known),
+    );
+    let rounded = (2 * n + d.signum() * d) / (2 * d);
+    i64::try_from(rounded).unwrap_or(i64::MAX)
+}
+
+/// EMU per pixel at 96 dpi.
+const EMU_PER_PIXEL: i64 = 9525;
 
 fn slide_id(view: &PptxModel, number: usize) -> Result<Id, IntentError> {
     number
@@ -337,19 +401,49 @@ pub fn resolve(
             height,
             rotation,
         } => {
+            let number = *slide;
             let (slide, shape) = shape_id(view, *slide, *shape)?;
-            Ok(vec![PptxOp::SetGeometry {
-                slide,
-                shape,
-                stamp: ids(1),
-                edit: GeometryEdit {
-                    x: *x,
-                    y: *y,
-                    width: *width,
-                    height: *height,
-                    rotation: *rotation,
-                },
-            }])
+            let view_shape = view.slides()[number - 1]
+                .shapes
+                .iter()
+                .find(|s| s.id == shape)
+                .cloned()
+                .expect("resolved");
+            let locked = view_shape.aspect_locked;
+            let mut ops = Vec::new();
+            let edit = GeometryEdit {
+                x: *x,
+                y: *y,
+                width: if locked { None } else { *width },
+                height: if locked { None } else { *height },
+                rotation: *rotation,
+            };
+            if edit != GeometryEdit::default() || !locked {
+                ops.push(PptxOp::SetGeometry {
+                    slide,
+                    shape,
+                    stamp: ids(1),
+                    edit,
+                });
+            }
+            if let (true, Some(current)) = (locked, view_shape.geometry) {
+                let size = match (*width, *height) {
+                    (Some(w), Some(h)) => Some((w, h)),
+                    (Some(w), None) => Some((w, scaled(w, current.width, current.height))),
+                    (None, Some(h)) => Some((scaled(h, current.height, current.width), h)),
+                    (None, None) => None,
+                };
+                if let Some((width, height)) = size {
+                    ops.push(PptxOp::ResizeShape {
+                        slide,
+                        shape,
+                        stamp: ids(1),
+                        width,
+                        height,
+                    });
+                }
+            }
+            Ok(ops)
         }
         PptxIntent::InsertSlide { at } => {
             let slides = view.slides();
@@ -412,5 +506,105 @@ pub fn resolve(
             let (slide, shape) = shape_id(view, *slide, *shape)?;
             Ok(vec![PptxOp::DeleteShape { slide, shape }])
         }
+        PptxIntent::FormatText {
+            slide,
+            shape,
+            start_paragraph,
+            start_offset,
+            end_paragraph,
+            end_offset,
+            format,
+        } => {
+            format.validate().map_err(IntentError::InvalidFormat)?;
+            let story = story(view, *slide, Target::Shape(*shape))?;
+            let paragraphs = view.paragraphs(story).expect("resolved");
+            let start = caret(&paragraphs, *start_paragraph, *start_offset)?;
+            let end = caret(&paragraphs, *end_paragraph, *end_offset)?;
+            if start.index > end.index {
+                return Err(IntentError::InvertedRange);
+            }
+            let chars: Vec<Id> = atoms(&paragraphs)[start.index..end.index]
+                .iter()
+                .filter_map(|a| a.ok())
+                .collect();
+            let (Some(first), Some(last)) = (chars.first(), chars.last()) else {
+                return Err(IntentError::NothingToFormat);
+            };
+            let (start, end) = view
+                .mark_anchors(story, *first, *last, format.key().expand())
+                .expect("a view's characters are in their story, in order");
+            Ok(vec![PptxOp::Mark {
+                story,
+                id: ids(1),
+                start,
+                end,
+                format: format.clone(),
+            }])
+        }
+        PptxIntent::AlignParagraphs {
+            slide,
+            shape,
+            start_paragraph,
+            end_paragraph,
+            alignment,
+        } => {
+            let story = story(view, *slide, Target::Shape(*shape))?;
+            let paragraphs = view.paragraphs(story).expect("resolved");
+            for n in [*start_paragraph, *end_paragraph] {
+                if n >= paragraphs.len() {
+                    return Err(IntentError::NoSuchParagraph(n));
+                }
+            }
+            if start_paragraph > end_paragraph {
+                return Err(IntentError::InvertedRange);
+            }
+            // A paragraph is named by the mark that ends the one before it.
+            let after = |n: usize| n.checked_sub(1).and_then(|k| paragraphs[k].mark);
+            Ok(vec![PptxOp::AlignParagraphs {
+                story,
+                from: after(*start_paragraph),
+                to: after(*end_paragraph),
+                alignment: *alignment,
+            }])
+        }
+        PptxIntent::InsertPicture {
+            slide,
+            x,
+            y,
+            width,
+            height,
+            image,
+        } => {
+            let slide = slide_id(view, *slide)?;
+            let info = jade_pptx_writer::picture_info(&image.0)
+                .map_err(|e| IntentError::InvalidPicture(e.to_string()))?;
+            let (pw, ph) = (
+                i64::from(info.width) * EMU_PER_PIXEL,
+                i64::from(info.height) * EMU_PER_PIXEL,
+            );
+            let (width, height) = match (*width, *height) {
+                (Some(w), Some(h)) => (w, h),
+                (Some(w), None) => (w, scaled(w, pw, ph)),
+                (None, Some(h)) => (scaled(h, ph, pw), h),
+                (None, None) => (pw, ph),
+            };
+            Ok(vec![PptxOp::InsertPicture {
+                slide,
+                id: ids(1),
+                geometry: Geometry {
+                    x: *x,
+                    y: *y,
+                    width,
+                    height,
+                    rotation: 0,
+                },
+                image: image.clone(),
+            }])
+        }
+        PptxIntent::SetSlideHidden { slide, hidden } => Ok(vec![PptxOp::SetSlideHidden {
+            slide: slide_id(view, *slide)?,
+            stamp: ids(1),
+            hidden: *hidden,
+        }]),
     }
 }

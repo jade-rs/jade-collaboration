@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{assert_agree, assert_agree_with, fixtures, generate, open};
+use common::{assert_agree, assert_agree_with, assert_formatted, fixtures, generate, open};
 use jade_collab_core::id::{Id, ReplicaId};
 use jade_collab_sync::{ApplyContext, Document, Lane, Materializer};
 use jade_pptx_collab::intent::{resolve, PptxIntent, Target};
@@ -186,7 +186,7 @@ fn structure_is_realised_in_jade() {
     });
     s.intent(PptxIntent::DeleteSlide { slide: 4 });
     s.intent(PptxIntent::DeleteSlide { slide: 2 });
-    let reopened = JadePptx::open(&s.jade.export().unwrap()).unwrap();
+    let reopened = JadePptx::open(&s.jade.export(&s.model).unwrap()).unwrap();
     assert_agree_with(&s.model, &s.jade, &reopened, "after export");
 }
 
@@ -282,11 +282,12 @@ proptest! {
                     jade.materialize(&model, effect, &ctx)
                         .unwrap_or_else(|e| panic!("{fixture}: jade refused {op:?}: {e}"));
                     assert_agree(&model, &jade, &format!("{fixture} after {op:?}"));
+                    assert_formatted(&model, &jade, &format!("{fixture} after {op:?}"));
                 }
                 Err(_) => prop_assert_eq!(&model, &before, "a rejected op changed the model"),
             }
         }
-        let reopened = JadePptx::open(&jade.export().unwrap()).unwrap();
+        let reopened = JadePptx::open(&jade.export(&model).unwrap()).unwrap();
         assert_agree_with(&model, &jade, &reopened, &format!("{fixture} after export"));
         // A model built from the exported file agrees with it too.
         let reloaded = PptxModel::from_pptx(reopened.bytes()).unwrap();
@@ -386,7 +387,7 @@ fn a_restored_materializer_finds_text_boxes_whose_ids_jade_reused() {
     let boxed = s.model.slides()[0].shapes.last().unwrap().clone();
 
     let model: PptxModel = serde_json::from_str(&serde_json::to_string(&s.model).unwrap()).unwrap();
-    let mut restored = JadePptx::restore(&s.jade.export().unwrap(), &model).unwrap();
+    let mut restored = JadePptx::restore(&s.jade.export_base(), &model).unwrap();
     assert_agree(&model, &restored, "restored");
     let mut model = model;
     let story = StoryId::Shape {
@@ -408,4 +409,274 @@ fn a_restored_materializer_finds_text_boxes_whose_ids_jade_reused() {
     let effect = model.apply(&op, &ctx).unwrap();
     restored.materialize(&model, effect, &ctx).unwrap();
     assert_agree(&model, &restored, "after editing the restored text box");
+}
+
+/// A deck whose second slide is hidden (`show="0"`), as PowerPoint writes it.
+fn deck_with_hidden_slide() -> Vec<u8> {
+    let bytes = common::fixture("sample-deck.pptx");
+    let mut package = jade_opc::OpcPackage::open_preserving(&bytes).unwrap();
+    let part = "ppt/slides/slide2.xml";
+    let xml = package.required_part_str(part).unwrap();
+    package.replace(
+        part,
+        xml.replacen("<p:sld ", "<p:sld show=\"0\" ", 1)
+            .into_bytes(),
+    );
+    package.write().unwrap()
+}
+
+/// Hidden slides are read from the file, and showing, hiding, duplicating
+/// and inserting next to them are realised by jade as the model says.
+#[test]
+fn hidden_slides_are_loaded_and_realised() {
+    let bytes = deck_with_hidden_slide();
+    let jade = JadePptx::open(&bytes).unwrap();
+    let model = PptxModel::from_pptx(&bytes).unwrap();
+    assert_eq!(
+        model.slides().iter().map(|s| s.hidden).collect::<Vec<_>>(),
+        [false, true, false]
+    );
+    assert_agree(&model, &jade, "on load");
+    let mut s = Session {
+        model,
+        jade,
+        seq: 0,
+        next: 1_000_000,
+    };
+    // A slide inserted in front of the hidden one, and a copy of it.
+    s.intent(PptxIntent::InsertSlide { at: 2 });
+    s.intent(PptxIntent::DuplicateSlide { slide: 3 });
+    assert_eq!(
+        s.model
+            .slides()
+            .iter()
+            .map(|s| s.hidden)
+            .collect::<Vec<_>>(),
+        [false, false, true, true, false]
+    );
+    s.intent(PptxIntent::SetSlideHidden {
+        slide: 3,
+        hidden: false,
+    });
+    s.intent(PptxIntent::SetSlideHidden {
+        slide: 1,
+        hidden: true,
+    });
+    assert_eq!(
+        s.model
+            .slides()
+            .iter()
+            .map(|s| s.hidden)
+            .collect::<Vec<_>>(),
+        [true, false, false, true, false]
+    );
+    let reopened = JadePptx::open(&s.jade.export(&s.model).unwrap()).unwrap();
+    assert_agree_with(&s.model, &s.jade, &reopened, "after export");
+}
+
+/// Character formatting is realised on the written file over jade's base:
+/// marked characters show the marks' values, text typed at a mark's end is
+/// covered, everything else keeps jade's formatting, and the server's own
+/// document never sees a mark. Alignment is applied to jade's document.
+#[test]
+fn formatting_is_realised_over_jades_base() {
+    use jade_pptx_collab::{Alignment, CharFormat};
+    let mut s = Session::open("sample-deck.pptx");
+    let slide = s.model.slides()[0].clone();
+    let shape = slide
+        .shapes
+        .iter()
+        .find(|shape| shape.editable && shape.text.as_ref().is_some_and(|t| t.len() > 4))
+        .expect("an editable shape with text")
+        .clone();
+    let format = |s: &mut Session, format: CharFormat, from: usize, to: usize| {
+        s.intent(PptxIntent::FormatText {
+            slide: 1,
+            shape: shape.number,
+            start_paragraph: 0,
+            start_offset: from,
+            end_paragraph: 0,
+            end_offset: to,
+            format,
+        })
+    };
+    let base_before = s.jade.bytes().to_vec();
+    format(&mut s, CharFormat::Bold { value: true }, 1, 3);
+    assert_eq!(
+        s.jade.bytes(),
+        &base_before[..],
+        "marks never reach jade's document"
+    );
+    format(&mut s, CharFormat::Italic { value: true }, 0, 2);
+    format(&mut s, CharFormat::Underline { value: true }, 2, 4);
+    format(&mut s, CharFormat::Size { hundredths: 3150 }, 0, 4);
+    format(
+        &mut s,
+        CharFormat::Font {
+            typeface: "Georgia".into(),
+        },
+        1,
+        2,
+    );
+    format(
+        &mut s,
+        CharFormat::EastAsianFont {
+            typeface: "Yu Mincho".into(),
+        },
+        0,
+        1,
+    );
+    format(
+        &mut s,
+        CharFormat::Color {
+            color: "#c00000".into(),
+        },
+        3,
+        4,
+    );
+    format(&mut s, CharFormat::Bold { value: false }, 1, 2);
+    // Typing at the end of the bold text, and in front of it.
+    s.intent(PptxIntent::InsertText {
+        slide: 1,
+        target: Target::Shape(shape.number),
+        paragraph: 0,
+        offset: 3,
+        text: "XY\nZ".into(),
+    });
+    s.intent(PptxIntent::InsertText {
+        slide: 1,
+        target: Target::Shape(shape.number),
+        paragraph: 0,
+        offset: 1,
+        text: "w".into(),
+    });
+    assert_formatted(&s.model, &s.jade, "after formatting");
+    let story = StoryId::Shape {
+        slide: slide.id,
+        shape: shape.id,
+    };
+    let x = s.model.paragraphs(story).unwrap()[0].chars[4];
+    let w = s.model.paragraphs(story).unwrap()[0].chars[1];
+    let marked = s.model.char_formats(story).unwrap();
+    assert!(
+        marked[&x].contains(&CharFormat::Bold { value: true }),
+        "typed at the end"
+    );
+    assert!(!marked
+        .get(&w)
+        .is_some_and(|f| f.contains(&CharFormat::Bold { value: true })));
+
+    s.intent(PptxIntent::AlignParagraphs {
+        slide: 1,
+        shape: shape.number,
+        start_paragraph: 0,
+        end_paragraph: 1,
+        alignment: Alignment::Center,
+    });
+    let deck = jade_pptx_reader::read_deck(&s.jade.export(&s.model).unwrap()).unwrap();
+    let body = deck.slides[0]
+        .content
+        .shapes
+        .iter()
+        .find_map(|item| match item {
+            jade_pptx_reader::ShapeItem::Shape(sh) if sh.id == Some(shape.number) => {
+                sh.text.clone()
+            }
+            _ => None,
+        })
+        .unwrap();
+    for paragraph in &body.paragraphs[..2] {
+        assert_eq!(paragraph.align, Some(jade_pptx_reader::TextAlign::Center));
+    }
+    let reopened = JadePptx::open(&s.jade.export(&s.model).unwrap()).unwrap();
+    assert_agree_with(&s.model, &s.jade, &reopened, "after export");
+}
+
+/// Pictures are inserted (sized from their pixels when the caller gives no
+/// size), moved, resized keeping their ratio, duplicated with their slide
+/// and deleted, all in jade; the file reads back as the same deck, and a
+/// restored server finds the file id jade gave the picture.
+#[test]
+fn pictures_are_realised_in_jade() {
+    use jade_pptx_collab::{Image, ShapeKind};
+    let mut s = Session::open("sample-deck.pptx");
+    s.intent(PptxIntent::InsertPicture {
+        slide: 1,
+        x: 914_400,
+        y: 457_200,
+        width: None,
+        height: None,
+        image: Image(common::PNG.to_vec()),
+    });
+    let picture = s.model.slides()[0].shapes.last().unwrap().clone();
+    assert_eq!(picture.kind, ShapeKind::Picture);
+    assert!(picture.aspect_locked);
+    let g = picture.geometry.unwrap();
+    assert_eq!(
+        (g.x, g.y, g.width, g.height),
+        (914_400, 457_200, 9525, 9525)
+    );
+    // Moving and resizing by width: the height follows the ratio.
+    s.intent(PptxIntent::SetGeometry {
+        slide: 1,
+        shape: picture.number,
+        x: Some(10),
+        y: Some(20),
+        width: Some(952_500),
+        height: None,
+        rotation: Some(5_400_000),
+    });
+    let g = s.model.slides()[0].shapes.last().unwrap().geometry.unwrap();
+    assert_eq!(
+        (g.x, g.y, g.width, g.height, g.rotation),
+        (10, 20, 952_500, 952_500, 5_400_000)
+    );
+    s.intent(PptxIntent::DuplicateSlide { slide: 1 });
+    s.intent(PptxIntent::DeleteShape {
+        slide: 1,
+        shape: picture.number,
+    });
+    let reopened = JadePptx::open(&s.jade.export(&s.model).unwrap()).unwrap();
+    assert_agree_with(&s.model, &s.jade, &reopened, "after export");
+    let reloaded = PptxModel::from_pptx(reopened.bytes()).unwrap();
+    assert_eq!(
+        reloaded.slides()[1].shapes.last().unwrap().kind,
+        ShapeKind::Picture,
+        "the copy keeps its picture"
+    );
+    let model: PptxModel = serde_json::from_str(&serde_json::to_string(&s.model).unwrap()).unwrap();
+    let restored = JadePptx::restore(&s.jade.export_base(), &model).unwrap();
+    assert_agree(&model, &restored, "restored");
+}
+
+/// The model checks a picture's size and signature; whether jade can
+/// decode it is jade's to say, before the operation commits.
+#[test]
+fn jade_refuses_a_picture_it_cannot_decode() {
+    use jade_pptx_collab::Image;
+    let (model, jade) = open("sample-deck.pptx");
+    let mut broken = common::PNG[..20].to_vec();
+    broken.extend_from_slice(b"garbage");
+    let op = PptxOp::InsertPicture {
+        slide: model.slides()[0].id,
+        id: Id::new(1_000_000, ReplicaId(1)),
+        geometry: Geometry {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+            rotation: 0,
+        },
+        image: Image(broken),
+    };
+    let ctx = ApplyContext {
+        origin: ReplicaId(1),
+        base_seq: 0,
+        seq: Some(1),
+    };
+    assert!(
+        model.clone().apply(&op, &ctx).is_ok(),
+        "the model alone would take it"
+    );
+    assert!(jade.admit(&model, &op).is_err());
 }

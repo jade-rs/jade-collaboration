@@ -324,10 +324,236 @@ fn intents_have_a_stable_wire_format() {
         r#"{"type":"delete_shape","slide":1,"shape":2}"#,
         r#"{"type":"insert_paragraph_break","slide":1,"target":{"shape":2},"paragraph":0,"offset":0}"#,
         r#"{"type":"replace_range","slide":1,"target":"notes","start_paragraph":0,"start_offset":0,"end_paragraph":0,"end_offset":0,"text":""}"#,
+        r#"{"type":"set_slide_hidden","slide":2,"hidden":true}"#,
+        r#"{"type":"insert_picture","slide":1,"x":0,"y":0,"image":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="}"#,
+        r#"{"type":"insert_picture","slide":1,"x":0,"y":0,"width":10,"height":20,"image":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="}"#,
+        r#"{"type":"format_text","slide":1,"shape":2,"start_paragraph":0,"start_offset":0,"end_paragraph":0,"end_offset":1,"format":{"attribute":"bold","value":true}}"#,
+        r#"{"type":"format_text","slide":1,"shape":2,"start_paragraph":0,"start_offset":0,"end_paragraph":0,"end_offset":1,"format":{"attribute":"size","hundredths":2400}}"#,
+        r#"{"type":"align_paragraphs","slide":1,"shape":2,"start_paragraph":0,"end_paragraph":1,"alignment":"center"}"#,
     ] {
         let intent: PptxIntent =
             serde_json::from_str(json).unwrap_or_else(|e| panic!("{json}: {e}"));
         let back = serde_json::to_string(&intent).unwrap();
         assert_eq!(serde_json::from_str::<PptxIntent>(&back).unwrap(), intent);
+    }
+}
+
+#[test]
+fn slides_are_hidden_and_shown_by_number() {
+    let mut model = PptxModel::from_texts(&[&["a"], &["b"]]);
+    let ops = run(
+        &mut model,
+        PptxIntent::SetSlideHidden {
+            slide: 2,
+            hidden: true,
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        ops.as_slice(),
+        [PptxOp::SetSlideHidden { hidden: true, .. }]
+    ));
+    assert_eq!(
+        model.slides().iter().map(|s| s.hidden).collect::<Vec<_>>(),
+        [false, true]
+    );
+    run(
+        &mut model,
+        PptxIntent::SetSlideHidden {
+            slide: 2,
+            hidden: false,
+        },
+    )
+    .unwrap();
+    assert!(!model.slides()[1].hidden, "a later write wins");
+    assert_eq!(
+        run(
+            &mut model,
+            PptxIntent::SetSlideHidden {
+                slide: 3,
+                hidden: true
+            }
+        ),
+        Err(IntentError::NoSuchSlide(3))
+    );
+}
+
+#[test]
+fn formatting_by_shape_id_and_byte_offsets() {
+    use jade_pptx_collab::{Alignment, CharFormat, StoryId};
+    let mut model = PptxModel::from_texts(&[&["日本語", "a\nb\n"]]);
+    let ops = run(
+        &mut model,
+        PptxIntent::FormatText {
+            slide: 1,
+            shape: 2,
+            start_paragraph: 0,
+            start_offset: 3,
+            end_paragraph: 0,
+            end_offset: 9,
+            format: CharFormat::Bold { value: true },
+        },
+    )
+    .unwrap();
+    assert!(matches!(ops.as_slice(), [PptxOp::Mark { .. }]));
+    let slide = &model.slides()[0];
+    let story = StoryId::Shape {
+        slide: slide.id,
+        shape: slide.shapes[0].id,
+    };
+    let chars = model.paragraphs(story).unwrap()[0].chars.clone();
+    let marked = model.char_formats(story).unwrap();
+    assert!(!marked.contains_key(&chars[0]));
+    assert_eq!(marked[&chars[1]], [CharFormat::Bold { value: true }]);
+    assert_eq!(marked[&chars[2]], [CharFormat::Bold { value: true }]);
+
+    // An empty range formats nothing; notes and bad values are refused.
+    let empty = PptxIntent::FormatText {
+        slide: 1,
+        shape: 2,
+        start_paragraph: 0,
+        start_offset: 3,
+        end_paragraph: 0,
+        end_offset: 3,
+        format: CharFormat::Bold { value: true },
+    };
+    assert_eq!(run(&mut model, empty), Err(IntentError::NothingToFormat));
+    let bad = PptxIntent::FormatText {
+        slide: 1,
+        shape: 2,
+        start_paragraph: 0,
+        start_offset: 0,
+        end_paragraph: 0,
+        end_offset: 3,
+        format: CharFormat::Color {
+            color: "red".into(),
+        },
+    };
+    assert!(matches!(
+        run(&mut model, bad),
+        Err(IntentError::InvalidFormat(_))
+    ));
+
+    // Alignment of every paragraph, the empty last one included.
+    let ops = run(
+        &mut model,
+        PptxIntent::AlignParagraphs {
+            slide: 1,
+            shape: 3,
+            start_paragraph: 1,
+            end_paragraph: 2,
+            alignment: Alignment::Right,
+        },
+    )
+    .unwrap();
+    let story = StoryId::Shape {
+        slide: slide.id,
+        shape: slide.shapes[1].id,
+    };
+    let marks: Vec<_> = model
+        .paragraphs(story)
+        .unwrap()
+        .iter()
+        .filter_map(|p| p.mark)
+        .collect();
+    assert_eq!(
+        ops,
+        [PptxOp::AlignParagraphs {
+            story,
+            from: Some(marks[0]),
+            to: Some(marks[1]),
+            alignment: Alignment::Right,
+        }]
+    );
+    assert_eq!(
+        run(
+            &mut model,
+            PptxIntent::AlignParagraphs {
+                slide: 1,
+                shape: 3,
+                start_paragraph: 1,
+                end_paragraph: 3,
+                alignment: Alignment::Right,
+            }
+        ),
+        Err(IntentError::NoSuchParagraph(3))
+    );
+}
+
+#[test]
+fn pictures_are_sized_from_their_pixels_and_resized_keeping_their_ratio() {
+    use jade_pptx_collab::{Image, ShapeKind};
+    let png = base64_png();
+    let mut model = PptxModel::from_texts(&[&["a"]]);
+    // One given side: the other follows the image's ratio (1×1 here).
+    run(
+        &mut model,
+        PptxIntent::InsertPicture {
+            slide: 1,
+            x: 5,
+            y: 6,
+            width: Some(4000),
+            height: None,
+            image: Image(png.clone()),
+        },
+    )
+    .unwrap();
+    let picture = model.slides()[0].shapes.last().unwrap().clone();
+    assert_eq!(picture.kind, ShapeKind::Picture);
+    let g = picture.geometry.unwrap();
+    assert_eq!((g.x, g.y, g.width, g.height), (5, 6, 4000, 4000));
+    // A width alone on a picture is a sequenced resize keeping the ratio;
+    // its position is a convergent write.
+    let ops = run(
+        &mut model,
+        PptxIntent::SetGeometry {
+            slide: 1,
+            shape: picture.number,
+            x: Some(1),
+            y: None,
+            width: None,
+            height: Some(1000),
+            rotation: None,
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        ops.as_slice(),
+        [
+            PptxOp::SetGeometry { .. },
+            PptxOp::ResizeShape {
+                width: 1000,
+                height: 1000,
+                ..
+            }
+        ]
+    ));
+    let g = model.slides()[0].shapes.last().unwrap().geometry.unwrap();
+    assert_eq!((g.x, g.width, g.height), (1, 1000, 1000));
+    // Not an image jade reads.
+    assert!(matches!(
+        run(
+            &mut model,
+            PptxIntent::InsertPicture {
+                slide: 1,
+                x: 0,
+                y: 0,
+                width: None,
+                height: None,
+                image: Image(b"nope".to_vec()),
+            }
+        ),
+        Err(IntentError::InvalidPicture(_))
+    ));
+}
+
+fn base64_png() -> Vec<u8> {
+    let intent: PptxIntent = serde_json::from_str(
+        r#"{"type":"insert_picture","slide":1,"x":0,"y":0,"image":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="}"#,
+    )
+    .unwrap();
+    match intent {
+        PptxIntent::InsertPicture { image, .. } => image.0,
+        other => panic!("{other:?}"),
     }
 }
