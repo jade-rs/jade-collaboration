@@ -194,6 +194,35 @@ impl<T> Rga<T> {
             .take(end - start)
     }
 
+    /// The atoms before document position `end`, nearest first — what
+    /// `nodes()[..end]` holds, reversed, without materializing the rest.
+    /// Lets a caller walk back to the start of whatever `end` is in (a
+    /// paragraph, say) in time proportional to the distance. Panics when
+    /// `end` is past the end.
+    pub fn nodes_before_rev(&self, end: usize) -> impl Iterator<Item = &Node<T>> + '_ {
+        assert!(
+            end <= self.len,
+            "position {end} out of range for a sequence of length {}",
+            self.len
+        );
+        let (chunk, take) = if end == 0 {
+            (0, 0)
+        } else {
+            let chunk = self.lens.find(end - 1);
+            (chunk + 1, end - self.lens.prefix(chunk))
+        };
+        let (last, earlier) = match self.chunks[..chunk].split_last() {
+            Some((last, earlier)) => (&last.nodes[..take], earlier),
+            None => (&[][..], &[][..]),
+        };
+        last.iter().rev().chain(
+            earlier
+                .iter()
+                .rev()
+                .flat_map(|chunk| chunk.nodes.iter().rev()),
+        )
+    }
+
     pub fn ids(&self) -> Vec<Id> {
         self.iter().map(|node| node.id).collect()
     }

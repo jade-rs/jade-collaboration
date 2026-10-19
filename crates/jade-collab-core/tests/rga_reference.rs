@@ -389,6 +389,10 @@ fn check_ranges(rga: &Rga<char>, naive: &Naive<char>, seed: usize) -> Result<(),
         naive.nodes[..end].to_vec()
     );
     prop_assert_eq!(collect(Box::new(rga.nodes_in(..))), naive.nodes.clone());
+    // Backwards from a position: what slicing up to it holds, reversed.
+    let mut reversed = naive.nodes[..end].to_vec();
+    reversed.reverse();
+    prop_assert_eq!(collect(Box::new(rga.nodes_before_rev(end))), reversed);
     if end < n {
         prop_assert_eq!(
             collect(Box::new(rga.nodes_in(start..=end))),
