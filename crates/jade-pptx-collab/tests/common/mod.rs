@@ -470,10 +470,10 @@ pub fn every_attribute() -> [CharFormat; 7] {
     ]
 }
 
-fn find_text<'a>(
-    items: &'a [jade_pptx_reader::ShapeItem],
+fn find_text(
+    items: &[jade_pptx_reader::ShapeItem],
     id: u32,
-) -> Option<&'a jade_pptx_reader::TextBody> {
+) -> Option<&jade_pptx_reader::TextBody> {
     items.iter().find_map(|item| match item {
         jade_pptx_reader::ShapeItem::Shape(s) if s.id == Some(id) => s.text.as_ref(),
         jade_pptx_reader::ShapeItem::Group(g) => find_text(&g.children, id),
