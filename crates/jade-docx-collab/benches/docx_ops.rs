@@ -328,12 +328,8 @@ fn main() {
             .filter(|(_, p)| p.chars.len() >= 8)
             .map(|(n, _)| n)
             .collect();
-        let mut made = 0;
         let mut mark_cost = Vec::new();
-        for (k, p) in targets.iter().cycle().enumerate() {
-            if made == marks {
-                break;
-            }
+        for (k, p) in targets.iter().cycle().enumerate().take(marks) {
             let shift = (k / targets.len()) % 4;
             let phases = session.run(&IntentOp::Format {
                 start_paragraph: *p,
@@ -343,7 +339,6 @@ fn main() {
                 change: FormatChange::Bold { value: k % 2 == 0 },
             });
             mark_cost.push(phases);
-            made += 1;
         }
         let tail = mark_cost.split_off(mark_cost.len().saturating_sub(samples));
         report(&format!("mark #{marks}"), tail);
