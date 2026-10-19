@@ -1216,6 +1216,19 @@ pub fn char_styles(model: &DocxModel, jade: &JadeDocx) -> BTreeMap<Id, CharStyle
     char_styles_in(model, jade.word())
 }
 
+/// Every visible character of `model`, with what jade's own document says
+/// about it once written and read back. jade resolves the properties of a
+/// run the file gives none (a text box made in the session) only when some
+/// edit touches it, sometimes to theme fonts and sometimes to their names;
+/// the file is the same either way, so formatting checks compare files.
+pub fn written_char_styles(model: &DocxModel, jade: &JadeDocx) -> BTreeMap<Id, CharStyle> {
+    let bytes = jade
+        .export_base()
+        .unwrap_or_else(|e| panic!("jade cannot write the document: {e}"));
+    let reread = JadeDocx::load(&bytes).unwrap_or_else(|e| panic!("jade cannot reread it: {e}"));
+    char_styles_in(model, reread.word())
+}
+
 /// Every visible character of `model`, with what the file jade writes —
 /// its document with the model's marks realised — says about it.
 pub fn formatted_char_styles(model: &DocxModel, jade: &JadeDocx) -> BTreeMap<Id, CharStyle> {

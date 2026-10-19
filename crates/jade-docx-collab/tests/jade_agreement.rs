@@ -12,7 +12,8 @@ use common::{
     assert_comments_agree, assert_formatting_agrees, assert_revisions_agree, assert_same_order,
     assert_stories_agree, assert_tables_agree, char_styles, char_styles_in, commit, derive,
     formatted_char_styles, generate, generate_through_merges, jade_comments, jade_core,
-    model_marks, open, paragraph_formats, paragraph_snapshot, shows, surface, CharStyle,
+    model_marks, open, paragraph_formats, paragraph_snapshot, shows, surface, written_char_styles,
+    CharStyle,
 };
 use jade_collab_core::id::{Id, ReplicaId};
 use jade_collab_sync::{ApplyContext, Document, Lane, Materializer};
@@ -261,7 +262,7 @@ proptest! {
             }
             let before = model.clone();
             let formatting = matches!(op, DocxOp::Format { .. });
-            let styles_before = formatting.then(|| char_styles(&model, &jade));
+            let styles_before = formatting.then(|| written_char_styles(&model, &jade));
             let formats_before = formatting.then(|| paragraph_formats(&model, &jade));
             match model.apply(&op, &ctx) {
                 Ok(effect) => {
@@ -279,7 +280,7 @@ proptest! {
                             &op,
                             &effect,
                             &styles_before,
-                            &char_styles(&model, &jade),
+                            &written_char_styles(&model, &jade),
                             &formats_before,
                             &paragraph_formats(&model, &jade),
                             &context,
