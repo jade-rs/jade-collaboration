@@ -55,6 +55,93 @@ fn through_json<T: serde::Serialize + serde::de::DeserializeOwned>(value: &T) ->
 }
 
 #[test]
+fn legacy_unbound_replicas_cannot_be_claimed_by_an_authenticated_principal() {
+    let mut server = Sequencer::new(ToyDoc::sample());
+    let replica = server.join().replica;
+    let mut old = serde_json::to_value(server.checkpoint()).unwrap();
+    old.as_object_mut().unwrap().remove("owners");
+    let mut restored: Sequencer<ToyDoc> =
+        Sequencer::restore(serde_json::from_value(old).unwrap(), NoMaterializer);
+    assert!(restored.resume_as(replica, 0, None).is_ok());
+    assert!(matches!(
+        restored.resume_as(replica, 0, Some("Ada")),
+        Err(SyncError::ReplicaOwnerMismatch { .. })
+    ));
+    let fresh = restored.join_as(Some("Ada".into())).replica;
+    assert_ne!(fresh, replica);
+    assert!(restored.resume_as(fresh, 0, Some("Ada")).is_ok());
+}
+
+proptest! {
+    #[test]
+    fn ownership_authorization_survives_join_refusal_replay_checkpoint_and_legacy_histories(
+        steps in prop::collection::vec((0u8..6,0usize..8,0u8..4),1..100),
+    ) {
+        use std::collections::BTreeMap;
+        let principal=|n:u8|match n {0=>None,1|3=>Some("Ada".to_string()),_=>Some("Bob".to_string())};
+        let mut server=Sequencer::new(ToyDoc::sample());
+        let mut base=server.checkpoint();
+        let mut journal=Vec::new();
+        let mut owners=BTreeMap::new();
+        for (kind,slot,who) in steps {
+            let caller=principal(who);
+            match kind {
+                0=>{
+                    let joined=server.join_as(caller.clone());
+                    let expected=ReplicaId(owners.len() as u64+1);
+                    prop_assert_eq!(joined.replica,expected);
+                    owners.insert(expected,caller.clone());
+                    journal.push(Record::Joined {replica:expected});
+                    if let Some(principal)=caller.clone() {journal.push(Record::Owned {replica:expected,principal});}
+                }
+                1=>{
+                    let checkpoint=through_json(&server.checkpoint());
+                    server=Sequencer::restore(checkpoint,NoMaterializer);
+                }
+                2=>{
+                    let mut restored=Sequencer::restore(through_json(&base),NoMaterializer);
+                    for record in &journal {restored.replay(through_json(record)).unwrap();}
+                    prop_assert_eq!(restored.checkpoint(),server.checkpoint());
+                    server=restored;
+                }
+                3=>{
+                    let replica=ReplicaId(slot as u64+1);
+                    let before=server.checkpoint();
+                    if let Some(Some(_))=owners.get(&replica) {
+                        prop_assert!(server.replay(Record::Owned {replica,principal:"Mallory".into()}).is_err(),"owners cannot be rebound");
+                        prop_assert_eq!(server.checkpoint(),before);
+                    }
+                }
+                4=>{
+                    let replica=ReplicaId(slot as u64+1);
+                    if owners.contains_key(&replica) {
+                        let ticket=server.processed_client_seq(replica)+1;
+                        if let Some(record)=server.reject(replica,ticket,jade_collab_sync::Rejection::new("read-only")).record(replica) {journal.push(record);}
+                    }
+                }
+                _=>{
+                    let mut old=serde_json::to_value(server.checkpoint()).unwrap();
+                    old.as_object_mut().unwrap().remove("owners");
+                    server=Sequencer::restore(serde_json::from_value(old).unwrap(),NoMaterializer);
+                    for owner in owners.values_mut() {*owner=None;}
+                    base=server.checkpoint();journal.clear();
+                }
+            }
+            let before=server.checkpoint();
+            for id in 1..=owners.len()+1 {
+                for who in 0..4 {
+                    let caller=principal(who);
+                    let replica=ReplicaId(id as u64);
+                    let expected=owners.get(&replica).is_some_and(|owner|*owner==caller);
+                    prop_assert_eq!(server.resume_as(replica,0,caller.as_deref()).is_ok(),expected);
+                }
+            }
+            prop_assert_eq!(server.checkpoint(),before,"authorization cannot change document, tickets, owner or sequence");
+        }
+    }
+}
+
+#[test]
 fn a_checkpoint_restores_the_document_and_the_bookkeeping() {
     let mut server = Sequencer::new(ToyDoc::sample());
     let a = server.join().replica;

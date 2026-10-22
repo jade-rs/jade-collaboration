@@ -434,7 +434,7 @@ fn line_formats_reach_jade_and_new_lines_take_them_as_in_jade() {
             },
         },
     );
-    assert_eq!(model.format(sheet, stamp(6), column_b), bold(true));
+    assert_eq!(model.format(sheet, stamp(6), column_b).bold, Some(true));
     assert_eq!(
         model.format(sheet, row3, stamp(7)).fill_color,
         Some("FFFF00".into())
@@ -471,6 +471,9 @@ proptest! {
         let (model, jade) = open("grid-operations-workbook.xlsx");
         let view = model.sheets().remove(0);
         let (sheet, rows, columns) = (view.id, view.rows[4..7].to_vec(), view.columns[1..4].to_vec());
+        let initial: Vec<_> = (0..3).map(|r| (0..3).map(|c| {
+            jade.workbook().format_at("Operations", &format!("{}{}", jade_xlsx_collab::column_label(c + 1), r + 5)).unwrap()
+        }).collect::<Vec<_>>()).collect();
         let mut sim = Simulation::with_materializer(model, jade, 3);
         // (stamp, which rows, which columns, change)
         let mut writes: Vec<(Id, Vec<usize>, Vec<usize>, FormatChange)> = Vec::new();
@@ -538,7 +541,7 @@ proptest! {
                 let expected = writes
                     .iter()
                     .filter(|(_, rs, cs, _)| rs.contains(&r) && cs.contains(&c))
-                    .fold(FormatChange::default(), |under, (.., over)| common::overlay(&under, over));
+                    .fold(initial[r][c].clone(), |under, (.., over)| common::overlay(&under, over));
                 let ours = server.document().format(sheet, *row, *column);
                 prop_assert_eq!(&ours, &expected);
                 let reference = format!("{}{}", jade_xlsx_collab::column_label(c as u32 + 1), r + 5);

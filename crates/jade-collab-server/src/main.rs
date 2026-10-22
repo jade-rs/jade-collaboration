@@ -6,20 +6,22 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
-use jade_collab_server::{Client, Format, Fsync, PresenceLimits, Server, StorageOptions, Tokens};
+use jade_collab_server::{
+    document_socket_path, Client, Format, Fsync, PresenceLimits, Server, StorageOptions, Tokens,
+};
 use jade_collab_sync::ReplicaEvent;
-use jade_docx_collab::intent::{resolve, IntentOp};
+use jade_docx_collab::intent::{try_resolve_with as resolve, word_date, Context, IntentOp};
 use jade_docx_collab::DocxModel;
-use jade_pptx_collab::intent::{resolve as resolve_slide, PptxIntent};
+use jade_pptx_collab::intent::{try_resolve as resolve_slide, PptxIntent};
 use jade_pptx_collab::PptxModel;
-use jade_xlsx_collab::intent::{resolve as resolve_cell, XlsxIntent};
+use jade_xlsx_collab::intent::{try_resolve as resolve_cell, XlsxIntent};
 use jade_xlsx_collab::XlsxModel;
 use serde_json::{json, Value};
 
 #[derive(Parser)]
 #[command(
     name = "jade-collab",
-    about = "Collaborative editing of .docx and .xlsx with jade"
+    about = "Collaborative editing of .docx, .xlsx and .pptx with jade"
 )]
 enum Cli {
     /// Host documents. Each file is served as /documents/<file name>.
@@ -78,6 +80,11 @@ enum Cli {
         /// `overloaded` (its replica resumes on a new one).
         #[arg(long, value_name = "N")]
         outgoing_limit: Option<usize>,
+        /// Compressed bytes accepted per HTTP upload (default 67108864,
+        /// 64 MiB). Zero refuses nonempty uploads. Local files and later
+        /// collaborative edits are unaffected.
+        #[arg(long, value_name = "BYTES")]
+        upload_limit: Option<usize>,
         /// Append one JSON line per access to this file: sockets connected,
         /// replicas joined, resumed and closed, requests refused, files
         /// uploaded and downloaded — by token name, never by token. On
@@ -119,7 +126,7 @@ enum FsyncArg {
 
 fn format_of(url: &str) -> Result<Format, String> {
     Format::of_url(url)
-        .ok_or_else(|| format!("{url} does not name a .docx, .xlsx or .pptx document"))
+        .ok_or_else(|| "the URL does not name a .docx, .xlsx or .pptx document".to_string())
 }
 
 fn edits<T: serde::de::DeserializeOwned>(text: &str) -> Result<Vec<T>, String> {
@@ -247,17 +254,27 @@ async fn show(url: &str, token: Option<&str>) -> Result<(), String> {
 async fn apply(url: &str, token: Option<&str>, text: &str) -> Result<(), String> {
     match format_of(url)? {
         Format::Docx => {
+            let edits = edits::<IntentOp>(text)?;
             let client = Client::<DocxModel>::connect(url, token)
                 .await
                 .map_err(|e| e.to_string())?;
-            for edit in edits::<IntentOp>(text)? {
-                let view = client.view();
-                let ops =
-                    resolve(&view, &edit, &mut |n| client.reserve(n)).map_err(|e| e.to_string())?;
-                for op in ops {
-                    client.submit(op).map_err(|e| e.to_string())?;
-                }
-            }
+            client
+                .try_edit(None, |context| {
+                    for edit in edits {
+                        let view = context.view().clone();
+                        let author = Context {
+                            replica: Some(context.id()),
+                            date: Some(word_date(std::time::SystemTime::now())),
+                        };
+                        let ops = resolve(&view, &edit, &author, &mut |n| context.try_reserve(n))
+                            .map_err(|e| e.to_string())?;
+                        for op in ops {
+                            context.submit(op).map_err(|e| e.to_string())?;
+                        }
+                    }
+                    Ok::<_, String>(())
+                })
+                .map_err(|e| e.to_string())?;
             client.settle().await.map_err(|e| e.to_string())?;
             report(client.take_events())?;
             println!(
@@ -266,15 +283,21 @@ async fn apply(url: &str, token: Option<&str>, text: &str) -> Result<(), String>
             );
         }
         Format::Xlsx => {
+            let edits = edits::<XlsxIntent>(text)?;
             let client = Client::<XlsxModel>::connect(url, token)
                 .await
                 .map_err(|e| e.to_string())?;
-            for edit in edits::<XlsxIntent>(text)? {
-                let view = client.view();
-                let op = resolve_cell(&view, &edit, &mut |n| client.reserve(n))
-                    .map_err(|e| e.to_string())?;
-                client.submit(op).map_err(|e| e.to_string())?;
-            }
+            client
+                .try_edit(None, |context| {
+                    for edit in edits {
+                        let view = context.view().clone();
+                        let op = resolve_cell(&view, &edit, &mut |n| context.try_reserve(n))
+                            .map_err(|e| e.to_string())?;
+                        context.submit(op).map_err(|e| e.to_string())?;
+                    }
+                    Ok::<_, String>(())
+                })
+                .map_err(|e| e.to_string())?;
             client.settle().await.map_err(|e| e.to_string())?;
             report(client.take_events())?;
             println!(
@@ -283,17 +306,23 @@ async fn apply(url: &str, token: Option<&str>, text: &str) -> Result<(), String>
             );
         }
         Format::Pptx => {
+            let edits = edits::<PptxIntent>(text)?;
             let client = Client::<PptxModel>::connect(url, token)
                 .await
                 .map_err(|e| e.to_string())?;
-            for edit in edits::<PptxIntent>(text)? {
-                let view = client.view();
-                let ops = resolve_slide(&view, &edit, &mut |n| client.reserve(n))
-                    .map_err(|e| e.to_string())?;
-                for op in ops {
-                    client.submit(op).map_err(|e| e.to_string())?;
-                }
-            }
+            client
+                .try_edit(None, |context| {
+                    for edit in edits {
+                        let view = context.view().clone();
+                        let ops = resolve_slide(&view, &edit, &mut |n| context.try_reserve(n))
+                            .map_err(|e| e.to_string())?;
+                        for op in ops {
+                            context.submit(op).map_err(|e| e.to_string())?;
+                        }
+                    }
+                    Ok::<_, String>(())
+                })
+                .map_err(|e| e.to_string())?;
             client.settle().await.map_err(|e| e.to_string())?;
             report(client.take_events())?;
             println!(
@@ -316,6 +345,7 @@ struct ServeOptions {
     tokens_poll: u64,
     presence: PresenceLimits,
     outgoing_limit: Option<usize>,
+    upload_limit: Option<usize>,
     audit_log: Option<PathBuf>,
     files: Vec<PathBuf>,
 }
@@ -332,6 +362,7 @@ async fn serve(options: ServeOptions) -> Result<(), String> {
         tokens_poll,
         presence,
         outgoing_limit,
+        upload_limit,
         audit_log,
         files,
     } = options;
@@ -355,7 +386,10 @@ async fn serve(options: ServeOptions) -> Result<(), String> {
             };
             let server = Server::with_storage_options(dir, storage).map_err(|e| e.to_string())?;
             for (name, _) in server.documents() {
-                println!("serving ws://{addr}/documents/{name}/ws (stored)");
+                println!(
+                    "serving ws://{addr}{} (stored)",
+                    document_socket_path(&name)
+                );
             }
             server
         }
@@ -364,6 +398,9 @@ async fn serve(options: ServeOptions) -> Result<(), String> {
     let mut server = server.with_presence_limits(presence);
     if let Some(limit) = outgoing_limit {
         server = server.with_outgoing_limit(limit);
+    }
+    if let Some(limit) = upload_limit {
+        server = server.with_upload_limit(limit);
     }
     if let Some(path) = audit_log {
         server = server.with_audit_log(path).map_err(|e| e.to_string())?;
@@ -389,7 +426,7 @@ async fn serve(options: ServeOptions) -> Result<(), String> {
         if !stored.contains(&name) {
             let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
             server.open(&name, bytes).map_err(|e| e.to_string())?;
-            println!("serving ws://{addr}/documents/{name}/ws");
+            println!("serving ws://{addr}{}", document_socket_path(&name));
         }
         named.push((name, path));
     }
@@ -454,6 +491,7 @@ async fn main() -> ExitCode {
             presence_burst,
             presence_per_second,
             outgoing_limit,
+            upload_limit,
             audit_log,
             files,
         } => {
@@ -474,6 +512,7 @@ async fn main() -> ExitCode {
                 tokens_poll,
                 presence,
                 outgoing_limit,
+                upload_limit,
                 audit_log,
                 files,
             })

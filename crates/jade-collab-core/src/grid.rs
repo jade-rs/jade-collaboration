@@ -154,8 +154,18 @@ impl Grid {
         self.rows.iter().map(|line| line.id).collect()
     }
 
+    /// Includes tombstoned rows, without allocating an identifier list.
+    pub fn stored_row_count(&self) -> usize {
+        self.rows.len()
+    }
+
     pub fn all_columns(&self) -> Vec<Id> {
         self.columns.iter().map(|line| line.id).collect()
+    }
+
+    /// Includes tombstoned columns, without allocating an identifier list.
+    pub fn stored_column_count(&self) -> usize {
+        self.columns.len()
     }
 
     pub fn contains_row(&self, id: Id) -> bool {

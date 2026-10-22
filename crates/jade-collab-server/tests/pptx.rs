@@ -16,11 +16,11 @@ fn deck() -> Vec<u8> {
     .unwrap()
 }
 
-async fn listen(server: &Server) -> String {
+async fn listen(server: &Server) -> (String, tokio::task::JoinHandle<std::io::Result<()>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(server.clone().serve(listener));
-    format!("ws://{addr}/documents/deck.pptx/ws")
+    let task = tokio::spawn(server.clone().serve(listener));
+    (format!("ws://{addr}/documents/deck.pptx/ws"), task)
 }
 
 async fn catch_up(server: &Server, client: &Client<PptxModel>) {
@@ -66,7 +66,7 @@ fn texts(model: &PptxModel) -> Vec<Vec<Option<String>>> {
 async fn two_people_edit_a_deck_and_the_file_matches() {
     let server = Server::new();
     assert_eq!(server.open("deck.pptx", deck()).unwrap(), Format::Pptx);
-    let url = listen(&server).await;
+    let (url, _task) = listen(&server).await;
     let a: Client<PptxModel> = Client::connect(&url, None).await.unwrap();
     let b: Client<PptxModel> = Client::connect(&url, None).await.unwrap();
     let (slide, shape) = editable(&a.view());
@@ -116,7 +116,7 @@ async fn a_hosted_deck_survives_a_restart() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::with_storage(dir.path()).unwrap();
     server.open("deck.pptx", deck()).unwrap();
-    let url = listen(&server).await;
+    let (url, task) = listen(&server).await;
     let a: Client<PptxModel> = Client::connect(&url, None).await.unwrap();
     let (slide, shape) = editable(&a.view());
     apply(
@@ -132,11 +132,13 @@ async fn a_hosted_deck_survives_a_restart() {
     a.settle().await.unwrap();
     let before = server.export("deck.pptx").await.unwrap();
     let replica = a.disconnect().await;
+    task.abort();
+    let _ = task.await;
     drop(server);
 
     let server = Server::with_storage(dir.path()).unwrap();
-    let url = listen(&server).await;
-    let a = Client::resume(&url, replica, None).await.unwrap();
+    let (url, _task) = listen(&server).await;
+    let a = Client::resume(&url, &replica, None).await.unwrap();
     catch_up(&server, &a).await;
     let after = server.export("deck.pptx").await.unwrap();
     let texts_of = |bytes: &[u8]| texts(&PptxModel::from_pptx(bytes).unwrap());

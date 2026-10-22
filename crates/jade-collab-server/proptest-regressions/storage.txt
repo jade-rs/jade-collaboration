@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 8ee6e21a1c10509d8dc33a1377d5ece0b22c5886f3e83dd30e87b24a00d2945d # shrinks to checkpoint_every = 1, keep_tail = 0, sync = EveryRecord, steps = []

@@ -462,6 +462,13 @@ impl JadePptx {
 }
 
 impl Materializer<PptxModel> for JadePptx {
+    fn may_derive(&self, _: &PptxModel, _: &PptxOp) -> bool {
+        false
+    }
+    fn fork(&self, model: &PptxModel) -> Result<Self, String> {
+        Self::restore(self.bytes(), model)
+    }
+
     /// Asks jade, on the current file, whether it would take a structural
     /// change whose validity depends on what the model does not track:
     /// other parts of a slide that refer to a shape, the parts a slide owns,

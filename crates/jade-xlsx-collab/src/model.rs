@@ -54,12 +54,15 @@ struct Sheet {
     /// Cell notes (legacy comments); `None` once deleted.
     #[serde(with = "pairs")]
     notes: BTreeMap<(Id, Id), LwwRegister<Option<String>>>,
-    /// The format attributes written through the model. What the file had
-    /// is left to jade: an attribute nobody wrote here is not modelled.
+    /// Immutable source styles, interned by the file's style index. Absent
+    /// in old checkpoints and models created with `blank`.
+    #[serde(default)]
+    source_formats: Option<SourceFormats>,
+    /// Collaborative cell changes, independent of the source style table.
     #[serde(with = "pairs")]
     formats: BTreeMap<(Id, Id), CellFormat>,
-    /// Whole-row formats (Excel's `<row s=…>`), by row id, written through
-    /// the model. A cell shows, per attribute, the newest of its own, its
+    /// Whole-row formats (Excel's `<row s=…>`), by row id.
+    /// A cell shows, per attribute, the newest of its own, its
     /// row's and its column's.
     #[serde(default, with = "pairs")]
     row_formats: BTreeMap<Id, CellFormat>,
@@ -119,9 +122,10 @@ macro_rules! each_attribute {
 /// in log order, exactly the writes that won when they arrived; the last of
 /// those for an attribute is the newest, so jade ends where the registers do.
 ///
-/// A register holding `None` means "whatever the file has": a merge copies
+/// A register holding `None` means an unresolved attribute. A merge copies
 /// its anchor's format into the cells it covers, and an attribute the model
-/// does not know for the anchor becomes unknown for them too.
+/// does not know for the anchor becomes unknown for them too. Source styles
+/// are complete layers, so an unresolved cell colour hides the row's colour.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 struct CellFormat {
     bold: LwwRegister<Option<bool>>,
@@ -156,7 +160,72 @@ struct CellFormat {
     diagonal_down: LwwRegister<Option<bool>>,
 }
 
+/// A source style is a whole layer (cell > row > column > default), while
+/// later writes override individual attributes. Interning avoids storing
+/// nineteen registers and repeated font strings for every source cell.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct SourceFormats {
+    baseline: u64,
+    styles: BTreeMap<u32, FormatChange>,
+    #[serde(with = "pairs")]
+    cells: BTreeMap<(Id, Id), u32>,
+    #[serde(with = "pairs")]
+    rows: BTreeMap<Id, u32>,
+    #[serde(with = "pairs")]
+    columns: BTreeMap<Id, u32>,
+}
+
+impl SourceFormats {
+    fn layer(&self, index: u32, priority: u64) -> CellFormat {
+        CellFormat::snapshot(
+            Id::new(self.baseline + priority, ReplicaId::ORIGIN),
+            &self.styles[&index],
+        )
+    }
+
+    fn at(&self, row: Id, column: Id) -> CellFormat {
+        let (index, priority) = if let Some(index) = self.cells.get(&(row, column)) {
+            (*index, 4)
+        } else if let Some(index) = self.rows.get(&row) {
+            (*index, 3)
+        } else if let Some(index) = self.columns.get(&column) {
+            (*index, 2)
+        } else {
+            (0, 1)
+        };
+        self.layer(index, priority)
+    }
+
+    fn line(&self, axis: LineAxis, line: Id) -> Option<CellFormat> {
+        match axis {
+            LineAxis::Rows => self.rows.get(&line).map(|index| self.layer(*index, 3)),
+            LineAxis::Columns => self.columns.get(&line).map(|index| self.layer(*index, 2)),
+        }
+    }
+
+    fn empty_sheet(&self) -> Self {
+        Self {
+            baseline: self.baseline,
+            styles: [(0, self.styles[&0].clone())].into_iter().collect(),
+            cells: BTreeMap::new(),
+            rows: BTreeMap::new(),
+            columns: BTreeMap::new(),
+        }
+    }
+}
+
 impl CellFormat {
+    /// A source style is a complete layer: an unresolved attribute must
+    /// hide the row/column's value rather than accidentally inherit it.
+    fn snapshot(stamp: Id, change: &FormatChange) -> Self {
+        macro_rules! snapshot {
+            ($($name:ident),*) => {
+                Self { $($name: LwwRegister::new(stamp, change.$name.clone()),)* }
+            };
+        }
+        each_attribute!(snapshot)
+    }
+
     /// Writes every attribute `change` names with `stamp`; returns the ones
     /// that won.
     fn apply(&mut self, stamp: Id, change: &FormatChange) -> FormatChange {
@@ -465,7 +534,9 @@ impl Sheet {
     /// attribute, the newest of the cell's, its row's and its column's
     /// writes.
     fn effective(&self, row: Id, column: Id) -> CellFormat {
+        let source = self.source_formats.as_ref().map(|s| s.at(row, column));
         CellFormat::newest(&[
+            source.as_ref(),
             self.formats.get(&(row, column)),
             self.row_formats.get(&row),
             self.column_formats.get(&column),
@@ -582,6 +653,17 @@ pub struct SheetView {
 pub enum LineAxis {
     Rows,
     Columns,
+}
+
+/// One sparse spreadsheet read item. A cell's value and resolved format
+/// share an item; whole-axis styles and merge geometry each occupy one.
+/// These are stable ids: callers resolve labels using the same SheetView.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum XlsxReadEntry {
+    Cell { row: Id, column: Id },
+    RowFormat { row: Id },
+    ColumnFormat { column: Id },
+    Merge { range: Merge },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -831,6 +913,7 @@ impl XlsxModel {
                 ),
                 cells: BTreeMap::new(),
                 notes: BTreeMap::new(),
+                source_formats: None,
                 formats: BTreeMap::new(),
                 row_formats: BTreeMap::new(),
                 column_formats: BTreeMap::new(),
@@ -879,6 +962,10 @@ impl XlsxModel {
         for (sheet, summary) in model.sheets.iter_mut().zip(&summary.sheets) {
             sheet.visible = summary.visibility == SheetVisibility::Visible;
         }
+        // Baseline precedence is default < column < row < explicit cell.
+        // Every subsequent operation observes a larger Lamport clock.
+        let baseline = model.max_lamport;
+        model.max_lamport += 4;
         let mut stamp = model.max_lamport;
         for (sheet, (name, rows, columns)) in model.sheets.iter_mut().zip(&shapes) {
             if *rows == 0 || *columns == 0 {
@@ -891,6 +978,48 @@ impl XlsxModel {
             })?;
             let row_ids = sheet.grid.rows();
             let column_ids = sheet.grid.columns();
+            if let Some(source) = book.workbook().sheets.iter().find(|s| s.name == *name) {
+                let mut formats = SourceFormats {
+                    baseline,
+                    styles: BTreeMap::new(),
+                    cells: BTreeMap::new(),
+                    rows: BTreeMap::new(),
+                    columns: BTreeMap::new(),
+                };
+                for (c, column) in column_ids.iter().enumerate() {
+                    if let Some(index) = source.column_span(c as u32).and_then(|s| s.style_index) {
+                        formats.columns.insert(*column, index);
+                    }
+                }
+                for row in &source.rows {
+                    let Some(row_id) = row_ids.get(row.index as usize) else {
+                        continue;
+                    };
+                    if let Some(index) = row.style_index.filter(|_| row.custom_format) {
+                        formats.rows.insert(*row_id, index);
+                    }
+                    for cell in &row.cells {
+                        if let (Some(index), Some(column)) = (
+                            cell.style_index,
+                            column_ids.get(cell.reference.column as usize),
+                        ) {
+                            formats.cells.insert((*row_id, *column), index);
+                        }
+                    }
+                }
+                let indices: BTreeSet<_> = std::iter::once(0)
+                    .chain(formats.cells.values().copied())
+                    .chain(formats.rows.values().copied())
+                    .chain(formats.columns.values().copied())
+                    .collect();
+                for index in indices {
+                    formats.styles.insert(
+                        index,
+                        crate::source_format::read(&book.workbook().styles, index),
+                    );
+                }
+                sheet.source_formats = Some(formats);
+            }
             // Table name -> (top, bottom, left, right) indices.
             let mut tables: BTreeMap<String, (usize, usize, usize, usize)> = BTreeMap::new();
             let mut with_totals: BTreeSet<String> = BTreeSet::new();
@@ -1033,10 +1162,10 @@ impl XlsxModel {
             .as_deref()
     }
 
-    /// The format attributes written through the model that show at a cell:
+    /// The known base format attributes that show at a cell:
     /// its own, or its merged region's anchor's, as jade's `format_at` and
-    /// Excel show it. An attribute nobody wrote is `None` — it is whatever
-    /// the file has.
+    /// Excel show it. Unresolved source attributes are `None`. Models made
+    /// with `blank`, and old checkpoints, know only collaborative writes.
     pub fn format(&self, sheet: Id, row: Id, column: Id) -> FormatChange {
         let Some(s) = self.sheets.iter().find(|s| s.id == sheet) else {
             return FormatChange::default();
@@ -1045,8 +1174,106 @@ impl XlsxModel {
         s.effective(row, column).current()
     }
 
-    /// The cells of `sheet`'s current grid that show attributes written
-    /// through the model ([`XlsxModel::format`]: a merged region's covered
+    /// The imported style used by cells without their own or axis styles.
+    pub fn default_format(&self, sheet: Id) -> FormatChange {
+        self.sheets
+            .iter()
+            .find(|s| s.id == sheet)
+            .and_then(|s| s.source_formats.as_ref())
+            .map(|s| s.styles[&0].clone())
+            .unwrap_or_default()
+    }
+
+    /// Sparse read order: cells in numeric row-major order, row styles,
+    /// column styles, then merges ordered by their top-left corner.
+    /// No format is projected here, and a merge contributes its anchor and
+    /// geometry rather than expanding every covered coordinate.
+    pub fn read_entries(&self, sheet: Id) -> Vec<XlsxReadEntry> {
+        let Some(s) = self.sheets.iter().find(|s| !s.deleted && s.id == sheet) else {
+            return Vec::new();
+        };
+        let rows = s.grid.rows();
+        let columns = s.grid.columns();
+        let positions = |ids: &[Id]| -> BTreeMap<Id, usize> {
+            ids.iter().enumerate().map(|(i, id)| (*id, i)).collect()
+        };
+        let row_indices = positions(&rows);
+        let column_indices = positions(&columns);
+        let source = s.source_formats.as_ref();
+        let cells: BTreeSet<_> =
+            s.cells
+                .iter()
+                .filter(|(_, register)| register.get().is_some_and(|v| *v != CellInput::Blank))
+                .map(|(cell, _)| cell)
+                .chain(
+                    s.notes
+                        .iter()
+                        .filter(|(_, register)| register.get().is_some_and(Option::is_some))
+                        .map(|(cell, _)| cell),
+                )
+                .chain(s.formats.keys())
+                .chain(source.into_iter().flat_map(|s| s.cells.keys()))
+                .filter_map(|(row, column)| {
+                    Some((*row_indices.get(row)?, *column_indices.get(column)?))
+                })
+                .chain(s.grid.merges().iter().filter_map(|m| {
+                    Some((*row_indices.get(&m.top)?, *column_indices.get(&m.left)?))
+                }))
+                .collect();
+        let mut entries: Vec<_> = cells
+            .into_iter()
+            .map(|(r, c)| XlsxReadEntry::Cell {
+                row: rows[r],
+                column: columns[c],
+            })
+            .collect();
+        let row_styles: BTreeSet<_> = s
+            .row_formats
+            .keys()
+            .chain(source.into_iter().flat_map(|s| s.rows.keys()))
+            .filter_map(|row| row_indices.get(row).copied())
+            .collect();
+        entries.extend(
+            row_styles
+                .into_iter()
+                .map(|r| XlsxReadEntry::RowFormat { row: rows[r] }),
+        );
+        let column_styles: BTreeSet<_> = s
+            .column_formats
+            .keys()
+            .chain(source.into_iter().flat_map(|s| s.columns.keys()))
+            .filter_map(|column| column_indices.get(column).copied())
+            .collect();
+        entries.extend(
+            column_styles
+                .into_iter()
+                .map(|c| XlsxReadEntry::ColumnFormat { column: columns[c] }),
+        );
+        let mut merges = s.grid.merges().to_vec();
+        merges.sort_by_key(|m| (row_indices[&m.top], column_indices[&m.left]));
+        entries.extend(
+            merges
+                .into_iter()
+                .map(|range| XlsxReadEntry::Merge { range }),
+        );
+        entries
+    }
+
+    /// One whole-row or whole-column style, projected only when requested.
+    pub fn line_format(&self, sheet: Id, axis: LineAxis, line: Id) -> FormatChange {
+        let Some(s) = self.sheets.iter().find(|s| s.id == sheet) else {
+            return FormatChange::default();
+        };
+        let source = s.source_formats.as_ref().and_then(|s| s.line(axis, line));
+        let own = match axis {
+            LineAxis::Rows => s.row_formats.get(&line),
+            LineAxis::Columns => s.column_formats.get(&line),
+        };
+        CellFormat::newest(&[source.as_ref(), own]).current()
+    }
+
+    /// Explicitly styled cells of `sheet`'s current grid, including the file's
+    /// cell styles ([`XlsxModel::format`]: a merged region's covered
     /// cells show its anchor's), row by row, with their A1 references.
     pub fn formatted_cells(&self, sheet: Id) -> Vec<(String, FormatChange)> {
         let Some(s) = self.sheets.iter().find(|s| s.id == sheet) else {
@@ -1055,6 +1282,11 @@ impl XlsxModel {
         let mut cells: BTreeSet<(usize, usize)> = s
             .formats
             .keys()
+            .chain(
+                s.source_formats
+                    .iter()
+                    .flat_map(|source| source.cells.keys()),
+            )
             .filter_map(|(row, column)| {
                 Some((s.grid.row_index(*row)?, s.grid.column_index(*column)?))
             })
@@ -1087,20 +1319,20 @@ impl XlsxModel {
     }
 
     /// The whole-row (`3`) or whole-column (`B`) formats of `sheet`'s
-    /// current grid written through the model, in order.
+    /// current grid, including the file's intentional axis styles, in order.
     pub fn line_formats(&self, sheet: Id, axis: LineAxis) -> Vec<(String, FormatChange)> {
         let Some(s) = self.sheets.iter().find(|s| s.id == sheet) else {
             return Vec::new();
         };
-        let (lines, formats) = match axis {
-            LineAxis::Rows => (s.grid.rows(), &s.row_formats),
-            LineAxis::Columns => (s.grid.columns(), &s.column_formats),
+        let lines = match axis {
+            LineAxis::Rows => s.grid.rows(),
+            LineAxis::Columns => s.grid.columns(),
         };
         lines
             .iter()
             .enumerate()
             .filter_map(|(at, line)| {
-                let format = formats.get(line)?.current();
+                let format = self.line_format(sheet, axis, *line);
                 let label = match axis {
                     LineAxis::Rows => (at + 1).to_string(),
                     LineAxis::Columns => column_label(at as u32),
@@ -1821,6 +2053,7 @@ impl XlsxModel {
             ));
         }
         let lines = u64::from(rows) + u64::from(columns);
+        let last = id.last_in_run(1 + lines)?;
         let taken = |candidate: Id| {
             self.sheets.iter().any(|s| {
                 s.id == candidate
@@ -1849,6 +2082,11 @@ impl XlsxModel {
                 ),
                 cells: BTreeMap::new(),
                 notes: BTreeMap::new(),
+                source_formats: self
+                    .sheets
+                    .first()
+                    .and_then(|s| s.source_formats.as_ref())
+                    .map(SourceFormats::empty_sheet),
                 formats: BTreeMap::new(),
                 row_formats: BTreeMap::new(),
                 column_formats: BTreeMap::new(),
@@ -1858,7 +2096,7 @@ impl XlsxModel {
                 deleted: false,
             },
         );
-        self.max_lamport = self.max_lamport.max(id.offset(lines).lamport);
+        self.max_lamport = self.max_lamport.max(last.lamport);
         Ok(vec![XlsxEffect::AddSheet {
             name: name.to_string(),
             after: after_name,
@@ -1963,9 +2201,73 @@ fn lines_between(lines: &[Id], first: Id, last: Id) -> Vec<Id> {
     }
 }
 
+impl XlsxModel {
+    fn check_text_fields(op: &XlsxOp) -> Result<(), Rejection> {
+        use jade_collab_core::text::check_xml_10;
+        match op {
+            // Cell text and notes use lossless SpreadsheetML xstring encoding.
+            XlsxOp::SetCell { value, .. } | XlsxOp::Derived { value, .. } => match value {
+                CellInput::Formula(text) => {
+                    let formula = text.strip_prefix('=').unwrap_or(text);
+                    if formula.trim().is_empty() {
+                        return Err(reject("a formula needs text"));
+                    }
+                    check_xml_10(formula)?;
+                }
+                CellInput::Number(number) if !number.is_finite() => {
+                    return Err(reject("a cell number must be finite"))
+                }
+                _ => {}
+            },
+            XlsxOp::SetHeader { text, .. } => check_xml_10(text)?,
+            XlsxOp::AddSheet { name, .. } | XlsxOp::RenameSheet { name, .. } => check_xml_10(name)?,
+            XlsxOp::SetFormat { change, .. } | XlsxOp::SetLineFormat { change, .. } => {
+                for text in [change.font_name.as_deref(), change.number_format.as_deref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    check_xml_10(text)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
 impl Document for XlsxModel {
     type Op = XlsxOp;
     type Effect = Vec<XlsxEffect>;
+
+    fn validate_submission(&self, op: &XlsxOp, origin: ReplicaId) -> Result<(), Rejection> {
+        Self::check_text_fields(op)?;
+        use jade_collab_sync::check_id_owner;
+        match op {
+            XlsxOp::SetCell { stamp, .. }
+            | XlsxOp::SetNote { stamp, .. }
+            | XlsxOp::SetFormat { stamp, .. }
+            | XlsxOp::SetBorders { stamp, .. }
+            | XlsxOp::SetLineFormat { stamp, .. }
+            | XlsxOp::MergeCells { stamp, .. }
+            | XlsxOp::SetHeader { stamp, .. } => check_id_owner(*stamp, origin)?,
+            XlsxOp::AddSheet { id, .. } => check_id_owner(*id, origin)?,
+            XlsxOp::Structure { op, .. } => match op {
+                GridOp::InsertRow { id, .. } | GridOp::InsertColumn { id, .. } => {
+                    check_id_owner(*id, origin)?
+                }
+                GridOp::DeleteRow { .. }
+                | GridOp::DeleteColumn { .. }
+                | GridOp::Merge(_)
+                | GridOp::Unmerge { .. } => {}
+            },
+            XlsxOp::UnmergeCells { .. }
+            | XlsxOp::RenameSheet { .. }
+            | XlsxOp::DeleteSheet { .. }
+            | XlsxOp::MoveSheet { .. }
+            | XlsxOp::Derived { .. } => {}
+        }
+        Ok(())
+    }
 
     fn lane(op: &XlsxOp) -> Lane {
         match op {
@@ -1993,6 +2295,7 @@ impl Document for XlsxModel {
     }
 
     fn apply(&mut self, op: &XlsxOp, ctx: &ApplyContext) -> Result<Vec<XlsxEffect>, Rejection> {
+        Self::check_text_fields(op)?;
         match op {
             XlsxOp::SetCell {
                 sheet,

@@ -1889,6 +1889,33 @@ impl Document for PptxModel {
     type Op = PptxOp;
     type Effect = Vec<PptxEffect>;
 
+    fn validate_submission(&self, op: &PptxOp, origin: ReplicaId) -> Result<(), Rejection> {
+        use jade_collab_sync::check_id_owner;
+        match op {
+            PptxOp::InsertText { first, text, .. } => {
+                if !text.is_empty() {
+                    check_id_owner(*first, origin)?;
+                }
+            }
+            PptxOp::SplitParagraph { id, .. }
+            | PptxOp::InsertSlide { id, .. }
+            | PptxOp::DuplicateSlide { id, .. }
+            | PptxOp::InsertTextBox { id, .. }
+            | PptxOp::Mark { id, .. }
+            | PptxOp::InsertPicture { id, .. } => check_id_owner(*id, origin)?,
+            PptxOp::SetGeometry { stamp, .. }
+            | PptxOp::SetSlideHidden { stamp, .. }
+            | PptxOp::ResizeShape { stamp, .. } => check_id_owner(*stamp, origin)?,
+            PptxOp::DeleteText { .. }
+            | PptxOp::JoinParagraph { .. }
+            | PptxOp::DeleteSlide { .. }
+            | PptxOp::MoveSlide { .. }
+            | PptxOp::AlignParagraphs { .. }
+            | PptxOp::DeleteShape { .. } => {}
+        }
+        Ok(())
+    }
+
     fn lane(op: &PptxOp) -> Lane {
         match op {
             PptxOp::InsertText { .. }

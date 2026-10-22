@@ -48,7 +48,7 @@ impl Session {
         let effect = self.model.apply(&op, &ctx).map_err(|e| e.to_string())?;
         self.seq += 1;
         self.jade.materialize(&self.model, effect, &ctx)?;
-        for derived in self.jade.derived(&self.model, &op) {
+        for derived in self.jade.derived(&self.model, &op).unwrap() {
             self.seq += 1;
             let ctx = ApplyContext {
                 origin: ReplicaId::ORIGIN,

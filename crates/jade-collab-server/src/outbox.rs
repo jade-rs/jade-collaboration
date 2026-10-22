@@ -16,6 +16,7 @@ pub const DEFAULT_OUTGOING_LIMIT: usize = 1024;
 pub(crate) struct Outbox {
     sender: mpsc::Sender<String>,
     overloaded: Arc<Notify>,
+    stopped: Arc<Notify>,
 }
 
 /// Fires once a message did not fit.
@@ -35,6 +36,7 @@ pub(crate) fn outbox(limit: usize) -> (Outbox, mpsc::Receiver<String>, Overloade
         Outbox {
             sender,
             overloaded: overloaded.clone(),
+            stopped: Arc::new(Notify::new()),
         },
         receiver,
         Overloaded(overloaded),
@@ -42,6 +44,16 @@ pub(crate) fn outbox(limit: usize) -> (Outbox, mpsc::Receiver<String>, Overloade
 }
 
 impl Outbox {
+    /// Wake an idle connection when the document's actor exits, including
+    /// while that connection is waiting for an unacknowledged edit.
+    pub fn stop(&self) {
+        self.stopped.notify_one();
+    }
+
+    pub async fn stopped(&self) {
+        self.stopped.notified().await;
+    }
+
     /// Queues `message`; `Err` when the connection is gone or too far
     /// behind, and the sender should stop sending to it.
     pub fn send(&self, message: String) -> Result<(), ()> {

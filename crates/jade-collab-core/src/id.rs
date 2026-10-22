@@ -38,10 +38,42 @@ impl Id {
 
     /// The identifier `n` ticks after this one on the same replica — the ids a
     /// [`Clock::reserve`] run hands out.
+    /// Requires a checked range; use [`Id::checked_offset`] on peer input.
     pub const fn offset(self, n: u64) -> Self {
         Self::new(self.lamport + n, self.replica)
     }
+
+    /// Checked offset for ranges received from a peer.
+    pub const fn checked_offset(self, n: u64) -> Option<Self> {
+        match self.lamport.checked_add(n) {
+            Some(lamport) => Some(Self::new(lamport, self.replica)),
+            None => None,
+        }
+    }
+
+    /// The last identifier of a non-empty run, without wrapping Lamport time.
+    pub fn last_in_run(self, count: u64) -> Result<Self, IdError> {
+        let offset = count.checked_sub(1).ok_or(IdError::EmptyReservation)?;
+        self.checked_offset(offset).ok_or(IdError::Exhausted)
+    }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdError {
+    EmptyReservation,
+    Exhausted,
+}
+
+impl fmt::Display for IdError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyReservation => f.write_str("reserve at least one identifier"),
+            Self::Exhausted => f.write_str("identifier space exhausted"),
+        }
+    }
+}
+
+impl std::error::Error for IdError {}
 
 impl fmt::Display for Id {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -91,10 +123,19 @@ impl Clock {
 
     /// Reserves `n >= 1` consecutive ids and returns the first; the rest are
     /// `first.offset(1)`, …, `first.offset(n - 1)`.
+    /// Panics if empty or exhausted; prefer [`Clock::try_reserve`] in applications.
     pub fn reserve(&mut self, n: u64) -> Id {
-        assert!(n >= 1, "reserve at least one id");
+        self.try_reserve(n).expect("cannot reserve identifiers")
+    }
+
+    /// Refuses an empty or exhausted reservation without advancing the clock.
+    pub fn try_reserve(&mut self, n: u64) -> Result<Id, IdError> {
+        if n == 0 {
+            return Err(IdError::EmptyReservation);
+        }
+        let last = self.lamport.checked_add(n).ok_or(IdError::Exhausted)?;
         let first = Id::new(self.lamport + 1, self.replica);
-        self.lamport += n;
-        first
+        self.lamport = last;
+        Ok(first)
     }
 }

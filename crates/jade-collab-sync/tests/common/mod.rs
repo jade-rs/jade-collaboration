@@ -233,8 +233,10 @@ pub fn generate(replica: &mut Replica<ToyDoc>, choice: u64) -> ToyOp {
 
 /// A materializer standing in for a real file: it mirrors the text, refuses
 /// structure while the mirrored text's length is a multiple of three, and
-/// reports a fault whenever an operation leaves it a multiple of five. Its
-/// "file" is the mirrored text.
+/// fails a staged write whenever an operation leaves it a multiple of five.
+/// Its "file" is the mirrored text. Staging keeps those injected constraints
+/// atomic, so checkpoint/replay histories contain only successful native writes.
+/// Unexpected live errors and recovery are tested in materialization_failure.rs.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Mirror {
     pub text: String,
@@ -253,6 +255,15 @@ impl Mirror {
 }
 
 impl Materializer<ToyDoc> for Mirror {
+    fn may_derive(&self, _: &ToyDoc, _: &ToyOp) -> bool {
+        // Conservatively stage every toy operation. A five-ish write must
+        // refuse its whole plan; a live error would quarantine the sequencer.
+        true
+    }
+    fn fork(&self, _: &ToyDoc) -> Result<Self, String> {
+        Ok(self.clone())
+    }
+
     fn admit(&self, _: &ToyDoc, op: &ToyOp) -> Result<(), Rejection> {
         match op {
             ToyOp::Grid(_) if self.text.chars().count().is_multiple_of(3) => {

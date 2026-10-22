@@ -10,7 +10,9 @@ jade-collab-core = { path = "../jade-collab-core" }
 jade-collab-sync = { path = "../jade-collab-sync" }
 jade-docx-document-core = { path = "../../jade-core/crates/jade-docx-document-core" }
 jade-docx-headless-api = { path = "../../jade-core/crates/jade-docx-headless-api" }
+jade-opc = { path = "../../jade-core/crates/jade-opc" }
 futures = "0.3"
+quick-xml = "0.39"
 serde.workspace = true
 thiserror.workspace = true
 

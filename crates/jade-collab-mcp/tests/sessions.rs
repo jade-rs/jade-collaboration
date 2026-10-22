@@ -183,7 +183,7 @@ async fn an_agent_joins_reads_edits_and_leaves_an_xlsx() {
     let mut expected = read_xlsx(&direct.view(), 0, usize::MAX);
     expected["seq"] = read["seq"].clone();
     expected["pending"] = json!(0);
-    assert_eq!(read, expected);
+    assert_eq!(common::without_snapshot(read), expected);
     assert!(hosted.server.faults(XLSX).await.unwrap().is_empty());
 
     agent
@@ -308,7 +308,7 @@ async fn read_document_pages_through_large_documents() {
         let page = agent
             .tool(
                 "read_document",
-                json!({ "session_id": doc, "start": at, "limit": 5 }),
+                json!({ "session_id": doc, "start": at, "limit": 5, "snapshot": all["snapshot"] }),
             )
             .await;
         assert_eq!(page["start"], json!(at));
@@ -327,25 +327,63 @@ async fn read_document_pages_through_large_documents() {
     assert_eq!(beyond["next"], Value::Null);
 
     let book = agent.join(&hosted.url(XLSX)).await;
+    let applied = agent.apply(&book, json!([
+        { "type":"set_format", "sheet":"Operations", "range":"A20:A30", "change":{"bold":true} },
+        { "type":"set_format", "sheet":"Operations", "range":"35:40", "change":{"italic":true} },
+        { "type":"set_format", "sheet":"Operations", "range":"G:H", "change":{"wrap_text":true} },
+        { "type":"merge_cells", "sheet":"Operations", "range":"J25:K27" },
+        { "type":"set_note", "sheet":"Operations", "reference":"L31", "text":"Check 日本🙂" },
+    ])).await;
+    assert_eq!(statuses(&applied), ["applied"; 5]);
     let all = agent.read_all(&book).await;
     let total = all["cell_count"].as_u64().unwrap();
     assert!(total > 4);
     let mut cells = serde_json::Map::new();
+    let mut formats = serde_json::Map::new();
+    let mut notes = serde_json::Map::new();
+    let mut row_formats = serde_json::Map::new();
+    let mut column_formats = serde_json::Map::new();
+    let mut merges = Vec::new();
     let mut start = Some(0u64);
     while let Some(at) = start {
         let page = agent
             .tool(
                 "read_document",
-                json!({ "session_id": book, "start": at, "limit": 3 }),
+                json!({ "session_id": book, "start": at, "limit": 3, "snapshot": all["snapshot"] }),
             )
             .await;
         assert_eq!(page["cell_count"], json!(total));
+        assert_eq!(page["seq"], all["seq"], "this walk has no concurrent edits");
         let listed = page["sheets"][0]["cells"].as_object().unwrap();
-        assert!(listed.len() <= 3);
+        let sheet = &page["sheets"][0];
+        let cell_items: std::collections::BTreeSet<_> = listed
+            .keys()
+            .chain(sheet["formats"].as_object().unwrap().keys())
+            .collect();
+        assert!(
+            cell_items.len()
+                + sheet["row_formats"].as_object().unwrap().len()
+                + sheet["column_formats"].as_object().unwrap().len()
+                + sheet["merges"].as_array().unwrap().len()
+                <= 3
+        );
         cells.extend(listed.clone());
+        formats.extend(sheet["formats"].as_object().unwrap().clone());
+        notes.extend(sheet["notes"].as_object().unwrap().clone());
+        row_formats.extend(sheet["row_formats"].as_object().unwrap().clone());
+        column_formats.extend(sheet["column_formats"].as_object().unwrap().clone());
+        merges.extend(sheet["merges"].as_array().unwrap().iter().cloned());
         start = page["next"].as_u64();
     }
     assert_eq!(Value::Object(cells), all["sheets"][0]["cells"]);
+    assert_eq!(Value::Object(formats), all["sheets"][0]["formats"]);
+    assert_eq!(Value::Object(notes), all["sheets"][0]["notes"]);
+    assert_eq!(Value::Object(row_formats), all["sheets"][0]["row_formats"]);
+    assert_eq!(
+        Value::Object(column_formats),
+        all["sheets"][0]["column_formats"]
+    );
+    assert_eq!(Value::Array(merges), all["sheets"][0]["merges"]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -424,7 +462,10 @@ async fn two_agents_editing_concurrently_converge() {
     alice.catch_up(&a, seq).await;
     bob.catch_up(&b, seq).await;
     let read = alice.read_all(&a).await;
-    assert_eq!(read, bob.read_all(&b).await);
+    assert_eq!(
+        common::without_snapshot(read.clone()),
+        common::without_snapshot(bob.read_all(&b).await)
+    );
     let joined = texts(&read).concat();
     for piece in ["Alice: ", "Bob: ", "world!"] {
         assert!(joined.contains(piece), "{piece} in {joined:?}");
@@ -433,7 +474,7 @@ async fn two_agents_editing_concurrently_converge() {
     let mut expected = read_docx(&direct.view(), 0, usize::MAX);
     expected["seq"] = json!(seq);
     expected["pending"] = json!(0);
-    assert_eq!(read, expected);
+    assert_eq!(common::without_snapshot(read), expected);
 
     let a = alice.join(&hosted.url(XLSX)).await;
     let b = bob.join(&hosted.url(XLSX)).await;
@@ -460,7 +501,10 @@ async fn two_agents_editing_concurrently_converge() {
     alice.catch_up(&a, seq).await;
     bob.catch_up(&b, seq).await;
     let read = alice.read_all(&a).await;
-    assert_eq!(read, bob.read_all(&b).await);
+    assert_eq!(
+        common::without_snapshot(read.clone()),
+        common::without_snapshot(bob.read_all(&b).await)
+    );
     let cells = &read["sheets"][0]["cells"];
     assert_eq!(cells["E5"], json!({ "kind": "text", "value": "a" }));
     assert_eq!(cells["F5"], json!({ "kind": "text", "value": "b" }));

@@ -1,4 +1,4 @@
-use jade_collab_core::id::{Clock, Id, ReplicaId};
+use jade_collab_core::id::{Clock, Id, IdError, ReplicaId};
 use proptest::prelude::*;
 
 #[test]
@@ -42,6 +42,51 @@ fn ids_round_trip_through_json() {
     let id = Id::new(5, ReplicaId(6));
     let json = serde_json::to_string(&id).unwrap();
     assert_eq!(serde_json::from_str::<Id>(&json).unwrap(), id);
+}
+
+fn boundary() -> impl Strategy<Value = u64> {
+    prop_oneof![
+        0..32u64,
+        any::<u64>(),
+        (0..32u64).prop_map(|n| u64::MAX - n)
+    ]
+}
+
+proptest! {
+    /// A u128 reference clock covers arbitrary observations, reservations,
+    /// exhaustion and later retries, including the exact last representable id.
+    #[test]
+    fn checked_clock_and_ranges_match_unbounded_arithmetic(
+        steps in prop::collection::vec((any::<bool>(), boundary(), boundary()), 1..100),
+    ) {
+        let mut clock = Clock::new(ReplicaId(7));
+        let mut reference = 0u128;
+        for (observe, value, count) in steps {
+            if observe {
+                clock.observe_lamport(value);
+                reference = reference.max(u128::from(value));
+            } else {
+                let before = clock.clone();
+                let result = clock.try_reserve(count);
+                if count > 0 && reference + u128::from(count) <= u128::from(u64::MAX) {
+                    prop_assert_eq!(result, Ok(Id::new((reference + 1) as u64, ReplicaId(7))));
+                    reference += u128::from(count);
+                } else {
+                    prop_assert_eq!(result, Err(if count == 0 { IdError::EmptyReservation } else { IdError::Exhausted }));
+                    prop_assert_eq!(&clock, &before, "failed reservations do not advance time");
+                }
+            }
+            prop_assert_eq!(u128::from(clock.now()), reference);
+            let start = Id::new(value, ReplicaId(3));
+            let last = u128::from(value) + u128::from(count.saturating_sub(1));
+            let actual = start.last_in_run(count);
+            if count > 0 && last <= u128::from(u64::MAX) {
+                prop_assert_eq!(actual, Ok(Id::new(last as u64, ReplicaId(3))));
+            } else {
+                prop_assert!(actual.is_err());
+            }
+        }
+    }
 }
 
 proptest! {

@@ -10,7 +10,7 @@
 //! character before it, so the edit keeps its meaning however long it takes
 //! to reach the server.
 
-use jade_collab_core::id::Id;
+use jade_collab_core::id::{Id, IdError};
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
@@ -166,6 +166,8 @@ pub enum PptxIntent {
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum IntentError {
+    #[error(transparent)]
+    Identifiers(#[from] IdError),
     #[error("slide {0} does not exist (slides are numbered from 1)")]
     NoSuchSlide(usize),
     #[error("slide {slide} has no shape {shape}")]
@@ -296,19 +298,19 @@ fn typing(
     story: StoryId,
     parent: Option<Id>,
     text: &str,
-    ids: &mut dyn FnMut(u64) -> Id,
-) -> Vec<PptxOp> {
+    ids: &mut dyn FnMut(u64) -> Result<Id, IdError>,
+) -> Result<Vec<PptxOp>, IntentError> {
     let mut ops = Vec::new();
     let mut parent = parent;
     for (k, run) in text.split('\n').enumerate() {
         if k > 0 {
-            let id = ids(1);
+            let id = ids(1)?;
             ops.push(PptxOp::SplitParagraph { story, parent, id });
             parent = Some(id);
         }
         if !run.is_empty() {
             let count = run.chars().count() as u64;
-            let first = ids(count);
+            let first = ids(count)?;
             ops.push(PptxOp::InsertText {
                 story,
                 parent,
@@ -318,7 +320,7 @@ fn typing(
             parent = Some(first.offset(count - 1));
         }
     }
-    ops
+    Ok(ops)
 }
 
 /// Resolves `intent` against `view`. `ids(n)` must reserve `n` consecutive
@@ -328,6 +330,15 @@ pub fn resolve(
     view: &PptxModel,
     intent: &PptxIntent,
     ids: &mut dyn FnMut(u64) -> Id,
+) -> Result<Vec<PptxOp>, IntentError> {
+    try_resolve(view, intent, &mut |n| Ok(ids(n)))
+}
+
+/// Resolves with an allocator that can report identifier exhaustion.
+pub fn try_resolve(
+    view: &PptxModel,
+    intent: &PptxIntent,
+    ids: &mut dyn FnMut(u64) -> Result<Id, IdError>,
 ) -> Result<Vec<PptxOp>, IntentError> {
     match intent {
         PptxIntent::InsertText {
@@ -340,7 +351,7 @@ pub fn resolve(
             let story = story(view, *slide, *target)?;
             let paragraphs = view.paragraphs(story).expect("resolved");
             let at = caret(&paragraphs, *paragraph, *offset)?;
-            Ok(typing(story, at.parent, text, ids))
+            typing(story, at.parent, text, ids)
         }
         PptxIntent::InsertParagraphBreak {
             slide,
@@ -352,7 +363,7 @@ pub fn resolve(
             let story = story(view, *slide, *target)?;
             let paragraphs = view.paragraphs(story).expect("resolved");
             let at = caret(&paragraphs, *paragraph, *offset)?;
-            Ok(typing(story, at.parent, &"\n".repeat(*count), ids))
+            typing(story, at.parent, &"\n".repeat(*count), ids)
         }
         PptxIntent::DeleteText {
             slide,
@@ -367,7 +378,7 @@ pub fn resolve(
             let at = caret(&paragraphs, *paragraph, *offset)?;
             let atoms = atoms(&paragraphs);
             let range = match direction {
-                Direction::Forward => at.index..(at.index + count).min(atoms.len()),
+                Direction::Forward => at.index..at.index.saturating_add(*count).min(atoms.len()),
                 Direction::Backward => at.index.saturating_sub(*count)..at.index,
             };
             Ok(deletion(story, &atoms[range]))
@@ -389,7 +400,7 @@ pub fn resolve(
                 return Err(IntentError::InvertedRange);
             }
             let mut ops = deletion(story, &atoms(&paragraphs)[start.index..end.index]);
-            ops.extend(typing(story, start.parent, text, ids));
+            ops.extend(typing(story, start.parent, text, ids)?);
             Ok(ops)
         }
         PptxIntent::SetGeometry {
@@ -422,7 +433,7 @@ pub fn resolve(
                 ops.push(PptxOp::SetGeometry {
                     slide,
                     shape,
-                    stamp: ids(1),
+                    stamp: ids(1)?,
                     edit,
                 });
             }
@@ -437,7 +448,7 @@ pub fn resolve(
                     ops.push(PptxOp::ResizeShape {
                         slide,
                         shape,
-                        stamp: ids(1),
+                        stamp: ids(1)?,
                         width,
                         height,
                     });
@@ -451,7 +462,7 @@ pub fn resolve(
                 return Err(IntentError::BadPosition(*at));
             }
             Ok(vec![PptxOp::InsertSlide {
-                id: ids(1),
+                id: ids(1)?,
                 after: (*at > 1).then(|| slides[at - 2].id),
             }])
         }
@@ -476,7 +487,7 @@ pub fn resolve(
         }
         PptxIntent::DuplicateSlide { slide } => Ok(vec![PptxOp::DuplicateSlide {
             slide: slide_id(view, *slide)?,
-            id: ids(1),
+            id: ids(1)?,
         }]),
         PptxIntent::InsertTextBox {
             slide,
@@ -487,7 +498,7 @@ pub fn resolve(
             text,
         } => {
             let slide = slide_id(view, *slide)?;
-            let id = ids(1);
+            let id = ids(1)?;
             let mut ops = vec![PptxOp::InsertTextBox {
                 slide,
                 id,
@@ -499,7 +510,12 @@ pub fn resolve(
                     rotation: 0,
                 },
             }];
-            ops.extend(typing(StoryId::Shape { slide, shape: id }, None, text, ids));
+            ops.extend(typing(
+                StoryId::Shape { slide, shape: id },
+                None,
+                text,
+                ids,
+            )?);
             Ok(ops)
         }
         PptxIntent::DeleteShape { slide, shape } => {
@@ -535,7 +551,7 @@ pub fn resolve(
                 .expect("a view's characters are in their story, in order");
             Ok(vec![PptxOp::Mark {
                 story,
-                id: ids(1),
+                id: ids(1)?,
                 start,
                 end,
                 format: format.clone(),
@@ -590,7 +606,7 @@ pub fn resolve(
             };
             Ok(vec![PptxOp::InsertPicture {
                 slide,
-                id: ids(1),
+                id: ids(1)?,
                 geometry: Geometry {
                     x: *x,
                     y: *y,
@@ -603,7 +619,7 @@ pub fn resolve(
         }
         PptxIntent::SetSlideHidden { slide, hidden } => Ok(vec![PptxOp::SetSlideHidden {
             slide: slide_id(view, *slide)?,
-            stamp: ids(1),
+            stamp: ids(1)?,
             hidden: *hidden,
         }]),
     }

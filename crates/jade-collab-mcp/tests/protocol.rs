@@ -13,6 +13,7 @@ const TOOLS: &[&str] = &[
     "join_document",
     "read_document",
     "apply_edits",
+    "get_edit_status",
     "wait_for_changes",
     "leave_document",
 ];
@@ -158,6 +159,7 @@ async fn every_tool_publishes_a_documented_interface() {
     assert_eq!(required("join_document"), ["url"]);
     assert_eq!(required("read_document"), ["session_id"]);
     assert_eq!(required("apply_edits"), ["session_id", "edits"]);
+    assert_eq!(required("get_edit_status"), ["session_id", "receipt"]);
     assert_eq!(required("wait_for_changes"), ["session_id", "after_seq"]);
     assert_eq!(required("leave_document"), ["session_id"]);
 }
@@ -167,6 +169,12 @@ fn sample(schema: &Value) -> Value {
     if let Some(constant) = schema.get("const") {
         return constant.clone();
     }
+    if let Some(example) = schema["examples"]
+        .as_array()
+        .and_then(|values| values.first())
+    {
+        return example.clone();
+    }
     if let Some(first) = schema["enum"].as_array().and_then(|e| e.first()) {
         return first.clone();
     }
@@ -174,7 +182,7 @@ fn sample(schema: &Value) -> Value {
         return sample(first);
     }
     match schema["type"].as_str() {
-        Some("integer") => json!(1),
+        Some("integer") => json!(schema["minimum"].as_i64().unwrap_or(1).max(1)),
         Some("number") => json!(1.5),
         Some("boolean") => json!(true),
         Some("string") => json!("B"),
@@ -188,6 +196,38 @@ fn sample(schema: &Value) -> Value {
             Value::Object(object)
         }
         other => panic!("no sample for {other:?}: {schema}"),
+    }
+}
+
+#[tokio::test]
+async fn pptx_geometry_schemas_allow_the_signed_coordinates_the_engine_accepts() {
+    let mut agent = Agent::new();
+    let tools = listed(&agent.request("tools/list", json!({})).await);
+    let apply = tools.iter().find(|t| t["name"] == "apply_edits").unwrap();
+    let variants = apply["inputSchema"]["properties"]["edits"]["items"]["anyOf"]
+        .as_array()
+        .unwrap();
+    for kind in ["set_geometry", "insert_text_box", "insert_picture"] {
+        let variant = variants
+            .iter()
+            .find(|v| {
+                v["properties"]["type"]["const"] == kind
+                    && v["description"].as_str().unwrap().starts_with("pptx:")
+            })
+            .unwrap();
+        let mut payload = sample(variant);
+        for coordinate in ["x", "y"] {
+            assert!(
+                variant["properties"][coordinate].get("minimum").is_none(),
+                "{kind}.{coordinate}"
+            );
+            payload[coordinate] = json!(-9525);
+        }
+        if kind == "set_geometry" {
+            assert!(variant["properties"]["rotation"].get("minimum").is_none());
+            payload["rotation"] = json!(-60000);
+        }
+        serde_json::from_value::<PptxIntent>(payload).unwrap();
     }
 }
 
@@ -253,7 +293,11 @@ async fn advertised_edits_match_the_intent_apis() {
             "move_slide",
             "duplicate_slide",
             "insert_text_box",
-            "delete_shape"
+            "delete_shape",
+            "format_text",
+            "align_paragraphs",
+            "insert_picture",
+            "set_slide_hidden"
         ]
     );
     assert_eq!(
@@ -352,6 +396,16 @@ async fn invalid_arguments_are_json_rpc_errors() {
             json!({ "session_id": "no-such-session", "edits": [] }),
         ),
         ("wait_for_changes", json!({ "session_id": session })),
+        ("get_edit_status", json!({"session_id":session})),
+        ("get_edit_status", json!({"session_id":session,"receipt":3})),
+        (
+            "get_edit_status",
+            json!({"session_id":session,"receipt":"r","timeout_ms":-1}),
+        ),
+        (
+            "get_edit_status",
+            json!({"session_id":session,"receipt":"r","resend":true}),
+        ),
         (
             "wait_for_changes",
             json!({ "session_id": session, "after_seq": -1 }),

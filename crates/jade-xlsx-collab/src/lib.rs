@@ -14,9 +14,11 @@
 //! border edge is one such attribute, its style and colour together. Both
 //! are realised with jade's own `set_note` / `delete_note` / `set_format`.
 
+mod inserted_column;
 pub mod intent;
 mod jade;
 mod model;
+mod source_format;
 
 pub use jade::JadeXlsx;
 pub use jade_xlsx_headless_api::CellInput;
@@ -24,5 +26,5 @@ pub use jade_xlsx_headless_editor::{BorderLine, BorderStyle, FormatChange};
 pub use jade_xlsx_reader::{HorizontalAlignment, VerticalAlignment};
 pub use model::{
     column_label, parse_reference, LineAxis, LoadError, LoadOptions, RangeBorders, SheetView,
-    XlsxEffect, XlsxModel, XlsxOp,
+    XlsxEffect, XlsxModel, XlsxOp, XlsxReadEntry,
 };

@@ -11,7 +11,7 @@ use common::{
 };
 use jade_collab_core::id::ReplicaId;
 use jade_collab_sync::sim::Simulation;
-use jade_collab_sync::Sequencer;
+use jade_collab_sync::{Document, Sequencer};
 use jade_docx_collab::{DocxModel, DocxOp, JadeDocx};
 use proptest::prelude::*;
 
@@ -42,6 +42,111 @@ fn steps() -> impl Strategy<Value = Vec<Step>> {
         ],
         0..60,
     )
+}
+
+#[test]
+fn a_text_box_between_moved_runs_keeps_tracked_deletion_after_reload() {
+    use jade_collab_core::id::Id;
+    use jade_docx_collab::intent::{resolve, IntentOp};
+    let (mut model, mut jade) = open("review-kinds.docx");
+    let moved = |model: &DocxModel| {
+        model
+            .revisions()
+            .into_iter()
+            .filter(|r| r.revision.moved)
+            .map(|r| (r.revision.kind, r.revision.author, r.revision.date))
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let before_moves = moved(&model);
+    let mut next = model.max_lamport() + 1;
+    let ops = resolve(
+        &model,
+        &IntentOp::InsertTextBox {
+            paragraph: 1,
+            offset: 4,
+            text: "箱".into(),
+            width_px: Some(216),
+            height_px: Some(96),
+        },
+        &mut |n| {
+            let first = Id::new(next, ReplicaId(1));
+            next += n;
+            first
+        },
+    )
+    .unwrap();
+    for op in ops {
+        common::commit(&mut model, &mut jade, op);
+    }
+    jade = JadeDocx::restore(&jade.export_base().unwrap(), &model).unwrap();
+    let paragraph = model
+        .paragraphs()
+        .into_iter()
+        .find(|p| matches!(p.story, jade_docx_collab::StoryId::TextBox { .. }))
+        .unwrap();
+    let op = DocxOp::TrackDeleteText {
+        story: paragraph.story,
+        ids: paragraph.chars,
+        revision: Id::new(model.max_lamport() + 1, ReplicaId(1)),
+        date: None,
+    };
+    common::commit(&mut model, &mut jade, op);
+    let reloaded = JadeDocx::load(&jade.export(&model).unwrap()).unwrap();
+    assert_same_order(&model, &reloaded, "text box between moved runs");
+    let imported = DocxModel::from_word_document(reloaded.word()).unwrap();
+    assert_eq!(model_marks(&imported), model_marks(&model));
+    assert_eq!(moved(&imported), before_moves);
+    assert!(imported
+        .paragraphs()
+        .iter()
+        .find(|p| p.text == "箱")
+        .unwrap()
+        .tracked[0]
+        .deleted
+        .is_some());
+}
+
+#[test]
+fn remote_deletion_replays_pending_sequenced_comment_and_then_the_server_refuses_it() {
+    let (model, jade) = open("footnote.docx");
+    let paragraph = model.paragraphs().remove(0);
+    let mut sim = Simulation::with_materializer(model, jade, 3);
+    let comment = sim.client_mut(0).reserve(1);
+    sim.local(
+        0,
+        DocxOp::AddComment {
+            story: paragraph.story,
+            start: paragraph.chars[0],
+            end: *paragraph.chars.last().unwrap(),
+            id: comment,
+            content: jade_docx_collab::CommentContent::new("pending comment"),
+        },
+    )
+    .unwrap();
+    sim.local(
+        1,
+        DocxOp::DeleteText {
+            story: paragraph.story,
+            ids: paragraph.chars,
+        },
+    )
+    .unwrap();
+    sim.deliver_up(1);
+    sim.deliver_down(0).unwrap();
+    assert_eq!(sim.client(0).view(), &sim.client(0).rebuilt_view());
+    assert!(sim.client(0).view().comments().is_empty());
+    assert_eq!(sim.client(0).pending_len(), 1);
+    sim.quiesce().unwrap();
+    for client in 0..3 {
+        assert_eq!(sim.client(client).view(), sim.server().document());
+    }
+    assert!(sim.server().faults().is_empty());
+    assert!(sim.server().document().comments().is_empty());
+    assert_comments_agree(
+        sim.server().document(),
+        sim.server().materializer(),
+        "after pending comment refusal",
+    );
 }
 
 proptest! {

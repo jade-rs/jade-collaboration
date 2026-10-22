@@ -27,6 +27,8 @@ pub enum Role {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Grant {
+    /// Stable principal identity and author label. Keys with the same name
+    /// intentionally share replica ownership; distinct users need distinct names.
     pub name: String,
     /// The role on every document, unless `documents` says otherwise.
     pub role: Role,
@@ -137,6 +139,19 @@ impl Tokens {
             return Err(TokensError::Invalid("a token cannot be empty".into()));
         }
         for grant in grants.values() {
+            // The stable principal also labels DOCX tracked revisions. Keep
+            // this validation independent of its current role/document scope:
+            // credentials may later gain editor access without changing identity.
+            if grant.name.trim().is_empty() {
+                return Err(TokensError::Invalid(
+                    "a token's name cannot be blank".into(),
+                ));
+            }
+            jade_collab_core::text::check_xml_10(&grant.name).map_err(|error| {
+                TokensError::Invalid(format!(
+                    "a token's name cannot be stored as an author: {error}"
+                ))
+            })?;
             let rules = grant.documents.iter().flatten();
             if rules.into_iter().any(|rule| rule.pattern().is_empty()) {
                 return Err(TokensError::Invalid(format!(
@@ -295,6 +310,31 @@ mod tests {
             ("ü*", "über.docx", true),
         ] {
             assert_eq!(glob_matches(pattern, name), matches, "{pattern} ~ {name}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::*;
+    #[test]
+    fn token_names_must_be_materializable_nonblank_author_labels() {
+        for name in [
+            "",
+            " ",
+            "\t\n\r",
+            "\u{2003}\u{3000}",
+            "bad\0name",
+            "bad\u{fffe}",
+            "bad\u{ffff}",
+        ] {
+            for role in ["editor", "viewer"] {
+                let input =
+                    serde_json::json!({"credential-secret":{"name":name,"role":role}}).to_string();
+                let error = Tokens::from_json(&input)
+                    .expect_err("unusable principal must not enter the active table");
+                assert!(!error.to_string().contains("credential-secret"));
+            }
         }
     }
 }

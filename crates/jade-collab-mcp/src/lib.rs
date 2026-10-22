@@ -11,20 +11,25 @@
 //! arguments the schema forbids are JSON-RPC `-32602` errors.
 
 mod catalogue;
+mod framing;
 mod http;
 mod read;
+mod receipts;
 mod session;
+#[cfg(test)]
+mod snapshot_tests;
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use jade_collab_server::Format;
+use jade_collab_server::{document_name_from_url, document_socket_path, Format};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 pub use read::{read_docx, read_pptx, read_xlsx};
-use session::Session;
+use receipts::ReceiptCache;
+use session::{ReadSnapshot, Session};
 
 /// MCP protocol version echoed back when the client does not request one.
 const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
@@ -38,6 +43,11 @@ const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 /// The longest a tool waits, whatever it is asked: requests are handled one
 /// at a time.
 const MAX_TIMEOUT_MS: u64 = 120_000;
+
+/// Maximum UTF-8 JSON-RPC request bytes, excluding LF or CRLF framing.
+pub const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum decoded HTTP body bytes accepted for document discovery.
+pub const MAX_DISCOVERY_BYTES: usize = 8 * 1024 * 1024;
 
 /// Why a tool call failed.
 enum CallError {
@@ -95,6 +105,8 @@ struct ReadArgs {
     #[serde(default)]
     start: usize,
     limit: Option<usize>,
+    snapshot: Option<String>,
+    include_base_formatting: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -102,6 +114,15 @@ struct ReadArgs {
 struct ApplyArgs {
     session_id: String,
     edits: Vec<Value>,
+    timeout_ms: Option<u64>,
+    snapshot: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EditStatusArgs {
+    session_id: String,
+    receipt: String,
     timeout_ms: Option<u64>,
 }
 
@@ -115,10 +136,29 @@ struct WaitArgs {
 
 /// The MCP server: the sessions this process has joined and the JSON-RPC
 /// dispatch. Requests are handled one at a time, in order.
-#[derive(Default)]
 pub struct McpServer {
     sessions: BTreeMap<String, Session>,
     next_session: u64,
+    /// At most one immutable read view per live session.
+    snapshots: BTreeMap<String, (String, ReadSnapshot)>,
+    next_snapshot: u64,
+    instance_id: uuid::Uuid,
+    receipts: BTreeMap<String, ReceiptCache>,
+    next_receipt: u64,
+}
+
+impl Default for McpServer {
+    fn default() -> Self {
+        Self {
+            sessions: BTreeMap::new(),
+            next_session: 0,
+            snapshots: BTreeMap::new(),
+            next_snapshot: 0,
+            instance_id: uuid::Uuid::new_v4(),
+            receipts: BTreeMap::new(),
+            next_receipt: 0,
+        }
+    }
 }
 
 impl McpServer {
@@ -127,8 +167,12 @@ impl McpServer {
     }
 
     /// Handles one JSON-RPC message. Returns the response line for a
-    /// request and `None` for a notification or blank input.
+    /// request and `None` for a notification or blank input. Message payloads
+    /// above MAX_REQUEST_BYTES are refused before parsing or changing state.
     pub async fn handle_message(&mut self, line: &str) -> Option<String> {
+        if line.len() > MAX_REQUEST_BYTES {
+            return Some(oversized_response());
+        }
         let trimmed = line.trim();
         if trimmed.is_empty() {
             return None;
@@ -184,8 +228,9 @@ impl McpServer {
         let result = match name.as_str() {
             "list_documents" => list_documents(args).await,
             "join_document" => self.join(args).await,
-            "read_document" => self.read(args),
+            "read_document" => self.read(args).await,
             "apply_edits" => self.apply(args).await,
+            "get_edit_status" => self.edit_status(args).await,
             "wait_for_changes" => self.wait(args).await,
             "leave_document" => self.leave(args).await,
             other => return Err((-32602, format!("unknown tool: {other}"))),
@@ -206,28 +251,25 @@ impl McpServer {
     async fn join(&mut self, args: Value) -> Result<Value, CallError> {
         let JoinArgs { url, token: given } = arguments(args)?;
         if !(url.starts_with("ws://") || url.starts_with("wss://")) {
-            return Err(CallError::Invalid(format!(
-                "{url} is not a ws:// URL (list_documents gives each document's)"
-            )));
+            return Err(CallError::Invalid(
+                "expected a ws:// or wss:// socket URL (list_documents gives each document's)"
+                    .into(),
+            ));
         }
         let format = Format::of_url(&url).ok_or_else(|| {
-            CallError::Invalid(format!(
-                "{url} does not name a .docx, .xlsx or .pptx document"
-            ))
+            CallError::Invalid("the URL does not name a .docx, .xlsx or .pptx document".into())
         })?;
+        let next_session = self
+            .next_session
+            .checked_add(1)
+            .ok_or_else(|| CallError::Failed("session identifier space exhausted".into()))?;
         let session = Session::join(&url, format, token(given).as_deref())
             .await
             .map_err(CallError::Failed)?;
-        let path = url.trim_end_matches('/');
-        let document = path
-            .strip_suffix("/ws")
-            .unwrap_or(path)
-            .rsplit('/')
-            .next()
-            .unwrap_or_default()
-            .to_string();
-        self.next_session += 1;
-        let session_id = format!("session-{}", self.next_session);
+        let document =
+            document_name_from_url(&url).expect("document URL format checked before joining");
+        self.next_session = next_session;
+        let session_id = format!("session-{}-{}", self.instance_id, self.next_session);
         let joined = json!({
             "session_id": session_id,
             "document": document,
@@ -239,41 +281,161 @@ impl McpServer {
         Ok(joined)
     }
 
-    fn read(&self, args: Value) -> Result<Value, CallError> {
+    async fn read(&mut self, args: Value) -> Result<Value, CallError> {
         let ReadArgs {
             session_id,
             start,
             limit,
+            snapshot,
+            include_base_formatting,
         } = arguments(args)?;
         let limit = limit.unwrap_or(DEFAULT_LIMIT);
         if limit == 0 {
             return Err(CallError::Invalid("limit must be at least 1".into()));
         }
-        Ok(self.session(&session_id)?.read(start, limit))
+        self.refresh_receipts(&session_id)?;
+        if let Some(token) = snapshot {
+            let (_, view) = self.snapshots.get(&session_id)
+                .filter(|(id, _)| id == &token)
+                .ok_or_else(|| CallError::Failed("read snapshot is unavailable for this session; start a new read without snapshot".into()))?;
+            if include_base_formatting
+                .is_some_and(|requested| requested != view.includes_base_formatting())
+            {
+                return Err(CallError::Failed("this snapshot has a different formatting mode; omit include_base_formatting or start a new read".into()));
+            }
+            let mut value = view.read(start, limit);
+            value["snapshot"] = json!(token);
+            return Ok(value);
+        }
+        let next = self
+            .next_snapshot
+            .checked_add(1)
+            .ok_or_else(|| CallError::Failed("read snapshot identifier space exhausted".into()))?;
+        let view = if include_base_formatting.unwrap_or(false) {
+            self.session(&session_id)?
+                .inspected_snapshot()
+                .await
+                .map_err(CallError::Failed)?
+        } else {
+            self.session(&session_id)?.snapshot()
+        };
+        let token = format!("read-{}-{next}", self.instance_id);
+        let mut value = view.read(start, limit);
+        value["snapshot"] = json!(token);
+        self.snapshots.insert(session_id, (token, view));
+        self.next_snapshot = next;
+        Ok(value)
     }
 
-    async fn apply(&self, args: Value) -> Result<Value, CallError> {
+    fn refresh_receipts(&mut self, session_id: &str) -> Result<(), CallError> {
+        let answers = self.session(session_id)?.answers();
+        self.receipts
+            .entry(session_id.to_owned())
+            .or_default()
+            .observe(answers);
+        Ok(())
+    }
+
+    async fn resolve_receipt(
+        &mut self,
+        session_id: &str,
+        token: &str,
+        wait: Duration,
+    ) -> Result<Value, CallError> {
+        self.refresh_receipts(session_id)?;
+        let receipt = self
+            .receipts
+            .get(session_id)
+            .and_then(|c| c.get(token))
+            .ok_or_else(|| {
+                CallError::Failed("edit receipt is expired or unavailable for this session".into())
+            })?;
+        let through = if receipt.complete() {
+            None
+        } else {
+            receipt.through()
+        };
+        if let Some(ticket) = through {
+            if let Ok(Err(error)) =
+                tokio::time::timeout(wait, self.session(session_id)?.settle_through(ticket)).await
+            {
+                self.receipts
+                    .get_mut(session_id)
+                    .unwrap()
+                    .disconnected(error);
+            }
+            self.refresh_receipts(session_id)?;
+        }
+        let mut value = self.receipts[session_id].get(token).unwrap().render();
+        value["receipt"] = json!(token);
+        value["seq"] = json!(self.session(session_id)?.seq());
+        value["pending"] = json!(self.session(session_id)?.pending());
+        Ok(value)
+    }
+
+    async fn edit_status(&mut self, args: Value) -> Result<Value, CallError> {
+        let EditStatusArgs {
+            session_id,
+            receipt,
+            timeout_ms,
+        } = arguments(args)?;
+        self.resolve_receipt(
+            &session_id,
+            &receipt,
+            timeout(Some(timeout_ms.unwrap_or(0))),
+        )
+        .await
+    }
+
+    async fn apply(&mut self, args: Value) -> Result<Value, CallError> {
         let ApplyArgs {
             session_id,
             edits,
             timeout_ms,
+            snapshot,
         } = arguments(args)?;
-        self.session(&session_id)?
-            .apply(edits, timeout(timeout_ms))
+        self.refresh_receipts(&session_id)?;
+        if !self.receipts[&session_id].has_room() {
+            return Err(CallError::Failed("all 64 edit receipts are still unresolved; query their status before submitting more edits".into()));
+        }
+        let next = self
+            .next_receipt
+            .checked_add(1)
+            .ok_or_else(|| CallError::Failed("edit receipt identifier space exhausted".into()))?;
+        let expected = match snapshot {
+            None => None,
+            Some(token) => Some(&self.snapshots.get(&session_id)
+                .filter(|(id, _)| id == &token)
+                .ok_or_else(|| CallError::Failed("read snapshot is unavailable for this session; read again before editing".into()))?.1),
+        };
+        let receipt = self
+            .session(&session_id)?
+            .submit(edits, expected)
+            .map_err(CallError::Failed)?;
+        let token = format!("receipt-{}-{next}", self.instance_id);
+        self.receipts
+            .get_mut(&session_id)
+            .unwrap()
+            .insert(token.clone(), receipt)
+            .expect("receipt capacity checked before submitting");
+        self.next_receipt = next;
+        self.resolve_receipt(&session_id, &token, timeout(timeout_ms))
             .await
-            .map_err(CallError::Failed)
     }
 
-    async fn wait(&self, args: Value) -> Result<Value, CallError> {
+    async fn wait(&mut self, args: Value) -> Result<Value, CallError> {
         let WaitArgs {
             session_id,
             after_seq,
             timeout_ms,
         } = arguments(args)?;
-        self.session(&session_id)?
+        let result = self
+            .session(&session_id)?
             .wait(after_seq, timeout(timeout_ms))
             .await
-            .map_err(CallError::Failed)
+            .map_err(CallError::Failed);
+        self.refresh_receipts(&session_id)?;
+        result
     }
 
     async fn leave(&mut self, args: Value) -> Result<Value, CallError> {
@@ -282,6 +444,8 @@ impl McpServer {
             .sessions
             .remove(&session_id)
             .ok_or_else(|| CallError::Invalid(format!("unknown session_id: {session_id}")))?;
+        self.snapshots.remove(&session_id);
+        self.receipts.remove(&session_id);
         let unanswered = session.leave().await;
         Ok(json!({ "session_id": session_id, "left": true, "unanswered": unanswered }))
     }
@@ -292,23 +456,15 @@ async fn list_documents(args: Value) -> Result<Value, CallError> {
         server,
         token: given,
     } = arguments(args)?;
-    let authority = server
-        .strip_prefix("http://")
-        .map(|rest| rest.trim_end_matches('/'))
-        .filter(|authority| !authority.is_empty() && !authority.contains('/'))
-        .ok_or_else(|| {
-            CallError::Invalid(format!(
-                "{server} is not a server address (http://host:port)"
-            ))
-        })?;
-    let documents = http::documents(authority, token(given).as_deref())
+    let address = http::Address::parse(&server).map_err(CallError::Invalid)?;
+    let documents = http::documents(&address, token(given).as_deref())
         .await
         .map_err(CallError::Failed)?;
     Ok(json!({
         "documents": documents
             .into_iter()
             .map(|listed| json!({
-                "url": format!("ws://{authority}/documents/{}/ws", listed.name),
+                "url": format!("{}{}", address.socket_base(), document_socket_path(&listed.name)),
                 "name": listed.name,
                 "format": listed.format,
             }))
@@ -361,14 +517,33 @@ fn error_response(id: Value, code: i64, message: &str) -> String {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }).to_string()
 }
 
+fn oversized_response() -> String {
+    error_response(
+        Value::Null,
+        -32600,
+        &format!("request exceeds the {MAX_REQUEST_BYTES}-byte limit"),
+    )
+}
+
 /// Serves newline-delimited JSON-RPC on stdin/stdout until stdin closes.
 pub async fn serve_stdio(server: &mut McpServer) {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncWriteExt, BufReader};
 
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut lines = framing::Reader::new(BufReader::new(tokio::io::stdin()), MAX_REQUEST_BYTES);
     let mut stdout = tokio::io::stdout();
-    while let Ok(Some(line)) = lines.next_line().await {
-        if let Some(response) = server.handle_message(&line).await {
+    while let Ok(Some(line)) = lines.next().await {
+        let response = match line {
+            framing::Frame::TooLarge => Some(oversized_response()),
+            framing::Frame::Bytes(bytes) => match String::from_utf8(bytes) {
+                Ok(line) => server.handle_message(&line).await,
+                Err(_) => Some(error_response(
+                    Value::Null,
+                    -32700,
+                    "message is not valid UTF-8",
+                )),
+            },
+        };
+        if let Some(response) = response {
             if stdout.write_all(response.as_bytes()).await.is_err()
                 || stdout.write_all(b"\n").await.is_err()
                 || stdout.flush().await.is_err()

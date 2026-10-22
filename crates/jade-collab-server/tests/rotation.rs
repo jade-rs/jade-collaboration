@@ -30,6 +30,24 @@ fn tokens(json: serde_json::Value) -> Tokens {
 
 const SECOND: Duration = Duration::from_secs(10);
 
+#[tokio::test]
+async fn assigning_a_token_to_a_different_principal_revokes_its_existing_socket() {
+    let server = Server::new().with_tokens(tokens(json!({"key":{"name":"Ada","role":"editor"}})));
+    let (url, _) = start(&server).await;
+    let client = Client::<DocxModel>::connect(&url, Some("key"))
+        .await
+        .unwrap();
+    server
+        .set_tokens(tokens(json!({"key":{"name":"Mallory","role":"editor"}})))
+        .unwrap();
+    let result = tokio::time::timeout(SECOND, client.wait_for_seq(1))
+        .await
+        .expect("principal change revokes promptly");
+    assert!(matches!(result, Err(ClientError::Revoked(_))));
+    let replica = client.disconnect().await;
+    assert!(Client::resume(&url, &replica, Some("key")).await.is_err());
+}
+
 async fn status(server: &Server, uri: &str, bearer: &str) -> StatusCode {
     let request = Request::get(uri)
         .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
@@ -163,7 +181,7 @@ async fn a_revoked_token_closes_its_connections_and_no_others() {
     assert_eq!(server.seq("hello.docx").await.unwrap(), 1);
     // And the revoked token cannot come back.
     let replica = ann.disconnect().await;
-    let error = Client::resume(&hello, replica, Some("a"))
+    let error = Client::resume(&hello, &replica, Some("a"))
         .await
         .err()
         .expect("refused");

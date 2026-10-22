@@ -1472,6 +1472,225 @@ fn formatting_marks_cover_tracked_text_and_keep_its_revisions() {
     reload_agrees(&model, &jade);
 }
 
+#[test]
+fn joining_a_note_after_splitting_its_host_keeps_the_text_and_revisions() {
+    for (fixture_name, tracked) in [
+        ("footnote.docx", false),
+        ("footnote.docx", true),
+        ("endnote.docx", false),
+        ("endnote.docx", true),
+    ] {
+        let (mut model, mut jade) = session(fixture_name);
+        let host = model
+            .paragraphs()
+            .into_iter()
+            .find(|p| p.story == StoryId::Body)
+            .unwrap();
+        commit_as(
+            &mut model,
+            &mut jade,
+            DocxOp::DeleteText {
+                story: StoryId::Body,
+                ids: host.chars,
+            },
+            ReplicaId(1),
+        );
+        let note = model
+            .paragraphs()
+            .into_iter()
+            .find(|p| matches!(p.story, StoryId::Footnote { .. } | StoryId::Endnote { .. }))
+            .unwrap();
+        commit_as(
+            &mut model,
+            &mut jade,
+            DocxOp::DeleteText {
+                story: note.story,
+                ids: vec![note.chars[note.chars.len() - 2]],
+            },
+            ReplicaId(1),
+        );
+        edit(
+            &mut model,
+            &mut jade,
+            1,
+            IntentOp::InsertText {
+                paragraph: 0,
+                offset: 0,
+                text: "x".into(),
+            },
+        );
+        if tracked {
+            let note = model
+                .paragraphs()
+                .into_iter()
+                .find(|p| matches!(p.story, StoryId::Footnote { .. } | StoryId::Endnote { .. }))
+                .unwrap();
+            let op = DocxOp::TrackInsertText {
+                story: note.story,
+                parent: Some(note.chars[1]),
+                first: Id::new(model.max_lamport() + 1, ReplicaId(1)),
+                text: "日本".into(),
+                date: Some("2026-10-21T04:00:00Z".into()),
+            };
+            commit_as(&mut model, &mut jade, op, ReplicaId(1));
+        }
+        let paragraph = model
+            .paragraphs()
+            .into_iter()
+            .find(|p| matches!(p.story, StoryId::Footnote { .. } | StoryId::Endnote { .. }))
+            .unwrap();
+        let story = paragraph.story;
+        let first = paragraph.chars[0];
+        let middle = paragraph.chars[paragraph.chars.len() / 2];
+        let mut next = model.max_lamport() + 1;
+        for parent in [middle, first] {
+            let id = Id::new(next, ReplicaId(1));
+            next += 1;
+            commit_as(
+                &mut model,
+                &mut jade,
+                DocxOp::SplitParagraph {
+                    story,
+                    parent: Some(parent),
+                    id,
+                },
+                ReplicaId(1),
+            );
+        }
+        let mark = Id::new(next - 1, ReplicaId(1));
+        let host = model
+            .paragraphs()
+            .into_iter()
+            .find(|p| p.story == StoryId::Body && !p.chars.is_empty())
+            .unwrap();
+        commit_as(
+            &mut model,
+            &mut jade,
+            DocxOp::SplitParagraph {
+                story: StoryId::Body,
+                parent: Some(host.chars[0]),
+                id: Id::new(next, ReplicaId(1)),
+            },
+            ReplicaId(1),
+        );
+        commit_as(
+            &mut model,
+            &mut jade,
+            DocxOp::JoinParagraph { story, mark },
+            ReplicaId(1),
+        );
+        reload_agrees(&model, &jade);
+    }
+}
+
+#[test]
+fn joining_after_a_trailing_endnote_preserves_the_second_paragraphs_text_box() {
+    use jade_docx_collab::NoteKind;
+    for text in ["", "箱🙂"] {
+        for restore in [false, true] {
+            let (mut model, mut jade) = session("jade-core/hello.docx");
+            let original = model.paragraphs()[0].clone();
+            let mark = Id::new(model.max_lamport() + 1, ReplicaId(1));
+            commit_as(
+                &mut model,
+                &mut jade,
+                DocxOp::SplitParagraph {
+                    story: StoryId::Body,
+                    parent: Some(original.chars[original.chars.len() / 2]),
+                    id: mark,
+                },
+                ReplicaId(1),
+            );
+            let first = model
+                .paragraphs()
+                .into_iter()
+                .find(|p| p.mark == Some(mark))
+                .unwrap();
+            // The helper also uses X. Existing, differently authored X runs
+            // on both sides must survive its positional cleanup unchanged.
+            for (replica, parent) in [(1, first.chars.last().copied()), (2, Some(mark))] {
+                let first = Id::new(model.max_lamport() + 1, ReplicaId(replica));
+                commit_as(
+                    &mut model,
+                    &mut jade,
+                    DocxOp::TrackInsertText {
+                        story: StoryId::Body,
+                        parent,
+                        first,
+                        text: "X".into(),
+                        date: None,
+                    },
+                    ReplicaId(replica),
+                );
+            }
+            let first = model
+                .paragraphs()
+                .into_iter()
+                .find(|p| p.mark == Some(mark))
+                .unwrap();
+            let note = Id::new(model.max_lamport() + 1, ReplicaId(1));
+            commit_as(
+                &mut model,
+                &mut jade,
+                DocxOp::InsertNote {
+                    kind: NoteKind::Endnote,
+                    story: StoryId::Body,
+                    parent: first.chars.last().copied(),
+                    id: note,
+                    text: "note🙂".into(),
+                },
+                ReplicaId(1),
+            );
+            let paragraphs = model.paragraphs();
+            let at = paragraphs
+                .iter()
+                .position(|p| p.mark == Some(mark))
+                .unwrap();
+            let second = &paragraphs[at + 1];
+            let expected = format!("{}{}", first.text, second.text);
+            let text_box = Id::new(model.max_lamport() + 1, ReplicaId(1));
+            commit_as(
+                &mut model,
+                &mut jade,
+                DocxOp::InsertTextBox {
+                    story: StoryId::Body,
+                    parent: second.chars.last().copied().or(Some(mark)),
+                    id: text_box,
+                    text: text.into(),
+                    width_px: 216,
+                    height_px: 96,
+                },
+                ReplicaId(1),
+            );
+            if restore {
+                jade = JadeDocx::restore(&jade.export_base().unwrap(), &model).unwrap();
+            }
+            commit_as(
+                &mut model,
+                &mut jade,
+                DocxOp::JoinParagraph {
+                    story: StoryId::Body,
+                    mark,
+                },
+                ReplicaId(1),
+            );
+            assert_eq!(model.paragraphs()[0].text, expected);
+            assert_eq!(
+                model.paragraphs()[0]
+                    .anchors
+                    .iter()
+                    .map(|a| a.story)
+                    .collect::<Vec<_>>(),
+                [
+                    StoryId::Endnote { id: note },
+                    StoryId::TextBox { id: text_box }
+                ]
+            );
+            reload_agrees(&model, &jade);
+        }
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 

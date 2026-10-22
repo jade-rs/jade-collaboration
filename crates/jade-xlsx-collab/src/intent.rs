@@ -3,7 +3,7 @@
 //! person's UI or an agent naturally produces.
 
 use jade_collab_core::grid::{GridOp, Merge};
-use jade_collab_core::id::Id;
+use jade_collab_core::id::{Id, IdError};
 use serde::{Deserialize, Serialize};
 
 use crate::model::{parse_reference, LineAxis, LoadOptions, RangeBorders, XlsxModel, XlsxOp};
@@ -94,6 +94,8 @@ pub enum XlsxIntent {
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum XlsxIntentError {
+    #[error(transparent)]
+    Identifiers(#[from] IdError),
     #[error("no sheet named {0}")]
     NoSuchSheet(String),
     #[error("{0} is outside the editable part of the sheet")]
@@ -165,6 +167,15 @@ pub fn resolve(
     intent: &XlsxIntent,
     ids: &mut dyn FnMut(u64) -> Id,
 ) -> Result<XlsxOp, XlsxIntentError> {
+    try_resolve(view, intent, &mut |n| Ok(ids(n)))
+}
+
+/// Resolves with an allocator that can report identifier exhaustion.
+pub fn try_resolve(
+    view: &XlsxModel,
+    intent: &XlsxIntent,
+    ids: &mut dyn FnMut(u64) -> Result<Id, IdError>,
+) -> Result<XlsxOp, XlsxIntentError> {
     let sheet_named = |name: &str| {
         view.sheets()
             .into_iter()
@@ -192,7 +203,7 @@ pub fn resolve(
                 sheet,
                 row,
                 column,
-                stamp: ids(1),
+                stamp: ids(1)?,
                 note: Some(text.clone()),
             }
         }
@@ -202,7 +213,7 @@ pub fn resolve(
                 sheet,
                 row,
                 column,
-                stamp: ids(1),
+                stamp: ids(1)?,
                 note: None,
             }
         }
@@ -218,7 +229,7 @@ pub fn resolve(
                     sheet: s.id,
                     axis,
                     lines,
-                    stamp: ids(1),
+                    stamp: ids(1)?,
                     change: change.clone(),
                 });
             }
@@ -227,7 +238,7 @@ pub fn resolve(
                 sheet: s.id,
                 rows,
                 columns,
-                stamp: ids(1),
+                stamp: ids(1)?,
                 change: change.clone(),
             }
         }
@@ -242,7 +253,7 @@ pub fn resolve(
                 sheet: s.id,
                 rows,
                 columns,
-                stamp: ids(1),
+                stamp: ids(1)?,
                 borders: borders.clone(),
             }
         }
@@ -257,7 +268,7 @@ pub fn resolve(
                     bottom: *rows.last().expect("non-empty"),
                     right: *columns.last().expect("non-empty"),
                 },
-                stamp: ids(1),
+                stamp: ids(1)?,
             }
         }
         XlsxIntent::UnmergeCells { sheet, range } => {
@@ -274,7 +285,7 @@ pub fn resolve(
             let defaults = LoadOptions::default();
             let (rows, columns) = (defaults.min_rows, defaults.min_columns);
             XlsxOp::AddSheet {
-                id: ids(1 + u64::from(rows) + u64::from(columns)),
+                id: ids(1 + u64::from(rows) + u64::from(columns))?,
                 name: name.clone(),
                 after,
                 rows,
@@ -312,7 +323,7 @@ pub fn resolve(
                     sheet,
                     row,
                     column,
-                    stamp: ids(1),
+                    stamp: ids(1)?,
                     text,
                 }
             } else {
@@ -320,7 +331,7 @@ pub fn resolve(
                     sheet,
                     row,
                     column,
-                    stamp: ids(1),
+                    stamp: ids(1)?,
                     value: value.clone(),
                 }
             }
@@ -334,7 +345,7 @@ pub fn resolve(
             };
             XlsxOp::Structure {
                 sheet: s.id,
-                op: GridOp::InsertRow { id: ids(1), after },
+                op: GridOp::InsertRow { id: ids(1)?, after },
             }
         }
         XlsxIntent::DeleteRow { sheet, row } => {
@@ -356,7 +367,7 @@ pub fn resolve(
             };
             XlsxOp::Structure {
                 sheet: s.id,
-                op: GridOp::InsertColumn { id: ids(1), after },
+                op: GridOp::InsertColumn { id: ids(1)?, after },
             }
         }
         XlsxIntent::DeleteColumn { sheet, column } => {

@@ -228,7 +228,7 @@ async fn the_socket_needs_a_token() {
     assert_eq!(by_query.view(), editor.view());
     // Resuming needs the token as well.
     let replica = by_query.disconnect().await;
-    let refused = Client::<DocxModel>::resume(&url, replica, None).await;
+    let refused = Client::<DocxModel>::resume(&url, &replica, None).await;
     let error = refused.err().expect("resumed without a token");
     assert!(error.to_string().contains("401"), "{error}");
 }
@@ -266,7 +266,7 @@ async fn viewers_read_but_their_edits_are_never_applied() {
 
     // Resuming does not turn a viewer into an editor.
     let replica = viewer.disconnect().await;
-    let viewer = Client::resume(&url, replica, Some("viewer-secret"))
+    let viewer = Client::resume(&url, &replica, Some("viewer-secret"))
         .await
         .unwrap();
     type_text(&viewer, "again ");

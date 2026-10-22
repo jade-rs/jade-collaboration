@@ -107,6 +107,89 @@ fn rejects_malformed_operations() {
 }
 
 #[test]
+fn an_overflowing_run_is_refused_without_changing_the_sequence() {
+    let mut rga = Rga::new();
+    rga.insert(id(1, 1), None, 'a').unwrap();
+    let before = rga.clone();
+    assert!(rga
+        .insert_run(id(u64::MAX - 1, 2), None, ['x', 'y', 'z'])
+        .is_err());
+    assert_eq!(rga, before);
+}
+
+#[test]
+fn a_run_ending_at_the_last_identifier_reports_collisions_without_overflowing() {
+    let mut rga = Rga::new();
+    let last = id(u64::MAX, 2);
+    rga.insert(last, None, 'a').unwrap();
+    let before = rga.clone();
+    assert_eq!(
+        rga.insert_run(id(u64::MAX - 1, 2), None, ['x', 'y']),
+        Err(RgaError::DuplicateId(last))
+    );
+    assert_eq!(rga, before);
+    let mut empty = Rga::new();
+    empty
+        .insert_run(id(u64::MAX - 1, 2), None, ['x', 'y'])
+        .unwrap();
+    assert_eq!(text(&empty), "xy");
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// A set-of-inserts reference, using u128 arithmetic for proposed runs,
+    /// remains equal after malformed runs, deletions, retries and restoration.
+    #[test]
+    fn boundary_runs_remain_atomic_and_match_the_reference(
+        steps in prop::collection::vec((
+            0u8..4,
+            prop_oneof![0..100u64, (0..8u64).prop_map(|n| u64::MAX - n)],
+            1..4u64, 0..6usize, any::<usize>(),
+        ), 1..90),
+    ) {
+        let mut rga = Rga::new();
+        let mut inserts: Vec<spec::Insert<char>> = Vec::new();
+        let mut deleted = BTreeSet::new();
+        for (kind, first, replica, count, choice) in steps {
+            let ids = spec::linearize(&inserts);
+            match kind {
+                1 if !ids.is_empty() => {
+                    let target = ids[choice % ids.len()];
+                    rga.delete(target).unwrap();
+                    deleted.insert(target);
+                }
+                2 => { rga = serde_json::from_str(&serde_json::to_string(&rga).unwrap()).unwrap(); }
+                _ => {
+                    let parent = if choice % (ids.len() + 1) == ids.len() { None }
+                        else { Some(ids[choice % (ids.len() + 1)]) };
+                    let first = id(first, replica);
+                    let before = rga.clone();
+                    let value = (b'a' + (choice % 26) as u8) as char;
+                    let fits = count == 0 || u128::from(first.lamport) + count as u128 - 1 <= u128::from(u64::MAX);
+                    let fresh = count == 0 || (0..count).all(|k| {
+                        !inserts.iter().any(|n| n.id.replica == first.replica && u128::from(n.id.lamport) == u128::from(first.lamport) + k as u128)
+                    });
+                    let newer = count == 0 || parent.is_none_or(|p| first.lamport > p.lamport);
+                    let result = rga.insert_run(first, parent, vec![value; count]);
+                    prop_assert_eq!(result.is_ok(), fits && fresh && newer);
+                    if result.is_ok() {
+                        let mut previous = parent;
+                        for k in 0..count {
+                            let next = id((u128::from(first.lamport) + k as u128) as u64, replica);
+                            inserts.push(spec::Insert::new(next, previous, value));
+                            previous = Some(next);
+                        }
+                    } else { prop_assert_eq!(&rga, &before); }
+                }
+            }
+            prop_assert_eq!(rga.ids(), spec::linearize(&inserts));
+            prop_assert_eq!(rga.visible().map(|(id, value)| (id, *value)).collect::<Vec<_>>(), spec::render(&inserts, &deleted));
+        }
+    }
+}
+
+#[test]
 fn spec_renders_a_dfs_with_descending_siblings() {
     let inserts = vec![
         spec::Insert::new(id(1, 1), None, 'a'),

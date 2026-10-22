@@ -15,30 +15,43 @@ use proptest::prelude::*;
 
 /// Stands in for a real document that fills the first column of every row
 /// inserted with 42, and counts how often it was asked.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Filler {
     asked: usize,
 }
 
 impl Materializer<ToyDoc> for Filler {
+    fn may_derive(&self, _: &ToyDoc, op: &ToyOp) -> bool {
+        matches!(op, ToyOp::Grid(GridOp::InsertRow { .. }))
+    }
+    fn fork(&self, _: &ToyDoc) -> Result<Self, String> {
+        Ok(self.clone())
+    }
+
     fn materialize(&mut self, _: &ToyDoc, _: (), _: &ApplyContext) -> Result<(), String> {
         Ok(())
     }
 
-    fn derived(&mut self, document: &ToyDoc, op: &ToyOp) -> Vec<ToyOp> {
+    fn derived(
+        &mut self,
+        document: &ToyDoc,
+        op: &ToyOp,
+    ) -> Result<Vec<ToyOp>, jade_collab_sync::Rejection> {
         self.asked += 1;
-        match op {
+        Ok(match op {
             ToyOp::Grid(GridOp::InsertRow { id, .. }) => vec![ToyOp::SetCell {
                 row: *id,
                 col: document.grid.all_columns()[0],
                 stamp: Id::new(
-                    jade_collab_sync::Document::max_lamport(document) + 1,
+                    jade_collab_sync::Document::max_lamport(document)
+                        .checked_add(1)
+                        .ok_or_else(|| jade_collab_sync::Rejection::new("derived id exhausted"))?,
                     ReplicaId::ORIGIN,
                 ),
                 value: 42,
             }],
             _ => Vec::new(),
-        }
+        })
     }
 }
 

@@ -11,6 +11,7 @@ jade-collab-core = { path = "../jade-collab-core" }
 jade-collab-sync = { path = "../jade-collab-sync" }
 jade-opc = { path = "../../jade-core/crates/jade-opc" }
 jade-pptx-reader = { path = "../../jade-core/crates/jade-pptx-reader" }
+jade-pptx-layout = { path = "../../jade-core/crates/jade-pptx-layout" }
 jade-pptx-writer = { path = "../../jade-core/crates/jade-pptx-writer" }
 serde.workspace = true
 thiserror.workspace = true

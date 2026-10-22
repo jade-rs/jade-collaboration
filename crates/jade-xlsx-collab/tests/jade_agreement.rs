@@ -148,6 +148,62 @@ const EDIT_FIXTURES: &[&str] = &[
     "calculation-open-workbook.xlsx",
 ];
 
+#[test]
+fn inserting_between_formatted_columns_does_not_extend_their_target_ids() {
+    let (mut model, mut jade) = open("grid-operations-workbook.xlsx");
+    let view = model.sheets().remove(0);
+    let mut seq = 0;
+    commit(
+        &mut model,
+        &mut jade,
+        &mut seq,
+        XlsxOp::SetLineFormat {
+            sheet: view.id,
+            axis: jade_xlsx_collab::LineAxis::Columns,
+            lines: view.columns[3..5].to_vec(),
+            stamp: stamp(1),
+            change: FormatChange {
+                fill_color: Some("FFFF00".into()),
+                ..Default::default()
+            },
+        },
+    );
+    commit(
+        &mut model,
+        &mut jade,
+        &mut seq,
+        XlsxOp::Structure {
+            sheet: view.id,
+            op: GridOp::InsertColumn {
+                id: stamp(2),
+                after: Some(view.columns[3]),
+            },
+        },
+    );
+    let reopened = JadeXlsx::open(&jade.export().unwrap()).unwrap();
+    assert_agree(&model, &reopened, "after export");
+    for reference in ["D500", "F500"] {
+        assert_eq!(
+            reopened
+                .workbook()
+                .format_at("Operations", reference)
+                .unwrap()
+                .fill_color
+                .as_deref(),
+            Some("FFFF00")
+        );
+    }
+    assert_eq!(
+        reopened
+            .workbook()
+            .format_at("Operations", "E500")
+            .unwrap()
+            .fill_color
+            .as_deref(),
+        Some("")
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(48))]
 
@@ -176,7 +232,7 @@ proptest! {
                     jade.materialize(&model, effect, &ctx)
                         .unwrap_or_else(|e| panic!("{fixture}: jade refused {op:?}: {e}"));
                     // As the sequencer does: what jade did on its own.
-                    for derived in jade.derived(&model, &op) {
+                    for derived in jade.derived(&model, &op).unwrap() {
                         let ctx = ApplyContext { origin: ReplicaId::ORIGIN, base_seq: seq, seq: Some(seq) };
                         let effect = model.apply(&derived, &ctx)
                             .unwrap_or_else(|e| panic!("{fixture}: derived {derived:?}: {e}"));
@@ -235,6 +291,7 @@ proptest! {
         let (model, jade) = open(fixture);
         let name = model.sheets()[0].name.clone();
         let (sheet, row, column) = model.locate(&name, target).unwrap();
+        let initial = jade.workbook().format_at(&name, target).unwrap();
         let mut sim = Simulation::with_materializer(model, jade, 3);
         let mut writes = Vec::new();
         for (client, kind, attribute, value) in steps {
@@ -265,7 +322,7 @@ proptest! {
         writes.sort_by_key(|(stamp, _)| *stamp);
         let expected = writes
             .iter()
-            .fold(FormatChange::default(), |under, (_, over)| overlay(&under, over));
+            .fold(initial, |under, (_, over)| overlay(&under, over));
         let server = sim.server();
         prop_assert!(server.faults().is_empty(), "{:?}", server.faults());
         prop_assert_eq!(server.document().format(sheet, row, column), expected.clone());
@@ -349,13 +406,18 @@ fn a_covered_cell_shows_its_merge_anchors_format() {
     };
     let (sheet, row1, column_f) = model.locate("Operations", "F1").unwrap();
     let (_, _, column_e) = model.locate("Operations", "E1").unwrap();
+    let initial = jade.workbook().format_at("Operations", "E1").unwrap();
+    let default = jade.workbook().format_at("Operations", "J20").unwrap();
     let mut seq = 0;
     let op = format_op(&model, "F1", 1, italic.clone());
     commit(&mut model, &mut jade, &mut seq, op);
-    assert_eq!(model.format(sheet, row1, column_f), FormatChange::default());
+    assert_eq!(model.format(sheet, row1, column_f), initial);
     let op = format_op(&model, "E1", 2, bold.clone());
     commit(&mut model, &mut jade, &mut seq, op);
-    assert_eq!(model.format(sheet, row1, column_f), bold);
+    assert_eq!(
+        model.format(sheet, row1, column_f),
+        overlay(&initial, &bold)
+    );
     // A column inserted inside the merge is covered too.
     let op = XlsxOp::Structure {
         sheet,
@@ -365,21 +427,27 @@ fn a_covered_cell_shows_its_merge_anchors_format() {
         },
     };
     commit(&mut model, &mut jade, &mut seq, op);
-    assert_eq!(model.format(sheet, row1, stamp(3)), bold);
+    assert_eq!(
+        model.format(sheet, row1, stamp(3)),
+        overlay(&initial, &bold)
+    );
     let op = XlsxOp::Structure {
         sheet,
         op: GridOp::DeleteColumn { id: column_e },
     };
     commit(&mut model, &mut jade, &mut seq, op);
     // The inserted column is the anchor now.
-    assert_eq!(model.format(sheet, row1, stamp(3)), FormatChange::default());
-    assert_eq!(model.format(sheet, row1, column_f), FormatChange::default());
+    assert_eq!(model.format(sheet, row1, stamp(3)), default);
+    assert_eq!(model.format(sheet, row1, column_f), default);
     let op = XlsxOp::Structure {
         sheet,
         op: GridOp::DeleteColumn { id: stamp(3) },
     };
     commit(&mut model, &mut jade, &mut seq, op);
-    assert_eq!(model.format(sheet, row1, column_f), italic);
+    assert_eq!(
+        model.format(sheet, row1, column_f),
+        overlay(&initial, &italic)
+    );
 }
 
 /// Notes stay on their cell as rows and columns come and go, and go with a

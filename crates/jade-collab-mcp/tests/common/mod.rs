@@ -13,6 +13,12 @@ use serde_json::{json, Value};
 pub const DOCX: &str = "hello.docx";
 pub const XLSX: &str = "book.xlsx";
 
+/// A read token identifies retained state in one MCP process, not content.
+pub fn without_snapshot(mut read: Value) -> Value {
+    read.as_object_mut().unwrap().remove("snapshot");
+    read
+}
+
 pub fn fixture(path: &str) -> Vec<u8> {
     std::fs::read(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))

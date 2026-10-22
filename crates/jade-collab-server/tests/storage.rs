@@ -10,9 +10,62 @@ use jade_docx_collab::intent::{resolve, IntentOp};
 use jade_docx_collab::{DocxModel, JadeDocx};
 use jade_xlsx_collab::intent::{resolve as resolve_cell, XlsxIntent};
 use jade_xlsx_collab::{CellInput, JadeXlsx, XlsxModel};
+use proptest::prelude::*;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio::task::JoinHandle;
+
+#[test]
+fn one_storage_directory_has_only_one_server_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::with_storage(dir.path()).unwrap();
+    let clone = server.clone();
+    assert!(
+        Server::with_storage(dir.path()).is_err(),
+        "a second writer was admitted"
+    );
+    drop(server);
+    assert!(
+        Server::with_storage(dir.path().join(".")).is_err(),
+        "a clone still owns storage"
+    );
+    drop(clone);
+    Server::with_storage(dir.path()).unwrap();
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// The OS lease follows the server's shared ownership across arbitrary
+    /// opens, clones, drops and path aliases, without manual stale-lock cleanup.
+    #[test]
+    fn storage_ownership_follows_live_server_clones(
+        steps in prop::collection::vec((0u8..3, any::<usize>(), any::<bool>()), 1..70),
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("shared");
+        let mut owners: Vec<Server> = Vec::new();
+        for (kind, choice, alias) in steps {
+            match kind {
+                0 => {
+                    let path = if alias { dir.join(".") } else { dir.clone() };
+                    let opened = Server::with_storage(path);
+                    if owners.is_empty() { owners.push(opened.unwrap()); }
+                    else { prop_assert!(opened.is_err(), "storage already has an owner"); }
+                }
+                1 if !owners.is_empty() => {
+                    owners.push(owners[choice % owners.len()].clone());
+                }
+                2 if !owners.is_empty() => { owners.swap_remove(choice % owners.len()); }
+                _ => {}
+            }
+            // Independent storage remains available, even while this root is leased.
+            Server::with_storage(root.path().join("other")).unwrap();
+        }
+        drop(owners);
+        Server::with_storage(dir).unwrap();
+    }
+}
 
 fn fixture(path: &str) -> Vec<u8> {
     std::fs::read(
@@ -145,6 +198,7 @@ async fn a_restarted_server_resumes_every_replica_where_it_was() {
         d.disconnect().await,
     );
     task.abort();
+    let _ = task.await;
     drop(server);
 
     let server = Server::with_storage_options(dir.path(), options).unwrap();
@@ -159,10 +213,10 @@ async fn a_restarted_server_resumes_every_replica_where_it_was() {
     let (base, _task) = listen(&server).await;
     let docx = format!("{base}/hello.docx/ws");
     let xlsx = format!("{base}/book.xlsx/ws");
-    let a = Client::resume(&docx, a, None).await.unwrap();
-    let b = Client::resume(&docx, b, None).await.unwrap();
-    let c = Client::resume(&xlsx, c, None).await.unwrap();
-    let d = Client::resume(&xlsx, d, None).await.unwrap();
+    let a = Client::resume(&docx, &a, None).await.unwrap();
+    let b = Client::resume(&docx, &b, None).await.unwrap();
+    let c = Client::resume(&xlsx, &c, None).await.unwrap();
+    let d = Client::resume(&xlsx, &d, None).await.unwrap();
     assert_eq!(a.view(), view_before, "the model itself was restored");
 
     // Editing goes on, and a newcomer gets a fresh replica id.
@@ -223,7 +277,7 @@ async fn checkpoints_bound_the_log_and_replicas_behind_them_must_rejoin() {
     }
     catch_up(&server, "hello.docx", &writer).await;
     // A running server forgets the log before its checkpoint too.
-    let error = Client::resume(&url, idle_live, None)
+    let error = Client::resume(&url, &idle_live, None)
         .await
         .err()
         .expect("refused");
@@ -231,6 +285,7 @@ async fn checkpoints_bound_the_log_and_replicas_behind_them_must_rejoin() {
     let before = server.export("hello.docx").await.unwrap();
     let writer = writer.disconnect().await;
     task.abort();
+    let _ = task.await;
     drop(server);
 
     // Only the newest checkpoint is kept, and the log after it is short.
@@ -254,10 +309,10 @@ async fn checkpoints_bound_the_log_and_replicas_behind_them_must_rejoin() {
     let (base, _task) = listen(&server).await;
     let url = format!("{base}/hello.docx/ws");
 
-    let writer = Client::resume(&url, writer, None).await.unwrap();
+    let writer = Client::resume(&url, &writer, None).await.unwrap();
     assert_eq!(writer.seq(), 10);
     // The idle replica was at log position 0, long compacted away.
-    let error = Client::resume(&url, idle, None)
+    let error = Client::resume(&url, &idle, None)
         .await
         .err()
         .expect("refused");
@@ -299,11 +354,11 @@ async fn replicas_just_behind_a_checkpoint_resume_from_the_kept_tail() {
     catch_up(&server, "hello.docx", &writer).await;
 
     // Three behind, across checkpoints: resumed, not asked to join again.
-    let near_live = Client::resume(&url, near_live, None).await.unwrap();
+    let near_live = Client::resume(&url, &near_live, None).await.unwrap();
     assert_eq!(near_live.seq(), 9);
     assert_eq!(near_live.view(), writer.view());
     // Nine behind is further than the four kept.
-    let error = Client::resume(&url, far_live, None)
+    let error = Client::resume(&url, &far_live, None)
         .await
         .err()
         .expect("refused");
@@ -313,16 +368,17 @@ async fn replicas_just_behind_a_checkpoint_resume_from_the_kept_tail() {
     drop(near_live);
     drop(writer);
     task.abort();
+    let _ = task.await;
     drop(server);
 
     // The tail is on disk: after a restart the same replica still resumes.
     let server = Server::with_storage_options(dir.path(), options).unwrap();
     let (base, _task) = listen(&server).await;
     let url = format!("{base}/hello.docx/ws");
-    let near = Client::resume(&url, near, None).await.unwrap();
+    let near = Client::resume(&url, &near, None).await.unwrap();
     assert_eq!(near.seq(), 9);
     assert_eq!(near.view(), view);
-    let error = Client::resume(&url, far, None)
+    let error = Client::resume(&url, &far, None)
         .await
         .err()
         .expect("refused");
@@ -351,16 +407,107 @@ async fn a_server_that_syncs_every_record_restarts_like_any_other() {
     let before = server.export("hello.docx").await.unwrap();
     let writer = writer.disconnect().await;
     task.abort();
+    let _ = task.await;
     drop(server);
 
     let server = Server::with_storage_options(dir.path(), options).unwrap();
     assert_eq!(server.seq("hello.docx").await.unwrap(), 5);
     assert_eq!(server.export("hello.docx").await.unwrap(), before);
     let (base, _task) = listen(&server).await;
-    let writer = Client::resume(&format!("{base}/hello.docx/ws"), writer, None)
+    let writer = Client::resume(&format!("{base}/hello.docx/ws"), &writer, None)
         .await
         .unwrap();
     assert_eq!(writer.seq(), 5);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_storage_failure_closes_waiting_clients_and_their_pending_edit_can_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = StorageOptions {
+        checkpoint_every: 2, // join, then the first edit triggers a checkpoint
+        ..StorageOptions::default()
+    };
+    let server = Server::with_storage_options(dir.path(), options).unwrap();
+    server.open("hello.docx", fixture("hello.docx")).unwrap();
+    let (base, task) = listen(&server).await;
+    let client: Client<DocxModel> = Client::connect(&format!("{base}/hello.docx/ws"), None)
+        .await
+        .unwrap();
+    let document = dir.path().join("hello.docx");
+    let moved = dir.path().join("temporarily-unavailable");
+    // The open journal remains writable, but the checkpoint path is gone.
+    std::fs::rename(&document, &moved).unwrap();
+    type_text(&client, 0, "recover me ");
+    let optimistic = client.view();
+    let result = tokio::time::timeout(Duration::from_secs(2), client.settle())
+        .await
+        .expect("a stopped document must wake clients waiting for an acknowledgement");
+    assert!(
+        result.is_err(),
+        "the failed checkpoint was not acknowledged"
+    );
+    let replica = client.disconnect().await;
+    assert_eq!(replica.pending_len(), 1);
+    task.abort();
+    let _ = task.await;
+    drop(server);
+    std::fs::rename(&moved, &document).unwrap();
+
+    let server = Server::with_storage_options(dir.path(), options).unwrap();
+    let (base, task) = listen(&server).await;
+    let client = Client::resume(&format!("{base}/hello.docx/ws"), &replica, None)
+        .await
+        .unwrap();
+    client.settle().await.unwrap();
+    assert_eq!(client.pending_len(), 0);
+    assert_eq!(
+        client.view(),
+        optimistic,
+        "the journal kept exactly one copy of the edit"
+    );
+    assert_eq!(client.seq(), 1);
+    type_text(&client, 0, "after recovery ");
+    client.settle().await.unwrap();
+    assert!(server.faults("hello.docx").await.unwrap().is_empty());
+    drop(client);
+    task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dropping_the_last_server_stops_connected_writers_before_releasing_storage() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::with_storage(dir.path()).unwrap();
+    server.open("hello.docx", fixture("hello.docx")).unwrap();
+    let (base, task) = listen(&server).await;
+    let client: Client<DocxModel> = Client::connect(&format!("{base}/hello.docx/ws"), None)
+        .await
+        .unwrap();
+    type_text(&client, 0, "before shutdown ");
+    client.settle().await.unwrap();
+    let view = client.view();
+    let seq = client.seq();
+    // An upgraded WebSocket owns a document sender but no Server clone.
+    // It must not keep the old actor writing after a new server takes over.
+    task.abort();
+    let _ = task.await;
+    drop(server);
+    let restarted = Server::with_storage(dir.path()).unwrap();
+    let closed = tokio::time::timeout(Duration::from_secs(2), client.wait_for_seq(seq + 1))
+        .await
+        .expect("dropping the server must stop its document connections");
+    assert!(closed.is_err());
+    let replica = client.disconnect().await;
+    let (base, task) = listen(&restarted).await;
+    let client = Client::resume(&format!("{base}/hello.docx/ws"), &replica, None)
+        .await
+        .unwrap();
+    assert_eq!(client.view(), view);
+    type_text(&client, 0, "after shutdown ");
+    client.settle().await.unwrap();
+    assert_eq!(client.seq(), seq + 1);
+    assert!(restarted.faults("hello.docx").await.unwrap().is_empty());
+    drop(client);
+    task.abort();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -378,6 +525,7 @@ async fn a_torn_last_journal_line_is_dropped() {
     let seq = server.seq("hello.docx").await.unwrap();
     drop(writer);
     task.abort();
+    let _ = task.await;
     drop(server);
 
     // The process died halfway through appending a record.
@@ -397,13 +545,16 @@ async fn a_torn_last_journal_line_is_dropped() {
     assert_eq!(server.seq("hello.docx").await.unwrap(), seq);
     assert_eq!(server.export("hello.docx").await.unwrap(), before);
     // And the journal goes on from there.
-    let (base, _task) = listen(&server).await;
+    let (base, task) = listen(&server).await;
     let writer: Client<DocxModel> = Client::connect(&format!("{base}/hello.docx/ws"), None)
         .await
         .unwrap();
     type_text(&writer, 0, "more ");
     writer.settle().await.unwrap();
     drop(writer);
+    task.abort();
+    let _ = task.await;
+    drop(server);
     let server = Server::with_storage(dir.path()).unwrap();
     assert_eq!(server.seq("hello.docx").await.unwrap(), seq + 1);
 }
@@ -419,9 +570,13 @@ async fn a_corrupt_journal_is_reported_rather_than_skipped() {
         .into_iter()
         .find(|n| n.starts_with("log-"))
         .unwrap();
-    std::fs::write(document.join(log), "not json\n{}\n").unwrap();
+    let log = document.join(log);
+    std::fs::write(&log, "not json\n{}\n").unwrap();
     let error = Server::with_storage(dir.path()).err().expect("refused");
     assert!(error.to_string().contains("hello.docx"), "{error}");
+    // Failed startup releases ownership too, so repaired storage can be opened.
+    std::fs::write(log, "").unwrap();
+    Server::with_storage(dir.path()).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -434,7 +589,7 @@ async fn documents_with_unsafe_names_are_refused() {
             "{name} was accepted"
         );
     }
-    assert!(files(dir.path()).is_empty());
+    assert_eq!(files(dir.path()), [".lock"]);
 }
 
 /// The bold characters of the second body paragraph of a written file.
@@ -456,6 +611,215 @@ fn edit(client: &Client<DocxModel>, op: IntentOp) {
     for op in ops {
         client.submit(op).unwrap();
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn imported_spreadsheet_styles_survive_socket_edits_checkpoints_and_resume() {
+    use jade_xlsx_collab::FormatChange;
+    let bytes = fixture("public/fixtures/number-formats-workbook.xlsx");
+    let native = JadeXlsx::open(&bytes).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let options = StorageOptions {
+        checkpoint_every: 2,
+        ..StorageOptions::default()
+    };
+    let server = Server::with_storage_options(dir.path(), options).unwrap();
+    server.open("book.xlsx", bytes).unwrap();
+    let (base, task) = listen(&server).await;
+    let writer: Client<XlsxModel> = Client::connect(&format!("{base}/book.xlsx/ws"), None)
+        .await
+        .unwrap();
+    let sheet_name = writer.view().sheets()[0].name.clone();
+    let (sheet, row, column) = writer.view().locate(&sheet_name, "B2").unwrap();
+    let mut expected = native.workbook().format_at(&sheet_name, "B2").unwrap();
+    assert_eq!(writer.view().format(sheet, row, column), expected);
+    assert!(!writer.view().default_format(sheet).is_empty());
+    let op = resolve_cell(
+        &writer.view(),
+        &XlsxIntent::SetFormat {
+            sheet: sheet_name.clone(),
+            range: "B2".into(),
+            change: FormatChange {
+                fill_color: Some("F0F000".into()),
+                ..Default::default()
+            },
+        },
+        &mut |n| writer.reserve(n),
+    )
+    .unwrap();
+    writer.submit(op).unwrap();
+    writer.settle().await.unwrap();
+    expected.fill_color = Some("F0F000".into());
+    assert_eq!(writer.view().format(sheet, row, column), expected);
+    let before = writer.view();
+    let bytes = server.export("book.xlsx").await.unwrap();
+    let replica = writer.disconnect().await;
+    task.abort();
+    let _ = task.await;
+    drop(server);
+
+    let server = Server::with_storage_options(dir.path(), options).unwrap();
+    assert_eq!(server.export("book.xlsx").await.unwrap(), bytes);
+    let (base, task) = listen(&server).await;
+    let writer = Client::resume(&format!("{base}/book.xlsx/ws"), &replica, None)
+        .await
+        .unwrap();
+    assert_eq!(writer.view(), before);
+    let op = resolve_cell(
+        &writer.view(),
+        &XlsxIntent::SetFormat {
+            sheet: sheet_name.clone(),
+            range: "B2".into(),
+            change: FormatChange {
+                italic: Some(true),
+                ..Default::default()
+            },
+        },
+        &mut |n| writer.reserve(n),
+    )
+    .unwrap();
+    writer.submit(op).unwrap();
+    writer.settle().await.unwrap();
+    expected.italic = Some(true);
+    assert_eq!(writer.view().format(sheet, row, column), expected);
+    let jade = JadeXlsx::open(&server.export("book.xlsx").await.unwrap()).unwrap();
+    let file = jade.workbook().format_at(&sheet_name, "B2").unwrap();
+    assert_eq!(file.number_format, expected.number_format);
+    assert_eq!(file.fill_color, expected.fill_color);
+    assert_eq!(file.italic, expected.italic);
+    assert!(server.faults("book.xlsx").await.unwrap().is_empty());
+    writer.disconnect().await;
+    task.abort();
+    let _ = task.await;
+}
+
+/// Downloaded Word settings, the collaborative model and new revisions agree
+/// after importing a file, replaying a journal, restoring a checkpoint and
+/// resuming the same replica over a new socket.
+#[tokio::test(flavor = "multi_thread")]
+async fn tracking_mode_survives_file_import_and_durable_restarts() {
+    let seed = Server::new();
+    seed.open("hello.docx", fixture("hello.docx")).unwrap();
+    let (base, task) = listen(&seed).await;
+    let author: Client<DocxModel> = Client::connect(&format!("{base}/hello.docx/ws"), None)
+        .await
+        .unwrap();
+    edit(&author, IntentOp::SetTracking { on: true });
+    author.settle().await.unwrap();
+    let imported = seed.export("hello.docx").await.unwrap();
+    author.disconnect().await;
+    task.abort();
+    let _ = task.await;
+    drop(seed);
+
+    for checkpoint_every in [1, 100] {
+        let dir = tempfile::tempdir().unwrap();
+        let options = StorageOptions {
+            checkpoint_every,
+            ..StorageOptions::default()
+        };
+        let mut server = Server::with_storage_options(dir.path(), options).unwrap();
+        server.open("hello.docx", imported.clone()).unwrap();
+        let (mut base, mut task) = listen(&server).await;
+        let mut writer: Client<DocxModel> = Client::connect(&format!("{base}/hello.docx/ws"), None)
+            .await
+            .unwrap();
+        assert!(
+            writer.view().tracking(),
+            "the imported file enables tracking"
+        );
+
+        for (on, text) in [(true, "tracked日本"), (false, "plain🙂"), (true, "again")] {
+            edit(&writer, IntentOp::SetTracking { on });
+            writer.settle().await.unwrap();
+            type_text(&writer, 1, text);
+            writer.settle().await.unwrap();
+            catch_up(&server, "hello.docx", &writer).await;
+            let view = writer.view();
+            assert_eq!(view.tracking(), on);
+            let mut revisions: Vec<_> = view.revisions().into_iter().map(|r| r.text).collect();
+            revisions.sort();
+            assert_eq!(revisions.iter().any(|r| r.contains(text)), on);
+            let bytes = server.export("hello.docx").await.unwrap();
+            let jade = JadeDocx::load(&bytes).unwrap();
+            let in_file = DocxModel::from_word_document(jade.word()).unwrap();
+            assert_eq!(in_file.tracking(), on);
+            let mut file_revisions: Vec<_> =
+                in_file.revisions().into_iter().map(|r| r.text).collect();
+            file_revisions.sort();
+            assert_eq!(file_revisions, revisions);
+
+            let replica = writer.disconnect().await;
+            task.abort();
+            let _ = task.await;
+            drop(server);
+            server = Server::with_storage_options(dir.path(), options).unwrap();
+            assert_eq!(server.export("hello.docx").await.unwrap(), bytes);
+            (base, task) = listen(&server).await;
+            writer = Client::resume(&format!("{base}/hello.docx/ws"), &replica, None)
+                .await
+                .unwrap();
+            assert_eq!(writer.view(), view);
+            assert!(server.faults("hello.docx").await.unwrap().is_empty());
+        }
+        writer.disconnect().await;
+        task.abort();
+        let _ = task.await;
+        drop(server);
+    }
+}
+
+/// A comment commits its jade-assigned number immediately after its cause.
+/// Checkpointing the cause must not put that number in both the snapshot
+/// and the journal that follows it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_checkpoint_at_a_comments_cause_restarts_without_replaying_its_number_twice() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = StorageOptions {
+        checkpoint_every: 2, // join, then the comment's cause
+        keep_tail: 4,
+        ..StorageOptions::default()
+    };
+    let server = Server::with_storage_options(dir.path(), options).unwrap();
+    server.open("hello.docx", fixture("hello.docx")).unwrap();
+    let (base, task) = listen(&server).await;
+    let url = format!("{base}/hello.docx/ws");
+    let writer: Client<DocxModel> = Client::connect(&url, None).await.unwrap();
+    edit(
+        &writer,
+        IntentOp::AddComment {
+            start_paragraph: 0,
+            start_offset: None,
+            end_paragraph: 0,
+            end_offset: None,
+            text: "durable comment".into(),
+            author: None,
+            initials: None,
+            date: None,
+        },
+    );
+    writer.settle().await.unwrap();
+    catch_up(&server, "hello.docx", &writer).await;
+    let before = server.export("hello.docx").await.unwrap();
+    let seq = server.seq("hello.docx").await.unwrap();
+    assert_eq!(seq, 2, "the comment and its assigned number");
+    let writer = writer.disconnect().await;
+    task.abort();
+    let _ = task.await;
+    drop(server);
+
+    let server = Server::with_storage_options(dir.path(), options).unwrap();
+    assert_eq!(server.seq("hello.docx").await.unwrap(), seq);
+    assert_eq!(server.export("hello.docx").await.unwrap(), before);
+    let (base, task) = listen(&server).await;
+    let writer = Client::resume(&format!("{base}/hello.docx/ws"), &writer, None)
+        .await
+        .unwrap();
+    type_text(&writer, 0, "after restart ");
+    writer.settle().await.unwrap();
+    assert!(server.faults("hello.docx").await.unwrap().is_empty());
+    drop(writer);
+    task.abort();
 }
 
 /// Character formatting is a set of marks in the model; a checkpoint keeps
@@ -491,12 +855,13 @@ async fn marks_survive_a_restart_and_keep_their_expand_rules() {
     assert_eq!(bold_in_second_paragraph(&before), "Wor");
     let writer = writer.disconnect().await;
     task.abort();
+    let _ = task.await;
     drop(server);
 
     let server = Server::with_storage_options(dir.path(), options).unwrap();
     assert_eq!(server.export("hello.docx").await.unwrap(), before);
     let (base, _task) = listen(&server).await;
-    let writer = Client::resume(&format!("{base}/hello.docx/ws"), writer, None)
+    let writer = Client::resume(&format!("{base}/hello.docx/ws"), &writer, None)
         .await
         .unwrap();
     // Right before the bold text, at the paragraph's start, and right after it.

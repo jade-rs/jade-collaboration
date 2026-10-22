@@ -2,10 +2,10 @@
 //! storage directory, named after the document:
 //!
 //! ```text
-//! <dir>/<name>/snapshot-<n>.json   {"format": "docx", "checkpoint": <Checkpoint>, "tail": [<Committed>…]}
+//! <dir>/<name>/snapshot-<n>.json   {"format": "docx", "name": <logical name>, "checkpoint": <Checkpoint>, "tail": [<Committed>…]}
 //! <dir>/<name>/snapshot-<n>.docx   the file jade exported at the checkpoint (for docx, without
 //!                                   the marks, which the model in the .json holds)
-//! <dir>/<name>/log-<n>.jsonl       one journal `Record` per line, after it
+//! <dir>/<name>/log-<n>.jsonl       one record or atomic record array per line
 //! ```
 //!
 //! `<n>` counts checkpoints. The checkpoint holds the model itself, not just
@@ -30,11 +30,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::wire::Format;
 
+#[cfg(test)]
+mod lean_tests;
+
 /// When the journal is synced to the disk.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Fsync {
     /// After every record, before anyone hears of it: an operation that was
-    /// acknowledged survives a power failure. One `fsync` per record.
+    /// acknowledged survives a power failure. One `fsync` per batch.
     EveryRecord,
     /// Only checkpoints are synced. Records are handed to the operating
     /// system at once, so they survive the server process dying, but a
@@ -47,7 +50,8 @@ pub enum Fsync {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StorageOptions {
     /// Take a checkpoint (a new snapshot, and an empty journal) after this
-    /// many journal records — joins, commits and rejections.
+    /// many journal records — joins, ownership bindings, commits and rejections. Checked after
+    /// complete submission batches, never between a cause and its derivatives.
     pub checkpoint_every: u64,
     /// Keep this many committed operations from before each checkpoint, in
     /// memory and in the snapshot, so that a replica at most this far
@@ -95,6 +99,8 @@ fn plain_journal() -> JournalOpener {
 #[derive(Serialize)]
 struct SnapshotOut<'a, D, Op> {
     format: Format,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
     checkpoint: &'a Checkpoint<D>,
     tail: &'a [Committed<Op>],
 }
@@ -102,6 +108,8 @@ struct SnapshotOut<'a, D, Op> {
 #[derive(Deserialize)]
 struct SnapshotIn<D, Op> {
     format: Format,
+    #[serde(default)]
+    name: Option<String>,
     checkpoint: Checkpoint<D>,
     /// Absent in snapshots written before tails were kept.
     #[serde(default = "Vec::new")]
@@ -120,6 +128,7 @@ pub(crate) struct Stored<D, Op> {
 /// One document's directory, open for appending.
 pub(crate) struct DocumentStore {
     dir: PathBuf,
+    name: Option<String>,
     format: Format,
     options: StorageOptions,
     generation: u64,
@@ -130,6 +139,33 @@ pub(crate) struct DocumentStore {
 
 fn error(path: &Path, error: impl std::fmt::Display) -> String {
     format!("{}: {error}", path.display())
+}
+
+/// New rooms initialize in parallel. A file lock also excludes different
+/// names resolving to the same physical directory (case or symlink aliases).
+/// Keep the inode in place: removing it could split concurrent ownership.
+fn claim_initialization(dir: &Path) -> Result<File, String> {
+    fs::create_dir_all(dir).map_err(|e| error(dir, e))?;
+    let path = dir.join(".initialize.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|e| error(&path, e))?;
+    file.try_lock().map_err(|e| {
+        error(
+            &path,
+            match e {
+                std::fs::TryLockError::WouldBlock => {
+                    "document initialization is already in progress".to_owned()
+                }
+                std::fs::TryLockError::Error(e) => e.to_string(),
+            },
+        )
+    })?;
+    Ok(file)
 }
 
 fn snapshot_json(generation: u64) -> String {
@@ -170,6 +206,25 @@ pub(crate) fn newest_generation(dir: &Path) -> Result<Option<u64>, String> {
     Ok(newest)
 }
 
+/// The winning initializer's logical name is committed with its model. Older
+/// checkpoints have no name and retain the directory-name convention.
+pub(crate) fn snapshot_name(dir: &Path, generation: u64) -> Result<Option<String>, String> {
+    #[derive(Deserialize)]
+    struct Header {
+        #[serde(default)]
+        name: Option<String>,
+    }
+    let path = dir.join(snapshot_json(generation));
+    let bytes = fs::read(&path).map_err(|e| error(&path, e))?;
+    serde_json::from_slice::<Header>(&bytes)
+        .map(|h| h.name)
+        .map_err(|e| error(&path, e))
+}
+
+fn directory_name(dir: &Path) -> Option<String> {
+    dir.file_name()?.to_str().map(str::to_owned)
+}
+
 /// Writes `bytes` to `path` so that a crash leaves either the old file or
 /// the new one.
 fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -197,6 +252,7 @@ fn sync_dir(dir: &Path) -> Result<(), String> {
 fn write_generation<D: Serialize, Op: Serialize>(
     dir: &Path,
     format: Format,
+    name: Option<&str>,
     generation: u64,
     checkpoint: &Checkpoint<D>,
     tail: &[Committed<Op>],
@@ -209,6 +265,7 @@ fn write_generation<D: Serialize, Op: Serialize>(
         .map_err(|e| error(&log_path, e))?;
     let json = serde_json::to_vec(&SnapshotOut {
         format,
+        name,
         checkpoint,
         tail,
     })
@@ -239,13 +296,16 @@ impl DocumentStore {
         file: &[u8],
         journal: JournalOpener,
     ) -> Result<Self, String> {
+        let _initialization = claim_initialization(&dir)?;
         if newest_generation(&dir)?.is_some() {
             return Err(format!("{} already holds a document", dir.display()));
         }
-        fs::create_dir_all(&dir).map_err(|e| error(&dir, e))?;
-        let log = write_generation::<D, ()>(&dir, format, 1, checkpoint, &[], file)?;
+        let name = directory_name(&dir);
+        let log =
+            write_generation::<D, ()>(&dir, format, name.as_deref(), 1, checkpoint, &[], file)?;
         Ok(Self {
             dir,
+            name,
             format,
             options,
             generation: 1,
@@ -299,9 +359,16 @@ impl DocumentStore {
             if line.is_empty() {
                 continue;
             }
-            let record = serde_json::from_slice(line)
-                .map_err(|e| error(&log_path, format!("line {}: {e}", number + 1)))?;
-            records.push(record);
+            // Old journals have one object per line. A submission and all
+            // its derived operations use one array, with a single newline
+            // committing the whole batch. A torn batch is discarded above.
+            let parsed = if line.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'[') {
+                serde_json::from_slice::<Vec<Record<Op>>>(line)
+            } else {
+                serde_json::from_slice::<Record<Op>>(line).map(|record| vec![record])
+            };
+            records
+                .extend(parsed.map_err(|e| error(&log_path, format!("line {}: {e}", number + 1)))?);
         }
         let log = OpenOptions::new()
             .create(true)
@@ -312,8 +379,10 @@ impl DocumentStore {
             log.set_len(complete as u64)
                 .map_err(|e| error(&log_path, e))?;
         }
+        let name = snapshot.name.or_else(|| directory_name(&dir));
         let store = Self {
             dir,
+            name,
             format,
             options,
             generation,
@@ -333,17 +402,31 @@ impl DocumentStore {
         ))
     }
 
-    /// Appends a record, and syncs it if the options say so. Returns whether
-    /// a checkpoint is due.
+    /// Single-record convenience for storage tests and legacy journals.
+    #[cfg(test)]
     pub fn append<Op: Serialize>(&mut self, record: &Record<Op>) -> Result<bool, String> {
-        let mut line = serde_json::to_vec(record).expect("records serialize");
+        self.append_batch(std::slice::from_ref(record))
+    }
+
+    /// Persist a cause and all its derived operations as one recoverable
+    /// unit. No checkpoint or acknowledgement may split this batch.
+    pub fn append_batch<Op: Serialize>(&mut self, records: &[Record<Op>]) -> Result<bool, String> {
+        if records.is_empty() {
+            return Ok(self.records >= self.options.checkpoint_every);
+        }
+        let mut line = if records.len() == 1 {
+            serde_json::to_vec(&records[0])
+        } else {
+            serde_json::to_vec(records)
+        }
+        .expect("records serialize");
         line.push(b'\n');
         let path = self.dir.join(log_name(self.generation));
         self.log.append(&line).map_err(|e| error(&path, e))?;
         if self.options.sync == Fsync::EveryRecord {
             self.log.sync().map_err(|e| error(&path, e))?;
         }
-        self.records += 1;
+        self.records += records.len() as u64;
         Ok(self.records >= self.options.checkpoint_every)
     }
 
@@ -361,7 +444,15 @@ impl DocumentStore {
         file: &[u8],
     ) -> Result<(), String> {
         let generation = self.generation + 1;
-        let log = write_generation(&self.dir, self.format, generation, checkpoint, tail, file)?;
+        let log = write_generation(
+            &self.dir,
+            self.format,
+            self.name.as_deref(),
+            generation,
+            checkpoint,
+            tail,
+            file,
+        )?;
         self.log = (self.journal)(log);
         self.generation = generation;
         self.records = 0;
@@ -391,6 +482,116 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
 
+    #[test]
+    fn initialization_claim_is_checked_before_writing_any_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a.docx");
+        fs::create_dir(&dir).unwrap();
+        let claim = File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.join(".initialize.lock"))
+            .unwrap();
+        claim.try_lock().unwrap();
+        let result = DocumentStore::create(
+            dir.clone(),
+            Format::Docx,
+            StorageOptions::default(),
+            &checkpoint(0),
+            b"file",
+        );
+        assert!(
+            result.is_err(),
+            "another initializer owns this physical directory"
+        );
+        assert!(
+            newest_generation(&dir).unwrap().is_none(),
+            "a refused initializer must not publish a snapshot"
+        );
+        drop(claim);
+        let store = DocumentStore::create(
+            dir.clone(),
+            Format::Docx,
+            StorageOptions::default(),
+            &checkpoint(0),
+            b"file",
+        )
+        .unwrap();
+        assert_eq!(store.generation, 1);
+        assert!(
+            dir.join(".initialize.lock").exists(),
+            "never unlink an active lock inode"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn simultaneous_initializers_through_alias_paths_publish_only_the_winners_content() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a.docx");
+        fs::create_dir(&dir).unwrap();
+        let alias = root.path().join("alias.docx");
+        std::os::unix::fs::symlink(&dir, &alias).unwrap();
+        let count = 12;
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(count));
+        let workers: Vec<_> = (0..count)
+            .map(|index| {
+                let dir = if index % 2 == 0 {
+                    dir.clone()
+                } else {
+                    alias.clone()
+                };
+                let gate = gate.clone();
+                std::thread::spawn(move || {
+                    gate.wait();
+                    DocumentStore::create(
+                        dir,
+                        Format::Docx,
+                        StorageOptions::default(),
+                        &checkpoint(index as u64),
+                        format!("owner {index}").as_bytes(),
+                    )
+                    .ok()
+                    .map(|_store| index)
+                })
+            })
+            .collect();
+        let winners: Vec<_> = workers
+            .into_iter()
+            .filter_map(|w| w.join().unwrap())
+            .collect();
+        assert_eq!(
+            winners.len(),
+            1,
+            "only one physical directory initializer can succeed"
+        );
+        let owner = winners[0];
+        let (mut store, stored) = DocumentStore::open::<String, String>(
+            dir.clone(),
+            Format::Docx,
+            StorageOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(stored.checkpoint.seq, owner as u64);
+        assert_eq!(stored.file, format!("owner {owner}").as_bytes());
+        let name = if owner % 2 == 0 {
+            "a.docx"
+        } else {
+            "alias.docx"
+        };
+        assert_eq!(snapshot_name(&dir, 1).unwrap().as_deref(), Some(name));
+        store
+            .checkpoint::<_, String>(&checkpoint(100), &[], b"later")
+            .unwrap();
+        assert_eq!(
+            snapshot_name(&dir, 2).unwrap().as_deref(),
+            Some(name),
+            "later checkpoints retain the logical owner name"
+        );
+    }
+
     #[derive(Clone, Debug)]
     enum Step {
         Append(Record<String>),
@@ -403,6 +604,10 @@ mod tests {
         prop_oneof![
             (1..9u64).prop_map(|r| Record::Joined {
                 replica: ReplicaId(r)
+            }),
+            (1..9u64, ".*").prop_map(|(r, principal)| Record::Owned {
+                replica: ReplicaId(r),
+                principal
             }),
             (1..9u64, any::<u64>()).prop_map(|(r, client_seq)| Record::Rejected {
                 replica: ReplicaId(r),
@@ -434,6 +639,7 @@ mod tests {
         Checkpoint {
             seq,
             processed: BTreeMap::from([(ReplicaId(1), seq)]),
+            owners: BTreeMap::new(),
             next_replica: 2,
             faults: vec![format!("fault {seq}")],
             document: format!("document at {seq}"),
@@ -481,8 +687,112 @@ mod tests {
         })
     }
 
+    #[test]
+    fn every_byte_cut_of_a_batch_recovers_all_or_none() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("cuts.docx");
+        let options = StorageOptions::default();
+        let mut store =
+            DocumentStore::create(dir.clone(), Format::Docx, options, &checkpoint(0), b"file")
+                .unwrap();
+        let earlier = Record::<String>::Joined {
+            replica: ReplicaId(1),
+        };
+        store.append(&earlier).unwrap();
+        let path = dir.join(log_name(store.generation));
+        let prefix = fs::read(&path).unwrap();
+        let batch = vec![
+            Record::Joined {
+                replica: ReplicaId(2),
+            },
+            Record::Owned {
+                replica: ReplicaId(2),
+                principal: "日本の主体".into(),
+            },
+            Record::Rejected {
+                replica: ReplicaId(1),
+                client_seq: 1,
+            },
+            Record::Committed(Committed {
+                seq: 1,
+                origin: ReplicaId::ORIGIN,
+                client_seq: 0,
+                base_seq: 0,
+                op: "derived".to_string(),
+            }),
+        ];
+        let mut line = serde_json::to_vec(&batch).unwrap();
+        line.push(b'\n');
+        drop(store);
+        for cut in 0..=line.len() {
+            let mut bytes = prefix.clone();
+            bytes.extend_from_slice(&line[..cut]);
+            fs::write(&path, bytes).unwrap();
+            let (_, stored) =
+                DocumentStore::open::<String, String>(dir.clone(), Format::Docx, options).unwrap();
+            let mut expected = vec![earlier.clone()];
+            if cut == line.len() {
+                expected.extend(batch.clone());
+            }
+            assert_eq!(stored.journal, expected, "cut at byte {cut}");
+            assert_eq!(
+                fs::metadata(&path).unwrap().len(),
+                (prefix.len() + if cut == line.len() { line.len() } else { 0 }) as u64
+            );
+        }
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(48))]
+
+        /// Mixed legacy records and batches recover only complete frames.
+        /// A crash can occur at any byte, including between derived records.
+        #[test]
+        fn batches_recover_atomically_across_torn_writes_and_reopens(
+            sync in fsync(),
+            checkpoint_every in 1..9u64,
+            steps in prop::collection::vec(
+                (prop::collection::vec(record(), 1..5), any::<usize>(), any::<bool>()), 1..30,
+            ),
+        ) {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("batch.docx");
+            let options = StorageOptions { sync, checkpoint_every, ..StorageOptions::default() };
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let mut store = DocumentStore::create_with(
+                dir.clone(), Format::Docx, options, &checkpoint(0), b"file", recording(&events),
+            ).unwrap();
+            let mut expected = Vec::new();
+            for (batch, cut, crash) in steps {
+                let mut line = if batch.len() == 1 {
+                    serde_json::to_vec(&batch[0]).unwrap()
+                } else {
+                    serde_json::to_vec(&batch).unwrap()
+                };
+                line.push(b'\n');
+                if crash {
+                    // All prefixes, including the complete frame, are possible.
+                    let cut = cut % (line.len() + 1);
+                    let path = dir.join(log_name(store.generation));
+                    let mut file = OpenOptions::new().append(true).open(path).unwrap();
+                    file.write_all(&line[..cut]).unwrap();
+                    if cut == line.len() { expected.extend(batch); }
+                } else {
+                    let before = events.lock().unwrap().len();
+                    let due = store.append_batch(&batch).unwrap();
+                    expected.extend(batch);
+                    prop_assert_eq!(due, expected.len() as u64 >= checkpoint_every);
+                    let mut wanted = vec![Event::Append(line)];
+                    if sync == Fsync::EveryRecord { wanted.push(Event::Sync); }
+                    prop_assert_eq!(&events.lock().unwrap()[before..], wanted);
+                }
+                let (reopened, stored) = DocumentStore::open_with::<String, String>(
+                    dir.clone(), Format::Docx, options, recording(&events),
+                ).unwrap();
+                prop_assert_eq!(&stored.journal, &expected);
+                store = reopened;
+            }
+        }
 
         /// Every record reaches the disk before `append` returns — and so
         /// before anyone hears of it — under `EveryRecord`; under
@@ -602,7 +912,7 @@ mod tests {
                 .collect();
             names.sort();
             let n = checkpoints + 1;
-            prop_assert_eq!(names, vec![log_name(n), snapshot_file(n, Format::Docx), snapshot_json(n)]);
+            prop_assert_eq!(names, vec![".initialize.lock".to_owned(), log_name(n), snapshot_file(n, Format::Docx), snapshot_json(n)]);
         }
     }
 
@@ -614,10 +924,18 @@ mod tests {
         let json = serde_json::json!({"format": "docx", "checkpoint": checkpoint(3)});
         fs::write(dir.join(snapshot_json(1)), json.to_string()).unwrap();
         fs::write(dir.join(snapshot_file(1, Format::Docx)), b"file").unwrap();
-        let (_, stored) =
-            DocumentStore::open::<String, String>(dir, Format::Docx, StorageOptions::default())
-                .unwrap();
+        assert_eq!(snapshot_name(&dir, 1).unwrap(), None);
+        let (mut store, stored) = DocumentStore::open::<String, String>(
+            dir.clone(),
+            Format::Docx,
+            StorageOptions::default(),
+        )
+        .unwrap();
         assert_eq!(stored.checkpoint, checkpoint(3));
         assert!(stored.tail.is_empty());
+        store
+            .checkpoint::<_, String>(&checkpoint(4), &[], b"next")
+            .unwrap();
+        assert_eq!(snapshot_name(&dir, 2).unwrap().as_deref(), Some("doc.docx"));
     }
 }

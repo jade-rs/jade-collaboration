@@ -34,8 +34,8 @@ other.
 Every operation is addressed by **stable identifiers** (CRDT style), never by
 index, and is classified into one of two lanes:
 
-* **Convergent lane** — invariant-confluent operations. They commute with every
-  other operation, so a replica applies them immediately and never rolls them
+* **Convergent lane** — invariant-confluent operations. They commute with other
+  convergent operations, so a replica applies them immediately and never rolls them
   back. Text insert/delete inside a paragraph (an RGA sequence CRDT), paragraph
   split, character formatting (Peritext-style marks over the RGA) and cell
   values (last-writer-wins registers).
@@ -55,7 +55,7 @@ server. The lanes only decide *whether an operation may be rejected* and
           └─▶ Submit{client_seq, base_seq, op} ─▶│ dedup (replica, seq)   │
                                                │ validate + apply on     │
                                                │   authoritative model   │──▶ Sequenced{seq, op} ─▶ confirmed.apply
-                                               │ materialize into jade   │                          convergent: view.apply
+                                               │ materialize into jade   │                          convergent-only pending: view.apply
                                                │   (WordDocument / xlsx) │                          sequenced : view = confirmed + pending
                                                │ append to log           │
                                                └────────────────────────┘
@@ -67,12 +67,15 @@ Why keep a CRDT when a server orders everything anyway?
 1. **No index transformation.** Operations name the characters, rows and
    columns they touch, so an operation computed against an old view is still
    meaningful against a newer state. There are no OT transform functions.
-2. **Typing never rebases.** Remote convergent operations are applied straight
-   to the optimistic view (they commute with the pending local operations —
-   `lean/JadeCollab/Reconcile.lean`, `fast_path_sound`). Only the rarer
-   structural operations make a replica replay its pending queue.
+2. **Typing-only queues use a fast path.** Remote convergent operations are
+   applied straight to the optimistic view while pending operations are all
+   applied convergent ones. A pending sequenced guard can depend on text: deleting
+   its complete range invalidates a tentative comment. Mixed or previously
+   inapplicable queues are therefore replayed on the new confirmed state.
+   `lean/JadeCollab/Reconcile.lean` proves the shortcut with its actual pending
+   commutation condition and the guarded choice between shortcut and replay.
 3. **Rejections are rare and local.** Only sequenced operations can be
-   rejected, and only when a concurrent structural change made them invalid.
+   rejected, when the authoritative state no longer admits them.
 4. **Offline / peer text merges remain possible** for the convergent lane.
 
 Why keep the server when a CRDT handles text?
@@ -104,6 +107,51 @@ Why keep the server when a CRDT handles text?
 * `base_seq` — the last log position the client had seen when it made the
   operation. Operations whose meaning depends on index-based text (formulas)
   use it to detect that a structural change slipped in between.
+
+Identifiers have bounded `u64` Lamport time. `Id::last_in_run` and
+`Clock::try_reserve` check a run's full inclusive range before allocating or
+mutating anything. RGA insertion, DOCX note/text-box creation and merge/unmerge
+stories, and XLSX sheet creation refuse overflowing ranges atomically.
+`Replica::try_reserve`, `Client::try_reserve` and the formats' `try_resolve`
+APIs propagate exhaustion as a typed error; CLI and MCP use them so an extreme
+peer timestamp cannot panic their allocator or poison the replica mutex.
+A resolver returns no partial operation list if a later reservation fails
+(earlier reserved but unused identifiers may remain consumed).
+`IdAllocation.lean` proves the bounded allocation model's range, freshness
+and failure properties; its executable oracle is compared with Rust on
+stateful histories biased toward the integer limits.
+
+`Document::validate_submission` is a pure admission boundary for new user
+operations. Native formats check every explicitly minted ID and LWW stamp
+against the submitting replica (`check_id_owner`). Targets, parents, existing
+row/column IDs, story/shape IDs and revision decisions remain shared references.
+DOCX zero-allocation merges/unmerges do not check their unused `first` sentinel.
+The exhaustive per-format matches force a policy decision when an operation is
+added. This does not establish global freshness of timestamps or prevent an
+editor from intentionally using its own extreme Lamport time.
+
+`Replica::submit` checks before changing the optimistic view or ticket;
+`Sequencer::submit` checks after processing the ticket but before even asking
+whether the native materializer needs staging. A refusal therefore changes
+only the processed watermark and is journaled/checkpointed like other refusals.
+The socket checks before DOCX author registration as well. It deduplicates
+processed tickets before decoding or registering an author: changing a refused
+payload after restart cannot create log or metadata effects.
+
+Committed replay/downstream facts and origin-derived operations bypass this
+new-submission policy. Existing historical IDs keep their original logical
+meaning; imported IDs and origin-generated numbering remain usable. Logical
+application still checks their actual validity. Rust field-mutation matrices
+cover all minted fields across DOCX/XLSX/PPTX, including multi-ID tables and
+LWW stamps, while stateful native-model tests mix forged/valid submissions,
+duplicates, resume and compact/restore against independent text/register
+references. Raw socket tests check native file equality on refusal and legitimate
+reuse by each owner; tracked DOCX tests restart through both checkpoint and
+journal paths and check author-free refusals and duplicate replay. Lean's
+`AllocationOwner` specifies namespace checks, reference independence, refusal
+metadata and duplicate suppression; field extraction and native IO are checked
+by Rust rather than proved.
+
 
 ## 4. Data model
 
@@ -222,7 +270,18 @@ binding in jade-core first. jade's `add_comment`
 paragraph it anchors to without relisting that paragraph's text boxes,
 whose paragraphs then point at a stale run until the
 file is read again; the materializer has jade relist them by restoring
-jade's own snapshot. A jade-core bug surfaced here — text typed after a note
+jade's own snapshot.
+
+The native run mapper skips `w:moveFrom`/`w:moveTo` although its parser lists
+their runs. That shifted the binding of a following text-box host, so a tracked
+deletion inside the box appeared in memory but vanished from the exported file
+after a restart. The adapter maps against a private XML view whose move-wrapper
+names are insertion/deletion names, with all node IDs and positions unchanged.
+Only the model's bindings are refreshed before commands; actual XML wrappers
+and move revision kinds are preserved. A minimized regression and the concurrent
+editing PBT check the text, tracked layers and exported/reloaded document.
+
+A jade-core bug surfaced here — text typed after a note
 reference or text box alone in its paragraph went into that run, and the
 next edit that split the run (formatting, a comment) copied the reference
 into both halves — and is fixed on jade-core's `feat/paragraph-story-api`
@@ -503,10 +562,17 @@ order disagree — below).
 | `SetTracking {on}` | sequenced | the document's mode (Word's *Track Changes* button) |
 | `SetAuthor {replica, name}` | sequenced, server only | who `replica` is |
 
+The mode loads from the related settings part's `w:trackRevisions` flag,
+including explicit on/off values. `SetTracking` updates that flag while
+preserving other settings; a missing settings part is created with its OPC
+relationship and content type. Checkpoints store both the model and the
+base file with the same mode. Older checkpoints whose base file predates
+this support restore the model's authoritative mode before replaying edits.
+
 **Convergence.** The state is (tombstones, `inserted`, `deleted`): set
 union, map insertion of fresh keys, and removals keyed by a revision id.
-Every convergent operation commutes with every other operation — the
-client fast path's condition (§2) — provided a decision names a revision
+These convergent revision operations commute with each other and with revision
+decisions, provided a decision names a revision
 other than the one a concurrent tracked deletion creates, which always
 holds (a revision is decided only after its author's operation committed).
 `lean/JadeCollab/Revision.lean` proves it: `trackDelete_comm_*` for every
@@ -586,12 +652,164 @@ attribute it does not name, so attributes are independent, concurrent
 changes to different attributes of one cell both survive, and each
 attribute converges to its newest write. jade is only told the attributes a
 write won when it arrived, so in log order the last write it sees for an
-attribute is the newest one. The model records only what was written
-through it; the formats the file already had stay in jade. Values are
+attribute is the newest one. The model also imports the file's editable
+base styles (default, column, intentional row, explicit cell), with the
+cell > row > column > default priority used by jade. Source style indices
+are interned: a whole-column default does not allocate cell registers for
+every row. A source style is a complete layer, including unresolved
+attributes; an automatic cell colour must not fall through to a red row
+colour. Later collaborative writes override only the attributes they name.
+`lean/JadeCollab/Style.lean` proves the source precedence, fresh-write
+dominance and convergence of cross-layer updates; native fixture comparisons
+and stateful property tests check the style projection and its persistence.
+Models from checkpoints predating this support remain readable with their
+previous knowledge of collaborative changes. Values are
 canonicalised to what `format_at` reads back (`#ff0000` → `FF0000`, an
 empty number format → `General`) and changes jade would refuse (a bad
 colour, a font size outside 1–409) are refused on every replica, so a
 convergent write never reaches a server whose jade cannot realise it.
+
+Column styles target stable column IDs, including imported source defaults.
+When the native writer stretches a `<col min=… max=…>` across an insertion,
+the materializer splits that span and clears only the new column's style.
+Widths, visibility and unknown column metadata survive. This prevents a
+format applied to existing columns from silently reaching a new ID, and
+keeps source row defaults visible at the new intersections. The stateful
+workbook-agreement test retains the minimized format/insert regression;
+explicit tests cover imported spans, sparse cells beyond the loaded grid,
+namespace/attribute preservation and export/reimport.
+
+MCP spreadsheet reads paginate one sparse stream in sheet order: cell
+entries in numeric row-major order, row styles, column styles, then merge
+ranges in top-left order. A cell's value, note and resolved format share
+one entry, so blank styled/note cells are visible too. Merge geometry is
+one entry plus its anchor cell rather than one entry per covered cell.
+`entry_count` indexes this stream; `cell_count` still counts non-blank values.
+Only the selected entries are projected to JSON, and their combined count
+is at most `limit`. Sheet dimensions and default styles repeat on every
+page. `lean/JadeCollab/Paging.lean` proves the finite
+stream's page bound, reconstruction, cursor progress and saturated-addition
+boundary; stateful Rust tests check the document-to-item mapping through
+format/value/note edits, line insertion/deletion and checkpoint restoration.
+
+MCP reads of all formats retain an immutable model snapshot, with the
+replication sequence and pending count captured under the client's replica
+lock (`Client::snapshot`). The response's `snapshot` token selects that same
+view for later pages and retries, while live editing and acknowledgements
+continue. A read without a token replaces the session's one retained view;
+leaving removes it. Missing, replaced and foreign-session tokens return an
+explicit tool failure. Session ids and tokens include a fresh UUID namespace
+per MCP instance so another instance cannot reuse the first identity after
+a restart.
+Session and snapshot counters refuse exhaustion,
+preserving existing identities and retained reads. `wait_for_changes` keeps
+using the live replica.
+`lean/JadeCollab/Snapshot.lean` proves retention, replacement, session
+isolation and stability under live edits for the cache specification.
+Stateful tests compare real retained payloads and cache sizes across session
+lifecycle histories, and real-socket tests cover all three formats and
+atomic capture of pending and committed operations.
+
+For DOCX, `read_document(include_base_formatting: true)` sends an `Inspect`
+request through the session's existing authenticated WebSocket. The actor
+captures its committed model, native formatting and sequence in one command,
+without logging an edit or advancing the sequence. Native style resolution
+uses document defaults, paragraph style inheritance, character style and direct
+properties after applying collaborative marks to a private Word document.
+`resolved_formatting` partitions each paragraph's UTF-8 text into runs of equal
+properties; `paragraph_format` includes style, alignment, indent and spacing.
+Empty paragraphs retain paragraph metadata with no character runs. Unresolved
+font/colour properties remain null, and rendered theme/conditional effects are
+outside this projection.
+
+The response carries the complete model with the formatting, so a concurrent
+edit cannot mix two versions. MCP retains that pure-data capture for paging
+(`view: authoritative`, `pending: 0`). It uses the existing snapshot token as
+an edit precondition. The SDK captures the client ticket while enqueueing the
+read, after earlier submissions; subsequent local submissions invalidate its
+guard even if they have not reached the server yet. The current socket must
+still own the replica, and viewer authorization permits inspection. Request
+identities are checked for exhaustion; cancellations remove their waiters,
+late answers cannot complete another request, and terminal connection errors
+complete all waiters. Inspection failures leave earlier MCP read snapshots
+retained. Native cascade fixtures, stateful network/checkpoint/reimport PBT,
+request lifecycle PBT and real-socket tests cover these boundaries.
+`lean/JadeCollab/NativeInspection.lean` specifies read purity, coherent capture
+and invalidation after local or remote edits; it does not verify native parsing
+or Rust synchronization internals.
+
+`apply_edits.snapshot` optionally guards editing with the retained read's
+local replica version. `Client::edit` checks connection identity, committed
+sequence, pending count and the next client ticket before invoking the edit
+planner. The ticket advances on every locally submitted operation, so a server
+rejection that restores the same view, sequence and pending count cannot reuse
+an old guard. Ticket exhaustion refuses submission before applying the model.
+The version check, position/formula resolution, ID reservation and queueing
+share one replica lock; ordinary submissions also enqueue under that lock to
+preserve client-ticket order. A mismatch leaves the model, clock and outgoing
+queue unchanged. Accepted batches retain per-edit failures and earlier effects;
+the guard is neither rollback nor a global server compare-and-swap. Omitting it
+uses the current local view. Read tokens remain readable after edits.
+`lean/JadeCollab/EditGuard.lean` proves refusal without effects, competing guard
+exclusion, owner isolation and protection against version reuse in the atomic
+transition specification. Stateful tests include guards through edits, rejected
+operations and session restarts; socket tests cover all document formats.
+
+Dropping a client aborts its connection tasks, closing its socket even while
+read snapshots survive. Callers can settle before dropping, or disconnect to
+retain pending operations for resume. Acknowledgement events are published
+before releasing the replica lock so observing zero pending operations also
+makes their verdicts available.
+
+`Client::try_edit` additionally plans on a cloned replica. A failed callback
+discards the tentative view, clock, pending operations and client tickets,
+without serializing operations. On success it installs that replica under the
+same lock, so concurrent ordinary submissions or other plans cannot interleave
+their ticket groups. Optional
+snapshot validation happens before cloning or invoking the callback. External
+callback effects are outside this boundary. Lean's `tryRun` specification
+proves failed-plan rollback, successful installation and retry after failure;
+stateful PBT compares the actual client with independent counters and queues
+through plans, cancellations, allocations, acknowledgements and rejections.
+
+The CLI resolves each whole edit array through `try_edit`: later intents see
+earlier tentative structure, while a locally invalid intent submits nothing.
+DOCX intent resolution receives the CLI replica's identity and current revision
+date, so deletion of text inserted earlier in that array removes its own
+tracked insertion outright, following Word's author rule.
+The server still judges each operation after submission, so server rejection
+can leave an accepted prefix. MCP keeps its documented per-edit outcomes and
+uses `Client::edit`; an invalid intent there does not abort the whole array.
+
+Accepted MCP edit calls retain a `receipt` before awaiting network answers.
+`get_edit_status` looks up that session's batch without resubmission; its
+default timeout is zero and an optional wait ends when its own submissions
+are answered. `Client::settle_through` uses the FIFO pending prefix, so later
+batches cannot delay an answered receipt and a rejection wakes it even without
+a log-position change. Future, unissued tickets are refused. Verdict events
+are published before completion becomes observable.
+
+The receipt records every edit's submitted tickets, including an accepted
+prefix when a later operation is locally refused. It reports invalid edits,
+known refusals, fully acknowledged edits or pending ones. `complete` and
+`unresolved` cover all submitted operations, even if one edit already has a
+rejection. Reading, watching or submitting another batch collects answers into
+all retained receipts, keeping late verdicts through the SDK event drain.
+Known verdicts are final. After a connection failure, unanswered operations
+remain unknown/pending with `connection_error`; they may have committed.
+Calls on a connection already known to have failed are refused before planning.
+
+Each session retains at most 64 receipts. Insertion evicts the oldest completed
+one; unanswered receipts are never evicted. If they fill the cache, submission
+is refused before reserving IDs or client tickets. Receipt identities use a
+checked counter and the MCP instance UUID, are session-scoped, and are removed
+on leave or process restart. Unknown/expired receipts do not establish that
+their operations failed. Socket tests control delayed verdicts, closed peers,
+capacity pressure and later pending batches; native tests cover all formats
+and scope/expiry. Stateful PBT checks the retained-result model, duplicates,
+foreign tickets, prefix refusal and eviction. Lean specifies finality, scope,
+pending versus answered status and FIFO prefix waiting, with Rust checking the
+actual transports, cache and ticket boundary near exhaustion.
 
 A range is formatted by one operation that names the row and column ids
 its author saw, not its corners: corners resolved at apply time would take
@@ -636,9 +854,9 @@ puts back, cell by cell, the attributes where a newer cell or crossing
 line write shows; a cell write older than its row's or column's reaches
 jade not at all. Lines inserted later behave as in jade: a new row has no
 row format and shows its columns' formats, a new column shows its rows'
-(jade widens a multi-column `<col>` span around a column inserted inside
-it; the model does not claim that format, so the two never disagree on
-what it knows). A merge copies what shows at the anchor, its row's and
+(the materializer clears a widened multi-column `<col>` span's style on
+the inserted column, preserving the original target IDs). A merge copies
+what shows at the anchor, its row's and
 column's formats included.
 
 jade reports a merged cell's format at the merge's anchor, so the model
@@ -811,7 +1029,13 @@ jade's parsed body.
 
 ### Replica rules learnt from the property tests
 
-* A remote convergent operation is applied straight to the optimistic view.
+* A remote convergent operation is applied straight to the optimistic view
+  only while every pending operation is applied and convergent. A pending
+  sequenced operation or an inapplicable pending operation causes replay.
+  Stateful PBT found a comment tentatively anchored to text that a peer then
+  deleted: the old shortcut retained the comment, while replay correctly refused
+  its empty range. The minimized seed and explicit core/native regressions keep
+  that boundary covered through delivery, reconnection and restart histories.
 * A remote sequenced operation rebuilds the view (`confirmed` + pending).
 * The acknowledgement of an **own sequenced** operation also rebuilds the
   view: its committed result can depend on where it was committed (the xlsx
@@ -942,14 +1166,76 @@ journal (`Sequencer::restore`, `Sequencer::replay`). The journal records
 joins (so replica ids are never reused), commits and rejections (a rejection
 moves the replica's processed client sequence number, which is what a resume
 reports). Each record is appended before anyone hears of it, so no replica can
-be ahead of the journal; a torn last line is dropped.
+be ahead of the journal. A submission and all the operations jade derives
+from it are written as one newline-terminated JSON array (single-record
+frames retain the original object representation). A torn last frame is
+dropped in full. No part of a submission is broadcast or checkpointed until
+its entire frame has been written. This prevents a checkpoint from including
+derived operations that are then appended again after it, and prevents a
+crash from preserving a cause without its derived effects. Old object-only
+journals remain readable; older servers cannot read the new array frames.
+
+A write or checkpoint failure stops the document and explicitly wakes its
+open connections so their sockets close. Dropping the subscriber map alone
+cannot do this: each connection also owns its outgoing queue's sender.
+Clients retain unanswered submissions and, after the server is restored,
+resume from the journal to acknowledge persisted edits or resend missing ones.
+Resuming also replaces the replica's current connection: late submissions
+from the previous socket are refused before parsing or recording anything,
+so they cannot consume the new connection's submission numbers.
+
+The storage root is owned exclusively through an OS lock on `.lock`, acquired
+before any snapshot is read or initialized. A competing server fails without
+waiting or modifying documents. Clones share the locked file. Document actors
+have explicit owners: dropping the last server clone sends a stop command and
+joins every actor (including actors still referenced by WebSockets), then
+releases the storage lock. This prevents surviving old sockets from writing
+after a replacement server takes over. The lock file is never unlinked;
+process death releases the OS lock, so stale-file cleanup is unnecessary and
+would defeat exclusion if done while a server was running. Document names
+are also reserved under the server's room mutex before loading or creating
+their storage, so simultaneous uploads cannot initialize the same name twice.
+The mutex covers only registry transitions: native loading, actor startup and
+snapshot writes run outside it. Each reservation has an opaque owner identity;
+only that owner publishes a ready actor. A dropped reservation releases its
+opening entry, including on initialization errors or unwinding, and cannot
+remove a ready room. Opening names conflict immediately but are hidden from
+listings and return not-found to reads/connections until publication. Other
+documents continue to serve joins, committed edits and exports while a load is
+blocked; another document can initialize independently. The initializer's server
+owner retains the storage-root lease throughout.
+
+Different names can resolve to the same physical directory on a case-insensitive
+filesystem or through aliases. Initial checkpoint creation therefore takes a
+per-directory OS lock on `.initialize.lock` before checking for an existing
+generation or writing one. The claim is released after initialization, and
+the lock inode is left in place. A competing initializer fails rather than
+overwriting the winner. This supplements the storage-root lifetime lease;
+it does not replace it. The checkpoint header also records the winning
+initializer's logical `name` in the same atomic JSON publication as its model.
+Restoration uses that name and later checkpoints retain it, even when filesystem
+normalization or an aliased path uses another directory spelling. Missing
+`name` fields remain compatible with old checkpoints: they use the directory
+name, which the next checkpoint records. Invalid or format-mismatched saved
+names refuse startup instead of becoming routes. Moving a new-format storage
+folder does not rename its hosted document.
+
+Tests block an initializer at a controlled I/O boundary
+while another document opens and a real socket edit commits, then restore both
+documents. Registry stateful PBT covers interleaved claims, completions, failures
+and guard drops; filesystem tests check simultaneous creators through aliases
+and verify the winner's actual snapshot content.
+Native tests also restore a differently spelled storage folder, and upload
+stateful histories move stored folders between restarts while checking stable
+public names and content markers in DOCX, XLSX and PPTX.
 
 Appending hands the record to the operating system, which survives the
 process dying but not the machine losing power. `StorageOptions::sync`
 chooses: `Fsync::Checkpoints` (the default) syncs only checkpoints;
 `Fsync::EveryRecord` syncs every record before `append` returns, and so
 before the commit is broadcast — an acknowledged edit is on the disk, at one
-`fsync` per record. The store appends through a `JournalFile` (a `File` in
+`fsync` per batch. Checkpoint thresholds still count records, and are checked
+after complete batches. The store appends through a `JournalFile` (a `File` in
 production), so a property test can watch every write and sync over random
 appends, checkpoints and reopenings.
 
@@ -1013,6 +1299,29 @@ old tokens: a withdrawn token, or one that no longer opens the socket's
 document, gets `revoked {message}` and a policy-violation close frame; a
 changed role or name applies from then on.
 
+### Document uploads
+
+`PUT /documents/{name}` accepts at most 64 MiB of compressed document bytes
+by default (`Server::with_upload_limit`, CLI `--upload-limit BYTES`). This is
+an explicit application setting rather than the framework's 2 MiB default.
+Zero refuses nonempty bodies; local files and subsequent collaborative edits
+are independent of the upload bound. Authentication and per-document editor
+authorization run before the body extractor, so forbidden requests do not
+consume application body frames or expose a body's parse/size errors.
+
+Axum buffers the bounded body, including streams without Content-Length,
+before a worker opens the document. Exactly the configured byte count is
+accepted. Excess bytes receive 413; an interrupted body receives 400. Neither
+case reaches room creation or storage initialization. A valid retry can use
+the same name. A valid upload to an existing name receives 409 without
+replacing it. Tests send real chunked HTTP requests to the CLI and preserve
+incompressible package parts over 2 MiB in DOCX/XLSX/PPTX exports. Stateful
+histories mix credentials, fragmented bodies, oversize/corrupt packages,
+conflicting names and server restarts against a separate admission model;
+accepted content markers survive while rejected requests reserve no storage.
+Lean specifies bounds independent of fragmentation, absorbing refusal and
+the absence of publication before a complete authorized body.
+
 ### Presence
 
 `presence {state}` carries arbitrary JSON (a cursor, a selection) and is
@@ -1032,6 +1341,49 @@ limits and arrival times. An update over a limit is dropped by the
 connection itself, before the document's thread sees it, and only its sender
 gets `presence_rejected {reason}`; submissions go through the same loop
 untouched.
+
+### Busy document input
+
+The actor inbox has 128 queued/reserved count slots per document and a shared
+32 MiB weighted semaphore. A socket reserves its text frame's encoded length
+before JSON decoding, then publishes the command synchronously. The envelope
+retains its byte lease through native processing; receiving releases its count
+slot. Thus there may be one processing command in addition to the 128 queued
+or reserved slots. Partial byte reservations waiting on either resource count
+against the byte budget. Administrative queries and disconnect cleanup charge
+one byte because they carry no incoming document payload.
+
+Capacity waits use async Tokio primitives; native actors receive on dedicated
+threads. Token watches remain active while capacity or join/resume answers
+are pending. Authorization is refreshed after admission and decoding, so a
+waiting edit uses its current role. After 10 seconds a busy socket receives
+`overloaded`, closes with 1013, and can resume/reconcile its pending tickets.
+A single frame exceeding the byte budget fails before decoding with `error`
+and close 1009; it must be split before retry. There is no admission timeout
+for local administrative queries. Cancellation returns reservation resources
+without enqueueing a command or consuming a ticket. Accepted commands may
+commit after the connection closes; normal resume watermarks settle them.
+
+Stop closes an out-of-band publication gate, wakes capacity/answer waiters,
+and drains already committed envelopes in FIFO order. It never waits for
+uncommitted permits held by Tokio tasks, so synchronously joining an actor
+on that same executor cannot deadlock storage-lease release. Publication and
+gate closure share a tiny mutex critical section. Fatal journal errors close
+the receiver immediately. Connection cleanup follows accepted commands and
+uses outbox identity even if a cancelled join never returned its replica id;
+it cannot remove a newer resumed connection. The close notification is sent
+before cleanup waits for capacity.
+
+The fixed per-document limits are not global heap bounds: raw transport frames
+(one waiting per connection), JSON allocation overhead, document growth,
+HTTP/download exports and total connection counts are separate resources.
+Rust stateful PBT checks weighted reservations, FIFO, cancellation, processing,
+release and stop against independent lists/counters. Gated real socket tests
+exercise revocation/demotion, unrelated documents, oversized invalid JSON and
+cancelled join cleanup. Native DOCX/XLSX/PPTX bursts span more than 128 edits
+on each side of an inspection barrier, then settle and resume. Lean's `Inbox`
+specifies resource accounting and publication/drain laws; scheduling, parser
+allocation and native processing are assumptions checked by Rust tests.
 
 ### Slow connections
 
@@ -1053,9 +1405,10 @@ mutation that stops reporting the overflow fails it.
 `--audit-log FILE` appends one JSON object per line for every access, each
 with `at` (milliseconds since the Unix epoch) and `event`: `connected`
 (document, token name, role), `joined` / `resumed` (the replica), `closed`
-(the replica and why: `client`, `revoked`, `overloaded`, `stopped`),
-`refused` (status 401 with the request path, or 403 with the document and
-token name), `uploaded` and `downloaded`. A token is recorded by its grant's
+(the replica and why: `client`, `revoked`, `overloaded`, `input-overloaded`, `input-too-large`, `stopped`),
+`refused` (status 401 with the request path, 403 with the document and
+token name, or 400/413 for failed upload buffering), `uploaded` and
+`downloaded`. A token is recorded by its grant's
 name and never by itself, and request URLs are reduced to their path, since
 a socket may carry its token in the query; a test checks that no secret
 reaches the file. On SIGHUP (Unix) the server opens the file again at its
@@ -1080,7 +1433,8 @@ file; in the body, table cells and text boxes) as sequenced operations on id
 ranges resolved in log order (§4), with jade's numbers for new comments and
 notes committed as derived operations so a restored server keeps
 addressing them;
-docx tracked changes (§4): a document-wide tracking mode, tracked typing
+docx tracked changes (§4): a document-wide tracking mode loaded from and
+saved to Word's settings, tracked typing
 and deleting by people and agents with the server naming each revision's
 author from the token, Word's own-insertion rule, concurrent tracked
 deletions converging on the least revision, accepting and rejecting whole
@@ -1092,8 +1446,10 @@ formatting (per-attribute LWW, A1 ranges), cell borders (a register per
 edge; Excel's outline/inside lines over a range), whole-row and
 whole-column formats, merged cells and sheet
 management (add, rename, delete, move); pptx slide
-insert/delete/move/duplicate, text in shapes, group children and speaker
-notes, shape geometry, text boxes and shape deletion (hosted by the server,
+insert/delete/move/duplicate and visibility, text in shapes, group children and speaker
+notes, character marks (bold/italic/underline/size/Latin and East Asian fonts/colour),
+paragraph alignment, PNG/JPEG pictures with aspect-preserving resizing,
+shape geometry, text boxes and shape deletion (hosted by the server,
 the CLI and the MCP server like the other formats; a restored deck's
 materializer re-learns which file id jade gave each session-made text box);
 index/A1/slide-number-addressed intent APIs for people and agents; the
@@ -1101,11 +1457,14 @@ index/A1/slide-number-addressed intent APIs for people and agents; the
 (`jade-collab-mcp`) through which agents join, read, edit and watch
 documents as replicas without a shell; durable documents with checkpoints,
 log compaction that keeps a tail for replicas slightly behind, and an
-optional fsync per journal record; bearer-token authentication with editor
+optional fsync per journal batch; bearer-token authentication with editor
 and viewer roles, per-document access and roles, and tokens rotated without a
 restart (revoked sockets are closed); presence, limited in size and rate per
 connection; a bounded outgoing queue per connection (a client that reads too
-slowly is closed and resumes); an audit log of every access.
+slowly is closed and resumes); an audit log of every access; authoritative
+DOCX/PPTX formatting inspection over the joined socket, capturing committed
+content, native style projection and log position together, with retained
+immutable MCP pagination and conditional editing.
 
 Not yet:
 
@@ -1115,37 +1474,628 @@ Not yet:
   empty paragraph's mark (Word's paragraph-mark run properties). A jade
   editor client would realise marks the way the server's writer does
   (`JadeDocx::formatted`), not by applying them to its own document.
-  `read_document` (MCP) does not report formatting yet.
+  `read_document` (MCP) reports collaborative character overrides as UTF-8
+  spans, including explicit false values, with `formatting_scope` identifying
+  that partial view. `include_base_formatting` reads native resolved character
+  properties and paragraph styles through an authoritative server capture;
+  base styles are not replicated for optimistic local reads. A missing
+  collaborative override does not establish false.
   Formatting a story's last paragraph while it is empty (it has no atom to
   name it by); comments in notes (jade-core's comment commands edit
   `document.xml` only, and note runs carry no XML binding) and headers.
   Headers and footers are not modelled.
 * xlsx conditional formats and threaded comments; borders on whole rows
   and columns through `set_borders` (`set_format` takes edges for them);
-  the formats a file already had are not loaded into the model, so reads
-  list only what was written in the collaboration; note authors are not
-  modelled (jade records `jade`).
+  only editable base styles are imported, not conditional painting;
+  note authors are not modelled (jade records `jade`).
 * Tracked changes: paragraph splits and joins, tables and formatting are
   not tracked (jade cannot yet decide every paragraph-mark revision, and
   formatting revisions — `w:rPrChange` — are not modelled; convergent
   marks format deleted and inserted text alike, untracked); a file's
   paragraph-mark and formatting revisions are kept in jade but neither
-  shown nor decided; the tracking mode is the model's and is not written to
-  `settings.xml` (`w:trackRevisions`) nor read from it; decisions take whole
-  revisions, not part of one; jade's own editor still marks one's own
+  shown nor decided; decisions take whole revisions, not part of one;
+  jade's own editor still marks one's own
   insertion deleted instead of removing it (the intent API removes it).
 * docx structure of ragged and nested tables (their text is editable);
   text boxes inside text boxes or notes, and their geometry.
 * Access: SIGHUP (reloading tokens, reopening the audit log) is Unix-only;
   the tokens file is still polled everywhere.
-* Performance: the RGA is indexed (§4), but paragraph positions are still
-  recomputed by walking the model on each operation; sequenced formatting, comment,
-  note and text box operations are preflighted on a copy of the jade document; marks are
+* Performance: the RGA is indexed (§4), and consecutive committed text
+  insertions reuse the paragraph position index described below. Intent
+  resolution, optimistic local plans and structural operations still walk
+  the model. Sequenced formatting, comment,
+  note and text box operations are preflighted on a copy of the jade document;
+  note paragraph joins re-load the base file to refresh jade's XML bindings;
+  marks are
   realised on a fresh copy of the base document every time the file is
   written (one jade command per run of one value), and their coverage is
   recomputed by a sweep over the story (`O((n + m) log m)`) when asked;
   jade's xlsx editor rereads the workbook on every write. Fine for the first
   milestone, not for large documents.
-* pptx tables and formatting in slides, hidden slides, layouts, pictures
-  and grouping. jade's pptx writer rewrites and re-reads the package on
-  every edit.
+* pptx tables, layout changes and group creation/ungrouping. Existing group
+  children and pictures are supported; reads identify enclosing group numbers,
+  aspect locks, hidden slides and collaborative character overrides. Imported
+  inherited text styles and paragraph alignment are not replicated in the
+  optimistic read. An authoritative `include_base_formatting` capture resolves
+  shape character and paragraph properties through jade's native inheritance
+  chain, including theme values, before display autofit. Text in existing group
+  children is included; notes remain plain text. Soft breaks keep their native
+  paragraph properties, while UTF-8 offsets address the model's newline-separated
+  segments; fields keep cached authoring text. Native inspection formats a
+  private export and invokes jade's toolbar queries per native run and paragraph;
+  these queries rescan the shape, so a shape with many runs can cost quadratically.
+  jade's pptx writer rewrites and re-reads the package on every edit.
+
+
+### Opaque names in document URLs
+
+Document names remain logical UTF-8 names in registries, snapshots and MCP
+metadata. A URL carries one canonically percent-encoded path segment; the CLI
+and MCP share `document_socket_path`, and HTTP callers use `document_path`.
+Format detection parses the URI path separately from its authentication query
+and strictly decodes one segment once. Invalid escapes/UTF-8, decoded path
+separators and fragments are refused. A literal `%2F` therefore travels as
+`%252F`; `+` and space retain distinct identities. The Lean byte specification
+proves roundtrip, injectivity and delimiter exclusion, with an executable oracle
+compared against Rust. Actual HTTP uploads, socket edits and filesystem restore
+are checked separately by stateful PBT and process tests.
+
+
+### Recoverable resumption
+
+SDK resumption borrows the caller's replica and owns a staging copy in the
+opening future. Failed authentication/transport, cancellation and timeout leave
+the source available for retry. The future remains Send without requiring a
+Sync model. One overall deadline covers connection, upgrade, initial response
+and resending, rather than restarting at each phase; the default is ten seconds.
+A successful client has a fresh connection identity for conditional edits.
+
+Core resumption validates `answered <= processed_client_seq < next_client_seq`
+and requires each missed own commit to be at or below that watermark. It applies
+the complete catch-up to a clone before replacing confirmed state, optimistic
+view, pending operations, ticket counter or clock. Invalid prefixes cannot
+remove tentative edits before a later error is found. The watermark bound makes
+`processed_client_seq + 1` safe, and receiving beyond the last log position
+returns a typed error. Lean specifies the watermark, exact remaining-ticket
+membership and whole-batch rollback after any valid prefix; Rust model histories
+include remote commits, server refusals, malformed prefixes and retry. Socket
+histories additionally exercise credentials, deadlines, cancellation, partial
+resends and lost answers across DOCX/XLSX/PPTX. Retrying uses stable submission
+tickets and the sequencer's existing deduplication, not a new replica identity.
+
+Permission refusals follow the same durable ticket path as native guard refusals.
+The socket sends a refusal reason to the actor; current-connection ownership is
+checked before it advances the ticket, and the actor journals the rejection
+before replying. It does not decode the forbidden operation or register its
+author. A duplicate denied ticket cannot later commit after role promotion.
+Actor stateful histories interleave guard/access refusals, duplicates, socket
+replacement, checkpoints and restart. Real all-format tests lose a viewer's
+answer, restore from both journal and checkpoint, promote its token to editor,
+and verify the refused operation stays absent while a new ticket can commit.
+
+
+### Authenticated replica ownership
+
+A transport joins under its trusted grant name, which is the stable principal
+identity as well as the author label. The sequencer persists named bindings in
+the checkpoint's optional `owners` map and in an `Owned` record journaled
+atomically with `Joined`. No credential is persisted. Before replacing a
+replica's subscriber or clearing its presence, the actor calls `resume_as` to
+check both membership and principal equality. Failed authorization changes no
+room state, so a reader or another editor cannot consume the owner's tickets
+by stealing its public replica ID. Legacy unbound IDs are anonymous and cannot
+be claimed by an authenticated caller; users rejoin and reconcile retained
+pending edits. Equal configured names share a principal across credential/role
+rotation. A token reassigned to another name revokes its existing sockets.
+
+Lean proves the ownership guard and preservation boundaries. Stateful Rust
+histories check native actor behavior, refused attempts, immutable bindings,
+legacy metadata and checkpoint/journal restoration. All-format socket tests
+also verify active-owner edits and presence survive failed takeovers, and that
+credential rotation preserves ownership after restart. Torn-batch and injected
+append/fsync tests verify no welcome precedes its durable binding.
+
+
+### Verified TLS transport
+
+HTTP and WebSocket clients share TransportAddress: the absolute URI determines
+host, explicit/default port and encryption. Userinfo and invalid ports are
+refused. Secure endpoints load native trust roots (or explicit SSL_CERT_FILE /
+SSL_CERT_DIR paths) and complete Rustls chain and hostname validation before
+constructing the HTTP/WebSocket exchange. The crypto provider is explicit,
+avoiding process-global provider installation. A TLS failure has no plaintext
+fallback; connection/request deadlines include the handshake. Server-side TLS
+is terminated by a reverse proxy to the existing plain listener.
+
+MCP HTTPS discovery preserves the authority and emits WSS document paths. It
+accepts a root server address, keeps authentication in its explicit token or
+environment, and does not follow redirects. Its HTTP driver has a cancellation
+guard, so completion, refusal or dropped requests release the socket. Public
+URL-validation and join errors do not repeat the supplied URL or its query.
+Lean specifies the security gate and scheme preservation; Rust integration
+histories verify actual TLS, certificate/host failure, process/session restart,
+all-format native editing and connection cleanup using per-child trust bundles.
+
+
+### Bounded MCP input
+
+Stdio and embedded requests share a 16 MiB encoded-message bound. The incremental
+reader retains at most the bound plus one possible CR delimiter; once exceeded,
+it frees the payload and drains through LF (or EOF), refusing the complete
+record without parsing its valid-looking prefix. It recognizes CRLF even when
+split across reads, keeps partial input/drain state in the reader across future
+cancellation, and resets at every boundary. A rejected record returns -32600
+with null id; invalid UTF-8 returns -32700 and does not end the stream. Valid
+EOF-terminated requests remain supported. The counter specification and actual
+byte/reference histories are checked separately from JSON-RPC/edit execution.
+
+Document discovery bounds HTTP bodies to 8 MiB before decoding the typed list.
+Actual data frames determine the bound, including chunked bodies; incomplete,
+overlong or invalid bodies cannot publish a partial list. The HTTP driver guard
+still closes the connection on failure/cancellation. Existing deadlines apply
+to both plain and TLS transports. Tests exercise real stdio and HTTP framing;
+stateful PBT covers bounded retention, reset, UTF-8 fragmentation and refusal,
+while Lean reuses Upload's buffer admission proofs for record boundaries.
+
+
+### SDK outbound memory and ordering
+
+The replica's pending operations are the SDK writer's source. Its monotonic
+cursor clones and serializes one submission immediately before sending, using
+constant-time ticket lookup rather than copying the entire pending queue.
+There is no additional queue of serialized edits; one frame may be in flight.
+This bounds duplicate transport buffering, not application models, pending edit
+count, individual operation size or the number of concurrent inspection callers.
+Callers can use `settle_through` to limit outstanding work.
+
+Inspection registration captures an exclusive next-ticket boundary under the
+replica lock. The writer sends all earlier edits, then that inspection, before
+later edits. Cancelled unsent inspections disappear from the writer's source;
+in-flight responses remain correlated by request identifier. Unsent presence
+updates occupy one replaceable slot. With document/control work available,
+at most one presence update is sent between such messages, so continuous
+cursor updates cannot starve edits.
+
+Either socket half's terminal failure records the first cause, drains inspection
+waiters and wakes settlement. It also stops the other half, including a writer
+blocked on IO. Encoding failures take this same path rather than panicking with
+a poisoned replica lock. Pending operations remain available for disconnect and
+resume; offline optimistic editing can continue without accumulating serialized
+frames. Notifications are registered before checking source/error state to avoid
+lost wakeups.
+
+`lean/JadeCollab/ClientPump.lean` proves FIFO ticket selection, inspection
+boundaries, presence fairness/coalescing and preservation of the retry source in
+the abstract policy. It does not prove Rust locking, serialization or socket IO.
+Rust stateful PBT compares mixed submission, aborted planning, inspection,
+cancellation, presence, refusal and failure histories against an independent
+FIFO reference; a gated sink verifies one encoded edit during backpressure and
+inspection placement through a thousand-edit burst.
+
+
+### Bounded restoration and replica issuance
+
+Durable restoration validates checkpoint allocation/ownership metadata before
+publishing a room: origin is reserved, every issued replica is below the next
+id, and every owner belongs to an issued replica. Retained tails must fit both
+the checkpoint's contiguous log interval and its per-replica processed
+watermarks. Tail iteration enumerates actual entries without constructing a
+successor after the final position, so empty and nonempty tails ending at
+`u64::MAX` remain readable and resumable.
+
+Journal commits require the exact next log position. Commits and refusals for
+known replicas must strictly advance their processed ticket, retaining allowed
+gaps; invalid records are rejected before applying or materializing anything.
+Origin commits have ticket zero. This prevents a corrupted suffix from rolling
+back a refusal and reviving an answered edit. Repeated refusal records for
+unknown replicas still have no effect, matching the trusted core's live refusal
+semantics.
+
+`Sequencer::try_join` and `try_join_as` refuse exhaustion or invalid allocation
+metadata before changing any ids, processed entries or owner bindings. MAX is
+the exhausted next-id sentinel; MAX - 1 is the last issued id. The older `join`
+and `join_as` convenience methods panic on refusal; server transports use the
+checked methods. A refused join returns a protocol error without stopping the
+actor or replacing existing sockets. At a full log, new user operations receive
+journaled refusal verdicts, while origin edits refuse without mutation; existing
+replicas can still resume and export. Causes that may derive are staged with
+their entire suffix before publication, as described below.
+
+`lean/JadeCollab/RecoveryBounds.lean` proves bounded fresh issuance, monotonic
+replay watermarks, refusal of repeated/older tickets and tail-position bounds,
+including empty tails at the limit. It abstracts parsing, IO and materialization.
+Stateful Rust histories use u128 reference counters near u64 limits across
+joins, replays, compaction, corrupted suffixes and restarts. Native tests seed
+boundary checkpoints for DOCX, XLSX and PPTX, retain the final admitted replica
+across restarts, refuse further joins and edits, and check unchanged exports and
+fault-free resumability.
+
+
+### Atomic planning of native derived edits
+
+Before applying a new submission, the sequencer asks the materializer's pure
+`may_derive` classification. Potential causes execute on independent model and
+file copies returned by `Materializer::fork`. DOCX clones its native document
+and numbering bindings; XLSX exports and reopens its package. Normal typing,
+formatting and cell values avoid this copy, as do all current PPTX operations.
+The classifier must return true for every cause whose derivation can produce
+operations or an error. A custom materializer must preserve this contract and
+ensure writes on a fork cannot affect the original or external live resources.
+
+The stage applies and materializes the cause, computes its actual derived
+suffix, checks all remaining log positions, then applies/materializes every
+child in order. Failure to fork, derive, allocate positions or materialize any
+staged effect discards the whole plan. Only the live processed ticket advances,
+with a durable refusal record so retries cannot revive that operation. Success
+installs the staged file/model and appends the cause plus every child in one
+actor journal batch before any acknowledgement or checkpoint. Earlier log
+entries, pending derived buffers, owner bindings and existing faults stay owned
+by the live sequencer. Replay applies recorded facts without staging or deriving
+again. Unexpected live failures use the quarantine/recovery boundary below.
+
+This uses the exact suffix rather than rejecting from an upper bound. An edit
+that actually derives nothing can consume the final log position even if its
+classification requires staging. XLSX origin Lamport ids use checked addition;
+zero actual allocations remain valid at MAX, an exact allocation can use MAX,
+and overflow discards the stage without changing the workbook. The cost of
+copying/parsing a native package applies to potential derived causes, such as
+DOCX comments/notes and XLSX table structure/header edits.
+
+Materializer API changes: implementations must provide `may_derive` and `fork`;
+`derived` now returns `Result<Vec<Op>, Rejection>`. Direct callers must handle
+that result. The workspace adapters, tests and benchmarks use the fallible API.
+
+`lean/JadeCollab/DerivedBatch.lean` proves all-or-none model/file/log publication,
+exact-fit admission, non-revival of refused tickets, bounded origin allocation
+and composition with the atomic journal batch specification. It abstracts native
+fork isolation, parsing, locking and IO. Rust stateful PBT compares mixed staged
+causes, invalid final children, duplicates, compaction and recovery with u128
+counter/list models. Fault injection covers fork and child materialization
+errors. Native socket tests cover DOCX numbering and XLSX table changes at log
+and Lamport limits, exact/empty suffixes, byte-identical exports after refusal,
+and both checkpoint and journal-only restart paths.
+
+
+### Office package budgets at the service boundary
+
+The current engine already enforces shared `jade_opc::PackageLoadLimits` for
+DOCX, XLSX and PPTX: 128 MiB archive bytes, 10,000 ZIP entries, 64 MiB per
+inflated part and 256 MiB total inflated parts. The service retains these checks
+rather than inflating a second copy for preflight. Central-directory declarations
+are checked before loading parts; actual decompressor output is independently
+bounded with a remaining-budget read plus one sentinel byte. Failed reads do
+not advance the running expanded-byte count. These limits bound package bytes,
+not every allocation of ZIP metadata or the XML/document parsers.
+
+The HTTP compressed-body bound remains separate (64 MiB by default, with 413
+on excess). Engine package/parse failures return 400 through normal open
+errors. Every failed upload, including native open errors and name conflicts,
+is audited once with document name, configured token name and status; payloads,
+raw credentials and decoder error text are omitted. No failed open publishes a
+room or initializes durable document storage, and a later valid upload may use
+the same name. Existing rooms remain available.
+
+Native protocol tests construct small ZIPs with excessive declared part/total
+sizes or 10,001 entries and assert each format's resource-specific refusal,
+absence of storage, live-room export and retry success. Stateful histories mix
+fragmented uploads, editor/viewer roles, malformed ZIPs, resource failures,
+conflicts and server restarts against an independent publication model.
+Additional PBT exercises the actual engine read helper with fragmented logical
+parts and injected IO failures, checking accepted bytes, sentinel reads,
+unchanged counters after failure and bounded successful histories.
+`lean/JadeCollab/PackageBudget.lean` proves this accounting contract, exact-cap
+acceptance, cap-plus-one refusal and independent metadata/actual admission.
+It abstracts ZIP/XML parsing, IO scheduling and total parser heap use.
+
+
+### DOCX table expansion and sparse traversal
+
+New DOCX table operations may create/enumerate at most 10,000 cell positions.
+`InsertTable` checks the row/column product with checked multiplication before
+constructing stories. A new row/column counts all stored opposite-axis lines,
+including tombstones: those historical positions also receive stories for
+concurrent edits. Merge/unmerge validates its rectangle before collecting the
+Cartesian positions. Exact fits succeed; an excessive or overflowing product
+refuses without changing tables, observed Lamport time or optimistic state.
+Deleting lines/tables remains available, and small incremental changes can grow
+a document beyond this per-operation bound. This is not a total-document or
+parser-heap limit.
+
+The model and native materializer both check new-request admission before cell
+expansion. Index-based merge/unmerge intents check before calling the ID
+allocator. A merge/unmerge needing zero new stories uses an unused origin
+sentinel and never reserves an ID, so it still works at clock exhaustion.
+
+Resource policy does not invalidate historical facts. `Document::apply_recorded`
+defaults to `apply`; DOCX overrides it to retain logical validation while skipping
+only the new-request expansion policy. Sequencer recovery and replica downstream
+application use this trusted hook after log/ticket validation. New submissions,
+optimistic local operations and pending replay still use ordinary `apply`.
+The hook must agree with ordinary application for currently admitted operations;
+it must never be used to admit an untrusted client submission. This preserves
+old large table records and existing checkpoint shapes without weakening
+logical checks such as distinct IDs and valid grid operations.
+
+Table paragraph walking maps live row/column IDs to indices, filters the stored
+layout and sorts those cells in grid order. It no longer scans the Cartesian
+row/column product of sparse imported merges. Tombstoned positions stay hidden,
+while stories moved by merges or deletion retain their original stable IDs.
+
+Stateful PBT checks incremental row/column edits, deletion, refused large
+creation, serialization and clock invariants. Sparse traversal is compared with
+a row-major reference under reordered IDs and tombstones; a 100-million-position
+grid with two stored cells exercises sparse output. Native tests edit and export
+a 10,001-column merged import, account for its tombstoned columns during refused
+row insertion, and test durable raw-socket refusals, duplicate tickets and ID
+reuse across checkpoint and journal-only restarts. `TableWork.lean` proves bounded
+products/refusal, admission versus recorded meaning, zero-ID allocation and
+sparse output bounds; native parser behavior and ordering remain Rust test
+obligations.
+
+### Materialized text boundaries
+
+`jade_collab_core::text` checks the XML 1.0 scalar ranges, returning the first
+invalid codepoint and UTF-8 byte offset without changing or escaping input.
+DOCX checks body/tracked text, revision dates, comment text/metadata, new
+note/text-box text, author names and string formatting attributes. The check
+runs in pure submission validation before author registration, and in logical
+application before model/clock mutation. It also applies to replayed operations:
+XML-forbidden content is a logical error rather than a resource-policy override.
+Existing comment/new-story whitespace and line-break rules remain in force.
+
+XLSX checks formulas, sheet names, table headers and string format attributes.
+After stripping a leading `=`, an empty/whitespace-only formula is refused;
+cell numbers must be finite. Cell text and legacy notes use the engine's
+SpreadsheetML xstring encoder and accept all Rust Unicode scalars, including
+NUL and literal escape-shaped text. They must not be filtered by the plain XML
+predicate. PPTX retains jade's existing character/paragraph policy and native
+format validation; multiline intents produce individual paragraph splits.
+
+This addresses deterministic unwritable inputs before materialization; it is
+not a proof that arbitrary native editor failures or IO errors are transactional.
+Independent native stages discard failed plans; unexpected live errors quarantine
+the instance as specified below.
+Scalar PBT uses independent numeric intervals and checks first-error byte
+positions. Native stateful histories interleave good/bad text, tracked dates,
+formula/cell/note writes, changed duplicate payloads, compaction and checkpoint
+restore. After every transition the exported file is reopened and compared
+with independent string/register references. Field mutation matrices check
+metadata and format strings. CLI invalid arrays submit no valid prefix; MCP
+receipts resolve refusals and keep pinned reads and subsequent edits usable.
+Lean's `TextBoundary` proves scalar/field admission, refusal preservation,
+duplicate suppression, valid-history preservation and agreement under the
+explicit assumption of successful lossless native materialization. Rust tests
+check the actual escaping, serialization, formula normalization and IO paths.
+
+
+### Unexpected native failures and recovery
+
+`Materializer::materialize` can return an error after partially changing the
+native file. The logical model has already applied its effect. The sequencer
+therefore records the diagnostic and fences that runtime instance. It returns
+`SubmitOutcome::Failed(SyncError::Materialization)` without a downstream message
+or journal record, restores the submitting replica's prior processed watermark,
+and leaves the committed log prefix unchanged. This is an unknown outcome for
+the client. Later submissions, access refusals, joins, resumption, replay and
+origin commits cannot advance the failed instance. Checked model/native access
+and checkpoint capture return the failure; legacy infallible accessors panic.
+Log positions, watermarks and fault strings remain available for diagnostics.
+
+No rollback of the partially changed live model/file is assumed. The actor
+terminates before journaling, checkpointing, broadcasting or returning an edit
+verdict, closing all of that room's subscribers and pending requests. Other
+rooms remain usable. Native author-registration errors take the same fatal
+path; a successfully journaled author commit remains a valid prefix if the
+following text write fails. Failed replay aborts room opening and name
+publication without rewriting stored files or journals. Checkpoints carrying
+legacy native faults are refused by checked restoration.
+
+With durable storage, restart loads an independent healthy file/checkpoint and
+journal prefix. The SDK retains its disconnected replica and pending ticket;
+resume reconciles that prefix and retries the unprocessed operation once.
+A second retry is a duplicate. A non-durable room requires an independently
+saved healthy state; its quarantined instance cannot supply one. Expected input
+constraints still belong in pure validation/admission. Failed independent
+stages remain atomic durable refusals, and their temporary failure diagnostics
+never poison the live instance. Ordinary writes do not need native forks.
+
+Rust stateful PBT mixes live errors before/after partial writes, staged refusals,
+changed duplicates, compaction, checkpoints, replay and exact-ticket retries
+against an independent sorted-multiset and counter reference. Real native
+DOCX/XLSX/PPTX socket tests inject failures before and after writes on both
+checkpoint and journal-only paths: observers see only the healthy prefix,
+clients retain unknown edits, exports become unavailable, restart reproduces
+byte-identical healthy files, and pending retries commit once. Further tests
+cover failed stored replay without durable mutation and DOCX origin-author
+failure on either side of successful author registration.
+
+`lean/JadeCollab/NativeFailure.lean` proves quarantine through arbitrary later
+histories, no verdict/commit/watermark advancement on live failure, snapshot
+refusal, isolated stage preservation and non-revival, recovery discarding every
+partial write, restored agreement and exactly-once successful retry. It models
+successful native writes, fork isolation and healthy journal IO as assumptions;
+Rust exercises those implementation boundaries. It does not prove native IO
+transactional or recover state from a quarantined file.
+
+
+### Authenticated author identity at configuration and file boundaries
+
+`Grant::name` identifies a principal and labels its tracked DOCX revisions.
+`Tokens::from_json` requires a nonblank name (`trim` tests emptiness only) and
+valid XML 1.0 scalars, independently of role or document scope. Accepted names
+retain their exact UTF-8 bytes. The entire table is parsed/validated before
+`set_tokens` publishes it, so invalid names during reload cannot partially add
+credentials, change roles or revoke the existing connections. Validation errors
+identify the constraint/codepoint without including bearer credentials.
+
+The actor checks the native health boundary after any `commit_origin` error
+while registering an author. An unexpected native error still stops the room
+with an unknown edit outcome. A healthy logical refusal instead processes and
+journals a refusal of the client ticket before replying, and never applies the
+tracked edit. Changed duplicate payloads cannot revive that refused ticket,
+including after checkpoint or journal-only restart. A later valid ticket can
+register the author and edit normally. Successful author metadata remains an
+independent ordered commit as documented under native failure recovery.
+
+The current native revision parser returns lexical XML attribute values.
+`JadeDocx::load` decodes the just-parsed revision metadata exactly once,
+including nested insertion/deletion layers, before the model groups revisions.
+Equivalent entity spellings therefore identify the same author/date/file ID.
+Live command values and `JadeDocx::new` are already logical strings and are not
+unescaped; literal text such as `&amp;` or `&#9;` must remain literal text.
+
+At the package boundary, literal TAB/LF/CR in author/date metadata on import
+follows XML attribute normalization (including a single space for CRLF).
+Character references preserve their represented whitespace. Export and base
+checkpoint export encode authored TAB/LF/CR as numeric character references,
+so conforming XML consumers preserve the logical label. This targets UTF-8
+WordprocessingML `author`, `date` and `dateUtc` attributes; it does not rewrite
+text nodes, other attributes, namespace spelling, existing entity references
+or unrelated XML/binary parts. Package writes reuse unchanged compressed
+payloads. The adapter uses the existing quick-xml version and leaves the native
+engine submodule unchanged. Native writes keep their ordinary fast path;
+package normalization runs at load/export boundaries.
+
+Native actor regressions verify no unattributed commit, unchanged file bytes,
+durable processed refusal, changed duplicate suppression and later valid edits
+on both checkpoint and journal-only paths. Stateful socket PBT mixes rejected
+configuration reloads before/after registration, viewer/editor transitions,
+credential rotation, tracked edits and durable restarts. Independent edit
+counters and tracked-character references check exact authors in the client
+model and exported/reopened native file after every transition. Scalar PBT
+checks admission with a numeric XML reference, and direct file tests cover
+entity aliases, nested revision layers, literal entity-shaped names and
+repeated whitespace-preserving export/reopen cycles.
+
+`lean/JadeCollab/AuthorIdentity.lean` proves eighteen properties of name/table
+admission, preservation of old grants on bad reload, exact accepted identities,
+no author/content mutation on prerequisite or viewer refusal, duplicate ticket
+non-revival, author-before-edit ordering, and a lossless attribute token codec
+with one decoding pass. Unicode blankness, XML lexical tokenization/CRLF
+normalization, native application, journal IO and socket delivery are abstract
+boundaries checked by Rust; fatal native failures remain specified separately.
+
+
+### Runtime DOCX text position index
+
+Consecutive committed `InsertText`/`TrackInsertText` operations use an optional
+position index. After a successful first insertion, its canonical walk records visible atom
+locations, per-paragraph atom membership, story-first paragraphs and successors
+within each story. The RGA's actual visible predecessor determines a new run's
+position: a character contributes its UTF-8 width, an anchor contributes its
+ordinal among zero-width anchors, and a paragraph mark selects the next
+paragraph of that same story, skipping interleaved cells/notes/text boxes.
+
+Only locations in the edited paragraph are revisited. Characters and the ending
+mark at or after the insertion offset move by the inserted UTF-8 byte length.
+An anchor at the exact same byte position moves only if its anchor ordinal is
+after the caret. New characters get their cumulative UTF-8 offsets and the
+caret's anchor count. Other paragraphs' locations and all existing anchor
+counts/widths remain unchanged. Position maintenance costs
+`O((P + M) log(N + M + 1))` for `P` existing atoms in the edited paragraph,
+`M` inserted characters and `N` indexed atoms plus paragraphs. Empty paragraphs
+therefore count in the index size too. Initial construction performs one
+canonical walk, followed by `O(N log(N + 1))` indexing; the walk has its own
+costs, including tombstones and stored grid structure. These bounds describe
+position maintenance, not RGA chunk maintenance, native engine work or intent
+resolution.
+
+Every other operation disables and discards the index before it can query or
+change topology. Internal structural queries keep using the canonical walk;
+the next committed text insertion builds from the resulting document.
+Ambiguous visible IDs in legacy/raw models disable acceleration rather than
+changing the canonical lookup's interpretation. Invalid insertion ranges or
+missing parents are refused before any cold projection. A failed RGA insertion
+restores the previous warm index, so repeated refusals cannot force rebuilding
+it or change logical document state.
+
+The index is runtime-only, excluded from serialization and model equality.
+Cloning starts cold rather than copying a document-sized map; immutable model
+sharing retains `Send + Sync` through a private mutex. Optimistic contexts
+(`seq: None`) keep the canonical walk, avoiding a new whole-document index on
+every short-lived SDK edit plan. Checkpoints and restore never carry stale
+positions. Normal server text editing requires no native file forks.
+
+A regression first measured two full document projections for one insertion in
+5,000 paragraphs. The accelerated path performs one warm-up projection and no
+full projections for subsequent edits, with repair counters bounded by the
+edited paragraph. Stateful PBT compares all returned effects and logical JSON
+against a forced canonical walk, mixing generated structures/revisions with
+UTF-8 typing bursts, several replicas, clone and JSON restoration. Direct cases
+exercise anchors at equal byte offsets, story successors, hidden deleted notes,
+legacy aliases, immutable sharing and unchanged snapshot representation.
+Existing native file/session/socket histories check the same accelerator against
+DOCX materialization, exports, checkpoints and reconnection.
+
+`lean/JadeCollab/TextPositions.lean` proves twenty-two properties of offset repair,
+anchor ties, UTF-8 prefix widths, unaffected paragraphs, structural invalidation,
+cold/warm canonical lookup and at-most-one full projection per eligible consecutive
+committed text segment. RGA predecessor lookup, canonical walk fidelity,
+UTF-8 widths, map/mutex implementation and native execution remain assumptions
+checked by Rust; this is not a proof of end-to-end latency.
+
+
+### Global DOCX flow atom identity
+
+DOCX paragraph location and revision maps address flow atoms by ID across all
+stories. Previously, per-story RGA duplicate checks let a client reuse its own
+note character ID as a new body character: the model inserted in the body while
+global lookup selected the existing note location. A real socket regression
+first demonstrated that this submission was committed instead of refused.
+
+Peer admission now checks complete new atom ranges against every stored story.
+This includes normal/tracked text, paragraph marks, note anchors plus their
+implicit leading tab/text, and text box anchors/text. Deleted atoms and stories
+retain their reservations. Checks use Unicode scalar counts and checked ID
+range ends; the owner is part of identity, and unused older clock slots remain
+valid. Each story probes the shorter of the new ID run or its stored atoms, so
+ordinary typing uses hash lookups without walking all document atoms.
+
+The pure check runs in SDK planning and server submission admission, before
+author registration, native staging/writes or log publication. A server refusal
+advances only the processed ticket, so changed duplicates cannot revive it.
+Existing recorded facts and snapshots keep their original content; the policy
+does not rewrite their IDs. Internal structural story keys and formatting write
+stamps retain their existing allocation rules.
+
+Field/range tests cover collisions at the start and inside implicit runs, all
+story kinds, tombstones, hidden cells/notes/boxes, clone/JSON restore and exact
+identifier exhaustion. Stateful native PBT uses an independent retained-ID list
+while interleaving fresh edits, splits, note/box creation/deletion, collisions,
+changed duplicates, SDK refusals and checkpoint restoration; exported/reopened
+DOCX geometry agrees after every transition. Socket tests verify refusal before
+author registration, unchanged export bytes, durable processed watermarks,
+non-revival and a later valid authored edit after checkpoint/journal recovery.
+
+`lean/JadeCollab/AtomIdentity.lean` proves sixteen properties of this admission
+contract, including global uniqueness across arbitrary admitted histories and
+reservation persistence through visibility changes and internal uniqueness of
+contiguous runs. Native execution, Rust field extraction, bounded arithmetic and snapshot IO
+are explicit assumptions checked by Rust.
+
+
+### Native joins after trailing references
+
+A stateful tracked-change history found a native backspace failure when a first
+paragraph ended with an endnote reference and the second hosted a text box.
+The native collapsed-delete path removed the second host while its box surfaces
+were temporarily absent, then failed its paragraph-count guard before moving
+the runs. Whole-file reloading did not fix that structural failure.
+
+The adapter now reuses its anchor-aware positional placeholder helper for a
+range join after all trailing references. The placeholder puts those references
+strictly before the selected break; removing its exact position after the join
+keeps both paragraphs' user text, revisions, references and boxes. Existing
+characters equal to the placeholder are preserved. This path restores its saved
+native document if a helper step fails. Ordinary joins without trailing anchors
+keep their existing direct range command, and native note joins retain their
+binding refresh. No native engine changes are required.
+
+The saved PBT seed includes endnote creation/splitting, table insertion/merge, an
+empty text box and a body join in a file with duplicate revision labels. A
+focused regression covers empty/nonempty boxes, restore before joining and two
+differently authored tracked X runs equal to the helper character. Model/file
+geometry and revision metadata agree before and after export/reopen. Three
+additional `TextPositions.lean` theorems prove positional cleanup's exact atom
+order, anchor projection and preservation of matching user atoms; actual native
+XML edits and offset mapping remain Rust verification boundaries.

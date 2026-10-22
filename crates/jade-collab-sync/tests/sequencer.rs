@@ -6,6 +6,39 @@ use jade_collab_core::id::{Id, ReplicaId};
 use jade_collab_sync::protocol::{Downstream, Submission};
 use jade_collab_sync::{Sequencer, SubmitOutcome};
 
+#[test]
+fn access_refusals_advance_the_watermark_and_cannot_commit_after_promotion_or_restore() {
+    let mut server = Sequencer::new(ToyDoc::sample());
+    let replica = server.join().replica;
+    let refused = server.reject(replica, 1, jade_collab_sync::Rejection::new("read-only"));
+    assert!(matches!(refused, SubmitOutcome::Rejected(_)));
+    assert_eq!(server.processed_client_seq(replica), 1);
+    assert_eq!(server.seq(), 0);
+    let mut restored = Sequencer::restore(server.checkpoint(), jade_collab_sync::NoMaterializer);
+    let submit = Submission {
+        client_seq: 1,
+        base_seq: 0,
+        op: insert(5, replica, Some(origin(2)), 'c'),
+    };
+    assert_eq!(
+        restored.submit(replica, submit.clone()),
+        SubmitOutcome::Duplicate
+    );
+    assert_eq!(
+        restored.reject(replica, 1, jade_collab_sync::Rejection::new("read-only")),
+        SubmitOutcome::Duplicate
+    );
+    assert_eq!(restored.seq(), 0);
+    assert_eq!(restored.document(), &ToyDoc::sample());
+    let mut next = submit;
+    next.client_seq = 2;
+    assert!(matches!(
+        restored.submit(replica, next),
+        SubmitOutcome::Committed(_)
+    ));
+    assert_eq!(restored.seq(), 1);
+}
+
 fn insert(lamport: u64, replica: ReplicaId, parent: Option<Id>, ch: char) -> ToyOp {
     ToyOp::Insert {
         id: Id::new(lamport, replica),
@@ -174,6 +207,13 @@ fn every_outcome_has_a_downstream_message() {
 struct NoMerges;
 
 impl jade_collab_sync::Materializer<ToyDoc> for NoMerges {
+    fn may_derive(&self, _: &ToyDoc, _: &ToyOp) -> bool {
+        false
+    }
+    fn fork(&self, _: &ToyDoc) -> Result<Self, String> {
+        Ok(Self)
+    }
+
     fn admit(&self, _: &ToyDoc, op: &ToyOp) -> Result<(), jade_collab_sync::Rejection> {
         match op {
             ToyOp::Grid(GridOp::Merge(_)) => {

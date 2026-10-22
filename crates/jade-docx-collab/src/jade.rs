@@ -14,8 +14,8 @@ use jade_docx_document_core::word_document::{
 };
 use jade_docx_document_core::Options;
 use jade_docx_headless_api::{
-    HeadlessCommand, HeadlessDeleteDirection, HeadlessEditRequest, HeadlessRevisionKindFilter,
-    HeadlessRevisionTarget, HeadlessShapeKind, HeadlessTableCellSelection,
+    HeadlessCommand, HeadlessEditRequest, HeadlessRevisionKindFilter, HeadlessRevisionTarget,
+    HeadlessShapeKind, HeadlessTableCellSelection,
 };
 
 use crate::model::{DocxEffect, DocxModel, DocxOp, FormatChange, NoteKind, Numbered, StoryId};
@@ -46,7 +46,8 @@ pub struct JadeDocx {
 }
 
 impl JadeDocx {
-    pub fn new(word: WordDocument) -> Self {
+    pub fn new(mut word: WordDocument) -> Self {
+        crate::bindings::refresh(&mut word);
         Self {
             word,
             numbered: BTreeMap::new(),
@@ -82,34 +83,57 @@ impl JadeDocx {
     }
 
     pub fn load(bytes: &[u8]) -> Result<Self, String> {
-        block_on(WordDocument::load(bytes, &Options::default()))
-            .map(Self::new)
-            .map_err(|e| e.to_string())
+        let bytes = crate::revision_metadata::read_package(bytes)?;
+        let mut word = block_on(WordDocument::load(&bytes, &Options::default()))
+            .map_err(|error| error.to_string())?;
+        crate::revision_metadata::loaded(&mut word)?;
+        Ok(Self::new(word))
     }
 
     pub fn word(&self) -> &WordDocument {
         &self.word
     }
 
+    /// Restore the base file alongside its authoritative model. Older
+    /// checkpoints may predate persistence of the tracking setting.
+    pub fn restore(bytes: &[u8], model: &DocxModel) -> Result<Self, String> {
+        let mut jade = Self::load(bytes)?;
+        if crate::settings::tracking(jade.word())? != model.tracking() {
+            crate::settings::set_tracking(&mut jade.word, model.tracking())?;
+        }
+        Ok(jade)
+    }
+
     /// The file with the model's formatting: what users download.
     pub fn export(&self, model: &DocxModel) -> Result<Vec<u8>, String> {
-        self.formatted(model)?
+        let bytes = self
+            .formatted(model)?
             .export_docx()
-            .map_err(|e| e.to_string())
+            .map_err(|error| error.to_string())?;
+        crate::revision_metadata::write_package(&bytes)
     }
 
     /// The base file, without the model's marks: what a checkpoint stores
     /// next to the model, which holds the marks.
     pub fn export_base(&self) -> Result<Vec<u8>, DocxExportError> {
-        self.word.export_docx()
+        let bytes = self.word.export_docx()?;
+        crate::revision_metadata::write_package(&bytes).map_err(|error| {
+            DocxExportError::Xml(jade_docx_document_core::docx_xml::DocxXmlError::Malformed(
+                error,
+            ))
+        })
     }
 
     /// A copy of the document showing the model's formatting: each run of
     /// characters a mark sets gets that value explicitly; everything else
-    /// keeps jade's own formatting.
+    /// keeps jade's own formatting. The persisted tracking switch also
+    /// reflects the model, including models from older checkpoints.
     pub fn formatted(&self, model: &DocxModel) -> Result<WordDocument, String> {
         let formatting = model.formatting();
         let mut copy = JadeDocx::new(self.word.clone());
+        if crate::settings::tracking(copy.word())? != model.tracking() {
+            crate::settings::set_tracking(&mut copy.word, model.tracking())?;
+        }
         for format in formatting {
             let surface = copy.surface(&format.paragraph)?;
             let command = copy.format_command(surface, format.start, format.end, format.change)?;
@@ -389,6 +413,7 @@ impl JadeDocx {
     }
 
     fn run(&mut self, command: HeadlessCommand) -> Result<(), String> {
+        crate::bindings::refresh(&mut self.word);
         let description = format!("{command:?}");
         apply_headless_commands_to_document(
             &mut self.word,
@@ -586,27 +611,47 @@ impl JadeDocx {
     /// Joins the paragraph at `at` (its text `len` bytes long) with the next
     /// paragraph of its story, which jade must list right after it.
     fn join(&mut self, at: &ParagraphStory, len: usize) -> Result<(), String> {
+        if matches!(
+            at,
+            ParagraphStory::Footnote { .. } | ParagraphStory::Endnote { .. }
+        ) {
+            // Editing the host can leave jade's note XML bindings stale.
+            // Rebind from the persisted parts before moving note runs so
+            // the merge keeps the second paragraph's text and revisions.
+            let bytes = self.export_base().map_err(|e| e.to_string())?;
+            self.word = Self::load(&bytes)?.word;
+        }
         let (first, second) = (self.surface(at)?, self.surface(&next_paragraph(at))?);
         if first + 1 != second {
             return Err(format!(
                 "jade lists a text box or note between {at:?} and the next paragraph"
             ));
         }
-        // A ranged join starts at the first paragraph's rendered end, before
-        // a trailing text box or note reference, and would drop it; deleting
-        // the break from the second paragraph's start keeps it.
+        // Keep trailing references on the first side of the range using the
+        // same temporary placeholder as anchor-aware splits. A collapsed
+        // backspace can lose the second paragraph's text box surfaces while
+        // removing its host, before moving those runs into the first.
         let trailing = self
             .word
             .paragraph_anchors(first)
             .iter()
             .any(|a| a.offset == len);
         if trailing {
-            return self.run(HeadlessCommand::DeleteText {
-                paragraph: second,
-                offset: self.rendered(second, 0),
-                direction: HeadlessDeleteDirection::Backward,
-                count: 1,
-            });
+            let anchors = self.word.paragraph_anchors(first).len();
+            let end_offset = self.rendered(second, 0);
+            return self.at_anchors(
+                first,
+                len,
+                anchors,
+                |offset| HeadlessCommand::ReplaceRange {
+                    start_paragraph: first,
+                    start_offset: offset,
+                    end_paragraph: second,
+                    end_offset,
+                    text: String::new(),
+                },
+                None,
+            );
         }
         let command = HeadlessCommand::ReplaceRange {
             start_paragraph: first,
@@ -745,8 +790,9 @@ impl JadeDocx {
                 start,
                 end,
             } => return self.decide_range(&paragraph, start, end, false, true),
-            // The mode lives in the model; jade's session is set per edit.
-            DocxEffect::SetTracking { .. } => return Ok(()),
+            DocxEffect::SetTracking { on } => {
+                return crate::settings::set_tracking(&mut self.word, on)
+            }
             DocxEffect::SplitParagraph {
                 paragraph,
                 offset,
@@ -1052,18 +1098,33 @@ fn next_paragraph(at: &ParagraphStory) -> ParagraphStory {
 }
 
 impl Materializer<DocxModel> for JadeDocx {
+    fn may_derive(&self, _: &DocxModel, cause: &DocxOp) -> bool {
+        !self.fresh.is_empty()
+            || matches!(
+                cause,
+                DocxOp::AddComment { .. }
+                    | DocxOp::ReplyToComment { .. }
+                    | DocxOp::InsertNote { .. }
+            )
+    }
+    fn fork(&self, _: &DocxModel) -> Result<Self, String> {
+        Ok(self.clone())
+    }
+
     /// The numbers jade gave what `cause` made, for the model to record.
-    fn derived(&mut self, _: &DocxModel, _cause: &DocxOp) -> Vec<DocxOp> {
-        std::mem::take(&mut self.fresh)
+    fn derived(&mut self, _: &DocxModel, _cause: &DocxOp) -> Result<Vec<DocxOp>, Rejection> {
+        Ok(std::mem::take(&mut self.fresh)
             .into_iter()
             .map(|(item, file_id)| DocxOp::Numbered { item, file_id })
-            .collect()
+            .collect())
     }
 
     fn admit(&self, model: &DocxModel, op: &DocxOp) -> Result<(), Rejection> {
+        model.check_table_budget(op)?;
         if matches!(
             op,
             DocxOp::Format { .. }
+                | DocxOp::SetTracking { .. }
                 | DocxOp::AddComment { .. }
                 | DocxOp::ReplyToComment { .. }
                 | DocxOp::ResolveComment { .. }

@@ -48,6 +48,7 @@ pub enum RgaError {
     DuplicateId(Id),
     MissingParent(Id),
     MissingTarget(Id),
+    IdentifierOverflow,
     /// The RGA skip rule needs every atom to be newer than its parent.
     NotNewerThanParent {
         id: Id,
@@ -61,6 +62,7 @@ impl fmt::Display for RgaError {
             RgaError::DuplicateId(id) => write!(f, "atom {id} already exists"),
             RgaError::MissingParent(id) => write!(f, "parent atom {id} does not exist"),
             RgaError::MissingTarget(id) => write!(f, "atom {id} does not exist"),
+            RgaError::IdentifierOverflow => f.write_str("identifier space exhausted"),
             RgaError::NotNewerThanParent { id, parent } => {
                 write!(f, "atom {id} is not newer than its parent {parent}")
             }
@@ -405,10 +407,12 @@ impl<T> Rga<T> {
         }
         let place = self.integration_point(first, parent)?;
         let count = values.len() as u64;
+        let last = first
+            .last_in_run(count)
+            .map_err(|_| RgaError::IdentifierOverflow)?;
         // Of the run's later ids already present, report the first in
         // document order — by lookup, or by a scan when that is shorter.
-        let taken =
-            |id: &Id| id.replica == first.replica && *id > first && *id < first.offset(count);
+        let taken = |id: &Id| id.replica == first.replica && *id > first && *id <= last;
         let existing = if count as usize > self.len {
             self.iter().map(|node| node.id).find(taken)
         } else {

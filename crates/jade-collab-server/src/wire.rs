@@ -32,9 +32,7 @@ impl Format {
     /// The format of the document a socket URL
     /// (`ws://host/documents/{name}/ws`) names.
     pub fn of_url(url: &str) -> Option<Self> {
-        let path = url.trim_end_matches('/');
-        let path = path.strip_suffix("/ws").unwrap_or(path);
-        Self::of(path.rsplit('/').next()?)
+        Self::of(&crate::document_name_from_url(url)?)
     }
 
     /// The file extension, without the dot.
@@ -59,6 +57,11 @@ pub enum ClientMessage {
         seq: u64,
     },
     Submit(Submission<Value>),
+    /// Read the committed model and native formatting at one log position.
+    /// Correlation ids are independent of editing tickets; never logged.
+    Inspect {
+        request: u64,
+    },
     /// Ephemeral state for the others to see (a cursor, a selection, …);
     /// replaces this replica's previous presence. Never logged.
     Presence {
@@ -81,6 +84,16 @@ pub enum ServerMessage {
     },
     Committed(Committed<Value>),
     Rejected(Rejected),
+    Inspected {
+        request: u64,
+        seq: u64,
+        snapshot: Value,
+        formatting: Value,
+    },
+    InspectionFailed {
+        request: u64,
+        message: String,
+    },
     /// Another replica's presence; `name` is its token's name, if the server
     /// has tokens.
     Presence {

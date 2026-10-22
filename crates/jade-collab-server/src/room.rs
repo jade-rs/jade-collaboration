@@ -1,5 +1,13 @@
 //! One document's actor thread.
 
+#[cfg(test)]
+mod author_tests;
+
+#[cfg(test)]
+pub(crate) mod failure_tests;
+#[cfg(test)]
+mod tests;
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -7,7 +15,9 @@ use std::thread;
 
 use jade_collab_core::id::ReplicaId;
 use jade_collab_sync::protocol::{Committed, Submission};
-use jade_collab_sync::{Document, Materializer, Record, Sequencer, SubmitOutcome, SyncError};
+use jade_collab_sync::{
+    Document, Materializer, Record, Rejection, Sequencer, SubmitOutcome, SyncError,
+};
 use jade_docx_collab::{DocxModel, DocxOp, JadeDocx};
 use jade_pptx_collab::{JadePptx, PptxModel};
 use jade_xlsx_collab::{JadeXlsx, LoadOptions, XlsxModel};
@@ -16,6 +26,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::oneshot;
 
+use crate::mailbox;
 use crate::storage::{DocumentStore, StorageOptions};
 use crate::wire::{Format, ServerMessage};
 
@@ -23,10 +34,12 @@ pub(crate) use crate::outbox::Outbox;
 
 pub(crate) enum Command {
     Join {
+        principal: Option<String>,
         outbox: Outbox,
-        reply: oneshot::Sender<ReplicaId>,
+        reply: oneshot::Sender<Result<ReplicaId, SyncError>>,
     },
     Resume {
+        principal: Option<String>,
         replica: ReplicaId,
         seq: u64,
         outbox: Outbox,
@@ -34,9 +47,14 @@ pub(crate) enum Command {
     },
     Submit {
         replica: ReplicaId,
+        /// Only the replica's current connection may submit on its behalf.
+        outbox: Outbox,
         /// The connection's token name, which the server makes the author
         /// of the replica's tracked changes.
         author: Option<String>,
+        /// Permission refusal is processed and journaled by the current actor
+        /// before acknowledging the ticket, without inspecting the payload.
+        refusal: Option<Rejection>,
         submission: Submission<Value>,
     },
     /// Carries the connection's outbox, so a late update from a replica's
@@ -47,14 +65,13 @@ pub(crate) enum Command {
         state: Value,
         outbox: Outbox,
     },
-    /// A connection closed. Carries its outbox so a late `Leave` from an old
-    /// connection does not unsubscribe the replica's newer one.
-    Leave {
-        replica: ReplicaId,
-        outbox: Outbox,
-    },
     Export {
         reply: oneshot::Sender<Result<Vec<u8>, String>>,
+    },
+    Inspect {
+        replica: ReplicaId,
+        outbox: Outbox,
+        request: u64,
     },
     Seq {
         reply: oneshot::Sender<u64>,
@@ -62,6 +79,45 @@ pub(crate) enum Command {
     Faults {
         reply: oneshot::Sender<Vec<String>>,
     },
+    /// Cleanup by connection identity, even when a cancelled join has not
+    /// returned its assigned replica. A resumed connection must remain intact.
+    Disconnected {
+        replica: Option<ReplicaId>,
+        outbox: Outbox,
+    },
+}
+
+pub(crate) type Commands = mailbox::Sender<Command>;
+
+/// Owns the document thread, even while sockets hold command senders.
+/// Dropping its server stops and joins it before storage can change owners.
+pub(crate) struct Actor {
+    pub commands: Commands,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for Actor {
+    fn drop(&mut self) {
+        self.commands.close();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[cfg(test)]
+impl Actor {
+    pub(super) fn test_worker(
+        count: usize,
+        bytes: usize,
+        work: impl FnOnce(mailbox::Inbox<Command>) + Send + 'static,
+    ) -> Self {
+        let (commands, inbox) = mailbox::channel(count, bytes);
+        Self {
+            commands,
+            thread: Some(thread::spawn(move || work(inbox))),
+        }
+    }
 }
 
 /// A format the server can host: how to open it and write it back.
@@ -81,6 +137,10 @@ trait Hosted: 'static {
     /// The file a checkpoint stores next to the model, which `load` reads
     /// back.
     fn checkpoint_file(materializer: &Self::Mat) -> Result<Vec<u8>, String>;
+
+    fn inspect(_document: &Self::Doc, _materializer: &Self::Mat) -> Result<Value, String> {
+        Err("native formatting inspection is currently available for DOCX and PPTX only".into())
+    }
 
     /// The operation the server commits, as the document's origin, before
     /// `op` from `replica` — whose token is named `author` — so that the
@@ -104,8 +164,8 @@ impl Hosted for Docx {
     type Mat = JadeDocx;
     const FORMAT: Format = Format::Docx;
 
-    fn load(bytes: &[u8], _: &DocxModel) -> Result<JadeDocx, String> {
-        JadeDocx::load(bytes)
+    fn load(bytes: &[u8], model: &DocxModel) -> Result<JadeDocx, String> {
+        JadeDocx::restore(bytes, model)
     }
 
     fn open(bytes: &[u8]) -> Result<(DocxModel, JadeDocx), String> {
@@ -116,6 +176,10 @@ impl Hosted for Docx {
 
     fn export(model: &DocxModel, materializer: &JadeDocx) -> Result<Vec<u8>, String> {
         materializer.export(model)
+    }
+
+    fn inspect(model: &DocxModel, materializer: &JadeDocx) -> Result<Value, String> {
+        serde_json::to_value(materializer.inspect_formatting(model)?).map_err(|e| e.to_string())
     }
 
     /// The base file: the model's marks are in the checkpoint's model.
@@ -194,6 +258,10 @@ impl Hosted for Pptx {
         materializer.export(model)
     }
 
+    fn inspect(model: &PptxModel, materializer: &JadePptx) -> Result<Value, String> {
+        serde_json::to_value(materializer.inspect_formatting(model)?).map_err(|e| e.to_string())
+    }
+
     /// The base file: the model's marks are in the checkpoint's model.
     fn checkpoint_file(materializer: &JadePptx) -> Result<Vec<u8>, String> {
         Ok(materializer.export_base())
@@ -218,14 +286,13 @@ pub(crate) enum Source {
 }
 
 /// Starts a document thread; returns once the document has opened (or failed to).
-pub(crate) fn spawn(
-    name: &str,
-    format: Format,
-    source: Source,
-) -> Result<mpsc::Sender<Command>, String> {
-    let (commands, inbox) = mpsc::channel();
+pub(crate) fn spawn(name: &str, format: Format, source: Source) -> Result<Actor, String> {
+    let (commands, inbox) = mailbox::channel(
+        mailbox::DEFAULT_INCOMING_LIMIT,
+        mailbox::DEFAULT_INCOMING_BYTES,
+    );
     let (ready, opened) = mpsc::channel();
-    thread::Builder::new()
+    let thread = thread::Builder::new()
         .name(format!("doc:{name}"))
         .spawn(move || match format {
             Format::Docx => host::<Docx>(source, inbox, ready),
@@ -233,13 +300,17 @@ pub(crate) fn spawn(
             Format::Pptx => host::<Pptx>(source, inbox, ready),
         })
         .map_err(|e| e.to_string())?;
+    let actor = Actor {
+        commands,
+        thread: Some(thread),
+    };
     opened.recv().map_err(|e| e.to_string())??;
-    Ok(commands)
+    Ok(actor)
 }
 
 fn host<H: Hosted>(
     source: Source,
-    inbox: mpsc::Receiver<Command>,
+    inbox: mailbox::Inbox<Command>,
     ready: mpsc::Sender<Result<(), String>>,
 ) {
     let mut hosting = match Hosting::<H>::open(source) {
@@ -322,10 +393,16 @@ impl<H: Hosted> Hosting<H> {
 
     /// Journals `record` before anyone hears of it, and checkpoints when due.
     fn journal(&mut self, record: Record<H::Op>) -> Result<(), String> {
+        self.journal_batch(&[record])
+    }
+
+    /// The sequencer has already applied the whole batch. Persist it before
+    /// checkpointing that state or publishing even its first operation.
+    fn journal_batch(&mut self, records: &[Record<H::Op>]) -> Result<(), String> {
         let Some(store) = &mut self.store else {
             return Ok(());
         };
-        if store.append(&record)? {
+        if store.append_batch(records)? {
             // A file that cannot be exported now is checkpointed later; the
             // journal keeps everything until then.
             match H::checkpoint_file(self.sequencer.materializer()) {
@@ -342,8 +419,22 @@ impl<H: Hosted> Hosting<H> {
         Ok(())
     }
 
-    fn serve(&mut self, inbox: mpsc::Receiver<Command>) -> Result<(), String> {
+    fn serve(&mut self, inbox: mailbox::Inbox<Command>) -> Result<(), String> {
         let mut subscribers: BTreeMap<ReplicaId, Outbox> = BTreeMap::new();
+        let result = self.serve_subscribers(inbox, &mut subscribers);
+        // Connections hold their own outbox sender, so dropping the map
+        // alone cannot close their outgoing queues. Wake them explicitly.
+        for outbox in subscribers.values() {
+            outbox.stop();
+        }
+        result
+    }
+
+    fn serve_subscribers(
+        &mut self,
+        mut inbox: mailbox::Inbox<Command>,
+        subscribers: &mut BTreeMap<ReplicaId, Outbox>,
+    ) -> Result<(), String> {
         // Ephemeral: in memory only, gone when the connection is.
         let mut presence: BTreeMap<ReplicaId, ServerMessage> = BTreeMap::new();
         // A subscriber that cannot take a message is gone or too far behind:
@@ -352,13 +443,34 @@ impl<H: Hosted> Hosting<H> {
             subscribers
                 .retain(|other, outbox| *other == replica || outbox.send(json.clone()).is_ok());
         };
-        while let Ok(command) = inbox.recv() {
+        while let Some(envelope) = inbox.blocking_recv() {
+            let mailbox::Envelope {
+                value: command,
+                _bytes,
+            } = envelope;
             match command {
-                Command::Join { outbox, reply } => {
-                    let welcome = self.sequencer.join();
-                    self.journal(Record::Joined {
+                Command::Join {
+                    principal,
+                    outbox,
+                    reply,
+                } => {
+                    let welcome = match self.sequencer.try_join_as(principal.clone()) {
+                        Ok(welcome) => welcome,
+                        Err(error) => {
+                            let _ = reply.send(Err(error));
+                            continue;
+                        }
+                    };
+                    let mut records = vec![Record::Joined {
                         replica: welcome.replica,
-                    })?;
+                    }];
+                    if let Some(principal) = principal {
+                        records.push(Record::Owned {
+                            replica: welcome.replica,
+                            principal,
+                        });
+                    }
+                    self.journal_batch(&records)?;
                     let message = ServerMessage::Welcome {
                         format: H::FORMAT,
                         replica: welcome.replica,
@@ -373,14 +485,15 @@ impl<H: Hosted> Hosting<H> {
                         let _ = outbox.send(message.to_json());
                     }
                     subscribers.insert(welcome.replica, outbox);
-                    let _ = reply.send(welcome.replica);
+                    let _ = reply.send(Ok(welcome.replica));
                 }
                 Command::Resume {
+                    principal,
                     replica,
                     seq,
                     outbox,
                     reply,
-                } => match self.sequencer.resume(replica, seq) {
+                } => match self.sequencer.resume_as(replica, seq, principal.as_deref()) {
                     Ok(resume) => {
                         let message = ServerMessage::Resumed {
                             processed_client_seq: resume.processed_client_seq,
@@ -390,7 +503,7 @@ impl<H: Hosted> Hosting<H> {
                         // Whatever the replica's old connection showed is stale.
                         if presence.remove(&replica).is_some() {
                             let left = ServerMessage::PresenceLeft { replica }.to_json();
-                            others(&mut subscribers, replica, left);
+                            others(subscribers, replica, left);
                         }
                         for message in presence.values() {
                             let _ = outbox.send(message.to_json());
@@ -404,9 +517,44 @@ impl<H: Hosted> Hosting<H> {
                 },
                 Command::Submit {
                     replica,
+                    outbox,
                     author,
+                    refusal,
                     submission,
                 } => {
+                    // A resume replaces the connection. Late frames from
+                    // the old socket must not consume the new one's client
+                    // sequence numbers or name its tracked-change author.
+                    if !subscribers
+                        .get(&replica)
+                        .is_some_and(|current| current.same_channel(&outbox))
+                    {
+                        let _ = outbox.send(
+                            ServerMessage::Error {
+                                message: "this connection no longer owns the replica; resume again"
+                                    .into(),
+                            }
+                            .to_json(),
+                        );
+                        continue;
+                    }
+                    // Deduplicate before decoding, admission or author
+                    // registration: a changed payload cannot revive a ticket.
+                    if submission.client_seq <= self.sequencer.processed_client_seq(replica) {
+                        continue;
+                    }
+                    if let Some(reason) = refusal {
+                        let outcome = self
+                            .sequencer
+                            .reject(replica, submission.client_seq, reason);
+                        if let Some(record) = outcome.record(replica) {
+                            self.journal(record)?;
+                        }
+                        if let SubmitOutcome::Rejected(rejected) = outcome {
+                            let _ = outbox.send(ServerMessage::Rejected(rejected).to_json());
+                        }
+                        continue;
+                    }
                     let op = match serde_json::from_value::<H::Op>(submission.op) {
                         Ok(op) => op,
                         Err(error) => {
@@ -422,6 +570,21 @@ impl<H: Hosted> Hosting<H> {
                             continue;
                         }
                     };
+                    // Refuse forged allocation namespaces before even author
+                    // registration or native admission can create side effects.
+                    if let Err(reason) = self.sequencer.document().validate_submission(&op, replica)
+                    {
+                        let outcome = self
+                            .sequencer
+                            .reject(replica, submission.client_seq, reason);
+                        if let Some(record) = outcome.record(replica) {
+                            self.journal(record)?;
+                        }
+                        if let SubmitOutcome::Rejected(rejected) = outcome {
+                            let _ = outbox.send(ServerMessage::Rejected(rejected).to_json());
+                        }
+                        continue;
+                    }
                     // Who the replica is goes into the log before what it
                     // does, for every replica to apply in that order.
                     let named = author.as_deref().and_then(|author| {
@@ -435,7 +598,27 @@ impl<H: Hosted> Hosting<H> {
                                     ServerMessage::Committed(committed_json(committed)).to_json();
                                 subscribers.retain(|_, outbox| outbox.send(json.clone()).is_ok());
                             }
-                            Err(error) => eprintln!("cannot name replica {replica}: {error}"),
+                            Err(error) => {
+                                // Native errors are unknown outcomes and stop
+                                // this room. A healthy logical refusal of the
+                                // author prerequisite must refuse the edit too.
+                                self.sequencer.check_health().map_err(|e| e.to_string())?;
+                                let outcome = self.sequencer.reject(
+                                    replica,
+                                    submission.client_seq,
+                                    Rejection::new(format!(
+                                        "cannot register tracked-change author: {error}"
+                                    )),
+                                );
+                                if let Some(record) = outcome.record(replica) {
+                                    self.journal(record)?;
+                                }
+                                if let SubmitOutcome::Rejected(rejected) = outcome {
+                                    let _ =
+                                        outbox.send(ServerMessage::Rejected(rejected).to_json());
+                                }
+                                continue;
+                            }
                         }
                     }
                     let submission = Submission {
@@ -444,8 +627,16 @@ impl<H: Hosted> Hosting<H> {
                         op,
                     };
                     let outcome = self.sequencer.submit(replica, submission);
-                    if let Some(record) = outcome.record(replica) {
-                        self.journal(record)?;
+                    // The file/model may contain partial native writes. Stop
+                    // before journaling, checkpointing or publishing a verdict.
+                    if let SubmitOutcome::Failed(error) = &outcome {
+                        return Err(error.to_string());
+                    }
+                    let derived = self.sequencer.take_derived();
+                    let mut records: Vec<_> = outcome.record(replica).into_iter().collect();
+                    records.extend(derived.iter().cloned().map(Record::Committed));
+                    if !records.is_empty() {
+                        self.journal_batch(&records)?;
                     }
                     match outcome {
                         SubmitOutcome::Committed(committed) => {
@@ -453,8 +644,7 @@ impl<H: Hosted> Hosting<H> {
                                 ServerMessage::Committed(committed_json(committed)).to_json();
                             subscribers.retain(|_, outbox| outbox.send(json.clone()).is_ok());
                             // What jade did on its own, right after its cause.
-                            for derived in self.sequencer.take_derived() {
-                                self.journal(Record::Committed(derived.clone()))?;
+                            for derived in derived {
                                 let json =
                                     ServerMessage::Committed(committed_json(derived)).to_json();
                                 subscribers.retain(|_, outbox| outbox.send(json.clone()).is_ok());
@@ -466,6 +656,7 @@ impl<H: Hosted> Hosting<H> {
                             }
                         }
                         SubmitOutcome::Duplicate => {}
+                        SubmitOutcome::Failed(error) => return Err(error.to_string()),
                     }
                 }
                 Command::Presence {
@@ -483,21 +674,8 @@ impl<H: Hosted> Hosting<H> {
                             name,
                             state,
                         };
-                        others(&mut subscribers, replica, message.to_json());
+                        others(subscribers, replica, message.to_json());
                         presence.insert(replica, message);
-                    }
-                }
-                Command::Leave { replica, outbox } => {
-                    // A subscriber whose outbox failed was dropped already;
-                    // its `Leave` still ends its presence.
-                    let current = subscribers
-                        .get(&replica)
-                        .is_none_or(|current| current.same_channel(&outbox));
-                    if current {
-                        subscribers.remove(&replica);
-                        presence.remove(&replica);
-                        let left = ServerMessage::PresenceLeft { replica }.to_json();
-                        others(&mut subscribers, replica, left);
                     }
                 }
                 Command::Export { reply } => {
@@ -506,11 +684,63 @@ impl<H: Hosted> Hosting<H> {
                         self.sequencer.materializer(),
                     ));
                 }
+                Command::Inspect {
+                    replica,
+                    outbox,
+                    request,
+                } => {
+                    if !subscribers
+                        .get(&replica)
+                        .is_some_and(|current| current.same_channel(&outbox))
+                    {
+                        let _ = outbox.send(
+                            ServerMessage::InspectionFailed {
+                                request,
+                                message: "this replica's connection was superseded".into(),
+                            }
+                            .to_json(),
+                        );
+                        continue;
+                    }
+                    let response = match H::inspect(
+                        self.sequencer.document(),
+                        self.sequencer.materializer(),
+                    ) {
+                        Ok(formatting) => ServerMessage::Inspected {
+                            request,
+                            seq: self.sequencer.seq(),
+                            snapshot: serde_json::to_value(self.sequencer.document())
+                                .expect("models serialize"),
+                            formatting,
+                        },
+                        Err(message) => ServerMessage::InspectionFailed { request, message },
+                    };
+                    let _ = outbox.send(response.to_json());
+                }
                 Command::Seq { reply } => {
                     let _ = reply.send(self.sequencer.seq());
                 }
                 Command::Faults { reply } => {
                     let _ = reply.send(self.sequencer.faults().to_vec());
+                }
+                Command::Disconnected { replica, outbox } => {
+                    let mut departed: Vec<_> = subscribers
+                        .iter()
+                        .filter_map(|(id, current)| current.same_channel(&outbox).then_some(*id))
+                        .collect();
+                    if let Some(replica) = replica.filter(|id| !subscribers.contains_key(id)) {
+                        departed.push(replica);
+                    }
+                    for replica in departed {
+                        subscribers.remove(&replica);
+                        if presence.remove(&replica).is_some() {
+                            others(
+                                subscribers,
+                                replica,
+                                ServerMessage::PresenceLeft { replica }.to_json(),
+                            );
+                        }
+                    }
                 }
             }
         }

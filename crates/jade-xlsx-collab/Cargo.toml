@@ -11,7 +11,10 @@ jade-collab-sync = { path = "../jade-collab-sync" }
 jade-xlsx-headless-api = { path = "../../jade-core/crates/jade-xlsx-headless-api" }
 jade-xlsx-headless-editor = { path = "../../jade-core/crates/jade-xlsx-headless-editor" }
 jade-xlsx-reader = { path = "../../jade-core/crates/jade-xlsx-reader" }
+jade-xlsx-layout = { path = "../../jade-core/crates/jade-xlsx-layout" }
 jade-xlsx-writer = { path = "../../jade-core/crates/jade-xlsx-writer" }
+jade-opc = { path = "../../jade-core/crates/jade-opc" }
+quick-xml = "0.39"
 serde.workspace = true
 thiserror.workspace = true
 

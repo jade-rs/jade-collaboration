@@ -115,7 +115,7 @@ impl Session {
             origin: ReplicaId::ORIGIN,
             ..ctx
         };
-        for derived in self.jade.derived(&self.model, op) {
+        for derived in self.jade.derived(&self.model, op).unwrap() {
             let effects = self.model.apply(&derived, &origin).expect("derived");
             self.jade
                 .materialize(&self.model, effects, &origin)

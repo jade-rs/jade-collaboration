@@ -21,8 +21,13 @@ pub struct Sequencer<D: Document, M = NoMaterializer> {
     log: Vec<Committed<D::Op>>,
     /// The newest client sequence number handled per replica.
     processed: BTreeMap<ReplicaId, u64>,
+    /// Stable authenticated principals, independent of credentials and roles.
+    owners: BTreeMap<ReplicaId, String>,
     next_replica: u64,
     faults: Vec<String>,
+    /// A live native error quarantines mutable model/file state. Never
+    /// serialized: a failed instance cannot produce a checkpoint.
+    failure: Option<SyncError>,
     /// Operations derived since the last [`Sequencer::take_derived`].
     derived: Vec<Committed<D::Op>>,
 }
@@ -37,6 +42,9 @@ pub struct Checkpoint<D> {
     /// The newest client sequence number handled per replica; every replica
     /// that ever joined is listed.
     pub processed: BTreeMap<ReplicaId, u64>,
+    /// Missing in legacy checkpoints: those replicas have anonymous ownership.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub owners: BTreeMap<ReplicaId, String>,
     /// The id the next joining replica gets.
     pub next_replica: u64,
     pub faults: Vec<String>,
@@ -50,6 +58,12 @@ pub struct Checkpoint<D> {
 pub enum Record<Op> {
     Joined {
         replica: ReplicaId,
+    },
+    /// Journal atomically with Joined, before sending the welcome. Never holds
+    /// a bearer token; ownership cannot be reassigned by later submissions.
+    Owned {
+        replica: ReplicaId,
+        principal: String,
     },
     Committed(Committed<Op>),
     /// A rejection changes nothing but the replica's processed client
@@ -68,6 +82,9 @@ pub enum SubmitOutcome<Op> {
     Rejected(Rejected),
     /// Already handled; nothing to send.
     Duplicate,
+    /// The native file/model may be partially written. Close transports and
+    /// recover; this is neither an acknowledgement nor a durable refusal.
+    Failed(SyncError),
 }
 
 impl<Op: Clone> SubmitOutcome<Op> {
@@ -75,12 +92,12 @@ impl<Op: Clone> SubmitOutcome<Op> {
         match self {
             SubmitOutcome::Committed(c) => Some(Downstream::Committed(c.clone())),
             SubmitOutcome::Rejected(r) => Some(Downstream::Rejected(r.clone())),
-            SubmitOutcome::Duplicate => None,
+            SubmitOutcome::Duplicate | SubmitOutcome::Failed(_) => None,
         }
     }
 
     /// What the sequencer must journal for this outcome of a submission
-    /// `from` a replica; nothing for a duplicate.
+    /// `from` a replica; nothing for a duplicate or unknown native outcome.
     pub fn record(&self, from: ReplicaId) -> Option<Record<Op>> {
         match self {
             SubmitOutcome::Committed(c) => Some(Record::Committed(c.clone())),
@@ -88,7 +105,7 @@ impl<Op: Clone> SubmitOutcome<Op> {
                 replica: from,
                 client_seq: r.client_seq,
             }),
-            SubmitOutcome::Duplicate => None,
+            SubmitOutcome::Duplicate | SubmitOutcome::Failed(_) => None,
         }
     }
 }
@@ -107,35 +124,60 @@ impl<D: Document, M: Materializer<D>> Sequencer<D, M> {
             log_start: 0,
             log: Vec::new(),
             processed: BTreeMap::new(),
+            owners: BTreeMap::new(),
             next_replica: ReplicaId::ORIGIN.0 + 1,
             faults: Vec::new(),
+            failure: None,
             derived: Vec::new(),
         }
     }
 
     /// The sequencer `checkpoint` was taken of, with `materializer` holding
     /// the real document at the same log position. Its log starts there.
+    /// Legacy checkpoints containing native faults produce a fenced instance;
+    /// checked startup should use `restore_with_tail` and handle its error.
     pub fn restore(checkpoint: Checkpoint<D>, materializer: M) -> Self {
+        let failure = checkpoint
+            .faults
+            .last()
+            .map(|reason| SyncError::Materialization {
+                seq: checkpoint.seq,
+                reason: format!(
+                    "checkpoint contains native faults; repair before restoring: {reason}"
+                ),
+            });
         Self {
             document: checkpoint.document,
             materializer,
             log_start: checkpoint.seq,
             log: Vec::new(),
             processed: checkpoint.processed,
+            owners: checkpoint.owners,
             next_replica: checkpoint.next_replica,
             faults: checkpoint.faults,
+            failure,
             derived: Vec::new(),
         }
     }
 
-    pub fn checkpoint(&self) -> Checkpoint<D> {
-        Checkpoint {
+    /// Checked capture; a partially materialized state can never become durable.
+    pub fn try_checkpoint(&self) -> Result<Checkpoint<D>, SyncError> {
+        self.check_health()?;
+        Ok(Checkpoint {
             seq: self.seq(),
             processed: self.processed.clone(),
+            owners: self.owners.clone(),
             next_replica: self.next_replica,
             faults: self.faults.clone(),
             document: self.document.clone(),
-        }
+        })
+    }
+
+    /// Captures healthy state. Use `try_checkpoint` when handling native errors.
+    /// Panics if this instance has been fenced after a materialization failure.
+    pub fn checkpoint(&self) -> Checkpoint<D> {
+        self.try_checkpoint()
+            .expect("cannot checkpoint a failed sequencer")
     }
 
     /// [`Sequencer::restore`], with the `tail` of the log that was kept
@@ -148,6 +190,11 @@ impl<D: Document, M: Materializer<D>> Sequencer<D, M> {
         materializer: M,
     ) -> Result<Self, SyncError> {
         let journal = |reason: String| SyncError::Journal { reason };
+        Self::validate_metadata(
+            &checkpoint.processed,
+            &checkpoint.owners,
+            checkpoint.next_replica,
+        )?;
         let start = checkpoint
             .seq
             .checked_sub(tail.len() as u64)
@@ -158,18 +205,61 @@ impl<D: Document, M: Materializer<D>> Sequencer<D, M> {
                     checkpoint.seq
                 ))
             })?;
-        for (expected, committed) in (start + 1..).zip(&tail) {
+        let mut previous = BTreeMap::new();
+        for (index, committed) in tail.iter().enumerate() {
+            // `start + tail.len() == checkpoint.seq`; enumerate only actual
+            // entries, without forming MAX + 1 for an empty or completed tail.
+            let expected = start + index as u64 + 1;
             if committed.seq != expected {
                 return Err(journal(format!(
                     "the tail holds log position {} where {expected} belongs",
                     committed.seq
                 )));
             }
+            if committed.origin == ReplicaId::ORIGIN {
+                if committed.client_seq != 0 {
+                    return Err(journal("an origin commit has a client ticket".into()));
+                }
+            } else {
+                let watermark = checkpoint
+                    .processed
+                    .get(&committed.origin)
+                    .ok_or(SyncError::UnknownReplica(committed.origin))?;
+                let prior = previous.entry(committed.origin).or_insert(0);
+                if committed.client_seq <= *prior || committed.client_seq > *watermark {
+                    return Err(journal(format!(
+                        "tail ticket {} for {} does not fit its processed watermark {watermark}",
+                        committed.client_seq, committed.origin
+                    )));
+                }
+                *prior = committed.client_seq;
+            }
         }
         let mut sequencer = Self::restore(checkpoint, materializer);
+        sequencer.check_health()?;
         sequencer.log_start = start;
         sequencer.log = tail;
         Ok(sequencer)
+    }
+
+    fn validate_metadata(
+        processed: &BTreeMap<ReplicaId, u64>,
+        owners: &BTreeMap<ReplicaId, String>,
+        next_replica: u64,
+    ) -> Result<(), SyncError> {
+        if next_replica == 0
+            || processed.contains_key(&ReplicaId::ORIGIN)
+            || processed
+                .keys()
+                .next_back()
+                .is_some_and(|id| id.0 >= next_replica)
+            || owners.keys().any(|id| !processed.contains_key(id))
+        {
+            return Err(SyncError::Journal {
+                reason: "invalid replica allocation or ownership metadata".into(),
+            });
+        }
+        Ok(())
     }
 
     /// Drops the log up to the current position, once a checkpoint of it is
@@ -181,7 +271,10 @@ impl<D: Document, M: Materializer<D>> Sequencer<D, M> {
     /// Like [`Sequencer::compact`], but keeps the last `keep` committed
     /// operations (or as many as there are), so that a replica at most
     /// `keep` operations behind can always still resume.
+    /// Panics after native failure, because no healthy checkpoint can be taken.
     pub fn compact_keeping(&mut self, keep: usize) {
+        self.check_health()
+            .expect("cannot compact a failed sequencer");
         let dropped = self.log.len().saturating_sub(keep);
         self.log.drain(..dropped);
         self.log_start += dropped as u64;
@@ -191,6 +284,7 @@ impl<D: Document, M: Materializer<D>> Sequencer<D, M> {
     /// recorded. Committed operations are applied and materialized without
     /// being admitted again: they are facts.
     pub fn replay(&mut self, record: Record<D::Op>) -> Result<(), SyncError> {
+        self.check_health()?;
         match record {
             Record::Joined { replica } => {
                 if replica.0 != self.next_replica {
@@ -201,17 +295,43 @@ impl<D: Document, M: Materializer<D>> Sequencer<D, M> {
                         ),
                     });
                 }
-                self.join();
+                self.try_join()?;
+            }
+            Record::Owned { replica, principal } => {
+                if !self.processed.contains_key(&replica) {
+                    return Err(SyncError::UnknownReplica(replica));
+                }
+                if self.owners.contains_key(&replica) || self.processed_client_seq(replica) != 0 {
+                    return Err(SyncError::Journal {
+                        reason: format!("cannot rebind the owner of {replica}"),
+                    });
+                }
+                self.owners.insert(replica, principal);
             }
             Record::Committed(committed) => {
                 let derived = committed.origin == ReplicaId::ORIGIN;
                 if !derived && !self.processed.contains_key(&committed.origin) {
                     return Err(SyncError::UnknownReplica(committed.origin));
                 }
-                if committed.seq != self.seq() + 1 {
+                let expected = self.seq().checked_add(1).ok_or(SyncError::LogExhausted)?;
+                if committed.seq != expected {
                     return Err(SyncError::OutOfOrder {
-                        expected: self.seq() + 1,
+                        expected,
                         received: committed.seq,
+                    });
+                }
+                if derived {
+                    if committed.client_seq != 0 {
+                        return Err(SyncError::Journal {
+                            reason: "an origin commit has a client ticket".into(),
+                        });
+                    }
+                } else if committed.client_seq <= self.processed_client_seq(committed.origin) {
+                    return Err(SyncError::Journal {
+                        reason: format!(
+                            "ticket {} for {} was already processed",
+                            committed.client_seq, committed.origin
+                        ),
                     });
                 }
                 let ctx = ApplyContext {
@@ -219,13 +339,14 @@ impl<D: Document, M: Materializer<D>> Sequencer<D, M> {
                     base_seq: committed.base_seq,
                     seq: Some(committed.seq),
                 };
-                let effect = self.document.apply(&committed.op, &ctx).map_err(|reason| {
-                    SyncError::Diverged {
-                        seq: committed.seq,
-                        reason: reason.to_string(),
-                    }
-                })?;
-                self.materialize(effect, &ctx);
+                let effect =
+                    self.document
+                        .apply_recorded(&committed.op, &ctx)
+                        .map_err(|reason| SyncError::Diverged {
+                            seq: committed.seq,
+                            reason: reason.to_string(),
+                        })?;
+                self.materialize(effect, &ctx)?;
                 if !derived {
                     self.processed
                         .insert(committed.origin, committed.client_seq);
@@ -238,6 +359,13 @@ impl<D: Document, M: Materializer<D>> Sequencer<D, M> {
             } => {
                 // Like `submit`, which ignores strangers.
                 if let Some(processed) = self.processed.get_mut(&replica) {
+                    if client_seq <= *processed {
+                        return Err(SyncError::Journal {
+                            reason: format!(
+                                "ticket {client_seq} for {replica} was already processed"
+                            ),
+                        });
+                    }
                     *processed = client_seq;
                 }
             }
@@ -245,35 +373,40 @@ impl<D: Document, M: Materializer<D>> Sequencer<D, M> {
         Ok(())
     }
 
-    /// Commits what the real document did on its own after `cause`, as
-    /// operations of [`ReplicaId::ORIGIN`]. A derived operation the model
-    /// refuses is a fault.
-    fn derive(&mut self, cause: &D::Op) {
-        for op in self.materializer.derived(&self.document, cause) {
-            let seq = self.seq() + 1;
+    /// Builds a staged derived suffix. Reserve all its positions before
+    /// applying even the first child; an error discards the whole stage.
+    fn derive(&mut self, cause: &D::Op) -> Result<(), Rejection> {
+        let operations = self.materializer.derived(&self.document, cause)?;
+        let count = u64::try_from(operations.len())
+            .map_err(|_| Rejection::new("derived suffix is too large"))?;
+        self.seq()
+            .checked_add(count)
+            .ok_or_else(|| Rejection::new(SyncError::LogExhausted.to_string()))?;
+        for op in operations {
+            let seq = self
+                .seq()
+                .checked_add(1)
+                .ok_or_else(|| Rejection::new(SyncError::LogExhausted.to_string()))?;
             let ctx = ApplyContext {
                 origin: ReplicaId::ORIGIN,
                 base_seq: seq - 1,
                 seq: Some(seq),
             };
-            match self.document.apply(&op, &ctx) {
-                Ok(effect) => {
-                    self.materialize(effect, &ctx);
-                    let committed = Committed {
-                        seq,
-                        origin: ReplicaId::ORIGIN,
-                        client_seq: 0,
-                        base_seq: seq - 1,
-                        op,
-                    };
-                    self.log.push(committed.clone());
-                    self.derived.push(committed);
-                }
-                Err(reason) => self.faults.push(format!(
-                    "seq {seq}: derived {op:?} does not apply: {reason}"
-                )),
-            }
+            let effect = self.document.apply(&op, &ctx).map_err(|reason| {
+                Rejection::new(format!("derived {op:?} does not apply: {reason}"))
+            })?;
+            self.materialize(effect, &ctx)?;
+            let committed = Committed {
+                seq,
+                origin: ReplicaId::ORIGIN,
+                client_seq: 0,
+                base_seq: seq - 1,
+                op,
+            };
+            self.log.push(committed.clone());
+            self.derived.push(committed);
         }
+        Ok(())
     }
 
     /// Commits `op` on behalf of [`ReplicaId::ORIGIN`], outside any
@@ -282,14 +415,18 @@ impl<D: Document, M: Materializer<D>> Sequencer<D, M> {
     /// materialized like a commit; the caller journals and broadcasts it.
     /// Nothing is admitted or derived: the server is the author.
     pub fn commit_origin(&mut self, op: D::Op) -> Result<Committed<D::Op>, Rejection> {
-        let seq = self.seq() + 1;
+        self.check_health()?;
+        let seq = self
+            .seq()
+            .checked_add(1)
+            .ok_or_else(|| Rejection::new(SyncError::LogExhausted.to_string()))?;
         let ctx = ApplyContext {
             origin: ReplicaId::ORIGIN,
             base_seq: seq - 1,
             seq: Some(seq),
         };
         let effect = self.document.apply(&op, &ctx)?;
-        self.materialize(effect, &ctx);
+        self.materialize(effect, &ctx)?;
         let committed = Committed {
             seq,
             origin: ReplicaId::ORIGIN,
@@ -307,23 +444,62 @@ impl<D: Document, M: Materializer<D>> Sequencer<D, M> {
         std::mem::take(&mut self.derived)
     }
 
-    fn materialize(&mut self, effect: D::Effect, ctx: &ApplyContext) {
-        if let Err(fault) = self.materializer.materialize(&self.document, effect, ctx) {
+    fn materialize(&mut self, effect: D::Effect, ctx: &ApplyContext) -> Result<(), SyncError> {
+        if let Err(reason) = self.materializer.materialize(&self.document, effect, ctx) {
             let seq = ctx.seq.expect("only committed operations are materialized");
-            self.faults.push(format!("seq {seq}: {fault}"));
+            let failure = SyncError::Materialization { seq, reason };
+            self.faults.push(failure.to_string());
+            self.failure = Some(failure.clone());
+            return Err(failure);
+        }
+        Ok(())
+    }
+
+    /// The first unexpected live native failure; it is sticky until this
+    /// instance is discarded and rebuilt from a known healthy file/checkpoint.
+    pub fn failure(&self) -> Option<&SyncError> {
+        self.failure.as_ref()
+    }
+
+    /// Refuses access to a model/file with an unknown native write outcome.
+    /// Recovery must load an independent healthy checkpoint/file and journal.
+    pub fn check_health(&self) -> Result<(), SyncError> {
+        match &self.failure {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
         }
     }
 
+    /// Reads the authoritative model only while its native file is healthy.
+    pub fn try_document(&self) -> Result<&D, SyncError> {
+        self.check_health()?;
+        Ok(&self.document)
+    }
+    /// Healthy model access. Panics after native failure; checked callers use `try_document`.
     pub fn document(&self) -> &D {
-        &self.document
+        self.try_document().expect("cannot read a failed sequencer")
     }
 
+    /// Reads the native file only while its materialization outcome is known.
+    pub fn try_materializer(&self) -> Result<&M, SyncError> {
+        self.check_health()?;
+        Ok(&self.materializer)
+    }
+    /// Healthy native access. Panics after failure; use `try_materializer` to handle errors.
     pub fn materializer(&self) -> &M {
-        &self.materializer
+        self.try_materializer()
+            .expect("cannot read a failed native file")
     }
 
+    /// Access for healthy native housekeeping; cannot repair a failed instance.
+    pub fn try_materializer_mut(&mut self) -> Result<&mut M, SyncError> {
+        self.check_health()?;
+        Ok(&mut self.materializer)
+    }
+    /// Healthy native access. Panics after failure; use the checked variant to handle errors.
     pub fn materializer_mut(&mut self) -> &mut M {
-        &mut self.materializer
+        self.try_materializer_mut()
+            .expect("cannot mutate a failed native file")
     }
 
     /// The position of the last committed operation (0 for none).
@@ -345,27 +521,75 @@ impl<D: Document, M: Materializer<D>> Sequencer<D, M> {
         self.processed.get(&replica).copied().unwrap_or(0)
     }
 
-    /// Materialization failures. Each is a bug — the model accepted an
-    /// operation the real document could not take — and leaves the file
-    /// behind the model; they are kept rather than hidden.
+    /// Native failure diagnostics. A live error fences the instance; these
+    /// details do not make its partially written model/file safe to publish.
     pub fn faults(&self) -> &[String] {
         &self.faults
     }
 
-    /// Admits a new replica.
+    /// Admits a new replica. Panics at identifier exhaustion or invalid restored
+    /// metadata, or after native failure; transports should use [`Sequencer::try_join`].
     pub fn join(&mut self) -> Welcome<D> {
+        self.try_join().expect("cannot allocate a replica")
+    }
+
+    /// Admits a new replica without wrapping, reusing ids or changing state on
+    /// refusal. MAX is the exhausted next-id sentinel, as for client tickets.
+    pub fn try_join(&mut self) -> Result<Welcome<D>, SyncError> {
+        self.check_health()?;
+        Self::validate_metadata(&self.processed, &self.owners, self.next_replica)?;
+        let next = self
+            .next_replica
+            .checked_add(1)
+            .ok_or(SyncError::ReplicaIdExhausted)?;
         let replica = ReplicaId(self.next_replica);
-        self.next_replica += 1;
+        self.next_replica = next;
         self.processed.insert(replica, 0);
-        Welcome {
+        Ok(Welcome {
             replica,
             seq: self.seq(),
             snapshot: self.document.clone(),
-        }
+        })
     }
 
-    /// What `replica`, last at log position `seq`, missed.
+    /// Joins for a trusted transport principal. Equal names identify the same
+    /// principal across credential/role changes. None is anonymous access.
+    pub fn join_as(&mut self, principal: Option<String>) -> Welcome<D> {
+        self.try_join_as(principal)
+            .expect("cannot allocate a replica")
+    }
+
+    /// Checked authenticated admission. Failure never publishes an owner or
+    /// consumes an identifier; already joined replicas can still resume.
+    pub fn try_join_as(&mut self, principal: Option<String>) -> Result<Welcome<D>, SyncError> {
+        let welcome = self.try_join()?;
+        if let Some(principal) = principal {
+            self.owners.insert(welcome.replica, principal);
+        }
+        Ok(welcome)
+    }
+
+    /// A trusted transport must authorize resumption before replacing sockets,
+    /// presence or any ticket state. Legacy unbound replicas only match None.
+    pub fn resume_as(
+        &self,
+        replica: ReplicaId,
+        seq: u64,
+        principal: Option<&str>,
+    ) -> Result<Resume<D::Op>, SyncError> {
+        if !self.processed.contains_key(&replica) {
+            return Err(SyncError::UnknownReplica(replica));
+        }
+        if self.owners.get(&replica).map(String::as_str) != principal {
+            return Err(SyncError::ReplicaOwnerMismatch { replica });
+        }
+        self.resume(replica, seq)
+    }
+
+    /// What `replica`, last at log position `seq`, missed. This trusted core
+    /// lookup does not authorize a caller; authenticated transports use resume_as.
     pub fn resume(&self, replica: ReplicaId, seq: u64) -> Result<Resume<D::Op>, SyncError> {
+        self.check_health()?;
         let processed_client_seq = *self
             .processed
             .get(&replica)
@@ -388,50 +612,131 @@ impl<D: Document, M: Materializer<D>> Sequencer<D, M> {
         })
     }
 
+    /// Refuses an issued submission at the access-control boundary without
+    /// decoding, admitting or materializing its operation. Journal the outcome
+    /// before replying, just as for submit; duplicate tickets stay duplicates.
+    pub fn reject(
+        &mut self,
+        from: ReplicaId,
+        client_seq: u64,
+        reason: Rejection,
+    ) -> SubmitOutcome<D::Op> {
+        if let Err(error) = self.check_health() {
+            return SubmitOutcome::Failed(error);
+        }
+        if let Some(outcome) = self.process_ticket(from, client_seq) {
+            return outcome;
+        }
+        SubmitOutcome::Rejected(Rejected { client_seq, reason })
+    }
+
+    fn process_ticket(&mut self, from: ReplicaId, client_seq: u64) -> Option<SubmitOutcome<D::Op>> {
+        let Some(processed) = self.processed.get_mut(&from) else {
+            return Some(SubmitOutcome::Rejected(Rejected {
+                client_seq,
+                reason: Rejection::new(SyncError::UnknownReplica(from).to_string()),
+            }));
+        };
+        if client_seq <= *processed {
+            return Some(SubmitOutcome::Duplicate);
+        }
+        *processed = client_seq;
+        None
+    }
+
+    /// Applies a new ticket. A native fast-path error returns `Failed` without
+    /// advancing the log/processed watermark; discard the fenced instance.
+    /// Errors isolated to an independent stage return a durable `Rejected`.
     pub fn submit(
         &mut self,
         from: ReplicaId,
         submission: Submission<D::Op>,
     ) -> SubmitOutcome<D::Op> {
-        let Some(processed) = self.processed.get_mut(&from) else {
-            return SubmitOutcome::Rejected(Rejected {
-                client_seq: submission.client_seq,
-                reason: Rejection::new(SyncError::UnknownReplica(from).to_string()),
-            });
-        };
-        if submission.client_seq <= *processed {
-            return SubmitOutcome::Duplicate;
+        if let Err(error) = self.check_health() {
+            return SubmitOutcome::Failed(error);
         }
-        *processed = submission.client_seq;
+        let previous = self.processed_client_seq(from);
+        if let Some(outcome) = self.process_ticket(from, submission.client_seq) {
+            return outcome;
+        }
 
-        let seq = self.seq() + 1;
+        let client_seq = submission.client_seq;
+        if let Err(reason) = self.document.validate_submission(&submission.op, from) {
+            return SubmitOutcome::Rejected(Rejected { client_seq, reason });
+        }
+        let result = if self.materializer.may_derive(&self.document, &submission.op) {
+            self.submit_staged(from, submission)
+        } else {
+            self.apply_submission(from, submission)
+        };
+        match result {
+            Ok(committed) => SubmitOutcome::Committed(committed),
+            Err(reason) => match &self.failure {
+                Some(error) => {
+                    // No durable verdict was reached. Preserve the last
+                    // healthy watermark so recovery can retry this ticket.
+                    self.processed.insert(from, previous);
+                    SubmitOutcome::Failed(error.clone())
+                }
+                None => SubmitOutcome::Rejected(Rejected { client_seq, reason }),
+            },
+        }
+    }
+
+    fn submit_staged(
+        &mut self,
+        from: ReplicaId,
+        submission: Submission<D::Op>,
+    ) -> Result<Committed<D::Op>, Rejection> {
+        // Refuse a full log before exporting/copying the file.
+        self.seq()
+            .checked_add(1)
+            .ok_or_else(|| Rejection::new(SyncError::LogExhausted.to_string()))?;
+        let materializer = self
+            .materializer
+            .fork(&self.document)
+            .map_err(|reason| Rejection::new(format!("cannot stage the document: {reason}")))?;
+        let mut stage = Self::with_materializer(self.document.clone(), materializer);
+        stage.log_start = self.seq();
+        let committed = stage.apply_submission(from, submission)?;
+        stage.derive(&committed.op)?;
+        // Metadata and the old log stay owned by the live sequencer. Failed
+        // plans advance only its processed ticket, which is journaled as a
+        // refusal; successful plans publish every file/model change together.
+        self.document = stage.document;
+        self.materializer = stage.materializer;
+        self.log.extend(stage.log);
+        self.derived.extend(stage.derived);
+        Ok(committed)
+    }
+
+    fn apply_submission(
+        &mut self,
+        from: ReplicaId,
+        submission: Submission<D::Op>,
+    ) -> Result<Committed<D::Op>, Rejection> {
+        let seq = self
+            .seq()
+            .checked_add(1)
+            .ok_or_else(|| Rejection::new(SyncError::LogExhausted.to_string()))?;
         let ctx = ApplyContext {
             origin: from,
             base_seq: submission.base_seq,
             seq: Some(seq),
         };
-        let admitted = match D::lane(&submission.op) {
-            Lane::Sequenced => self.materializer.admit(&self.document, &submission.op),
-            Lane::Convergent => Ok(()),
-        };
-        match admitted.and_then(|()| self.document.apply(&submission.op, &ctx)) {
-            Ok(effect) => {
-                self.materialize(effect, &ctx);
-                let committed = Committed {
-                    seq,
-                    origin: from,
-                    client_seq: submission.client_seq,
-                    base_seq: submission.base_seq,
-                    op: submission.op,
-                };
-                self.log.push(committed.clone());
-                self.derive(&committed.op);
-                SubmitOutcome::Committed(committed)
-            }
-            Err(reason) => SubmitOutcome::Rejected(Rejected {
-                client_seq: submission.client_seq,
-                reason,
-            }),
+        if D::lane(&submission.op) == Lane::Sequenced {
+            self.materializer.admit(&self.document, &submission.op)?;
         }
+        let effect = self.document.apply(&submission.op, &ctx)?;
+        self.materialize(effect, &ctx)?;
+        let committed = Committed {
+            seq,
+            origin: from,
+            client_seq: submission.client_seq,
+            base_seq: submission.base_seq,
+            op: submission.op,
+        };
+        self.log.push(committed.clone());
+        Ok(committed)
     }
 }

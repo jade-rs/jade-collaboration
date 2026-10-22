@@ -1,6 +1,6 @@
 //! Realising model effects in a jade `HeadlessWorkbook`.
 
-use jade_collab_sync::{ApplyContext, Materializer};
+use jade_collab_sync::{ApplyContext, Materializer, Rejection};
 use jade_xlsx_headless_editor::HeadlessWorkbook;
 
 use crate::model::{column_label, from_view, XlsxEffect, XlsxModel, XlsxOp};
@@ -19,6 +19,38 @@ pub struct JadeXlsx {
 }
 
 impl JadeXlsx {
+    fn insert_column(&mut self, sheet: &str, at: u32) -> Result<(), String> {
+        self.book
+            .insert_columns(sheet, &column_label(at), 1)
+            .map_err(|e| e.to_string())?;
+        let view = self
+            .book
+            .workbook()
+            .sheets
+            .iter()
+            .find(|s| s.name == sheet)
+            .ok_or_else(|| "inserted column's sheet is missing".to_owned())?;
+        if view
+            .column_span(at)
+            .and_then(|span| span.style_index)
+            .is_none()
+        {
+            return Ok(());
+        }
+        let part = view.part_name.clone();
+        let mut package =
+            jade_opc::OpcPackage::open(self.book.bytes()).map_err(|e| e.to_string())?;
+        let xml = package
+            .required_part_str(&part)
+            .map_err(|e| e.to_string())?;
+        if let Some(xml) = crate::inserted_column::clear_style(&xml, at + 1)? {
+            package.replace(&part, xml.into_bytes());
+            self.book = HeadlessWorkbook::open(&package.write().map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
     pub fn new(book: HeadlessWorkbook) -> Self {
         Self { book }
     }
@@ -39,18 +71,25 @@ impl JadeXlsx {
 }
 
 impl Materializer<XlsxModel> for JadeXlsx {
+    fn may_derive(&self, _: &XlsxModel, cause: &XlsxOp) -> bool {
+        matches!(cause, XlsxOp::Structure { .. } | XlsxOp::SetHeader { .. })
+    }
+    fn fork(&self, _: &XlsxModel) -> Result<Self, String> {
+        Self::open(&self.export()?)
+    }
+
     /// After a change that Excel follows up on its own inside a table — a
     /// structural change or a header rename — every cell of the sheet's
     /// tables is compared with the model; what jade holds differently (a new
     /// column's `ColumnN` header, a normalised header, a filled calculated
     /// column) comes back as derived operations.
-    fn derived(&mut self, model: &XlsxModel, cause: &XlsxOp) -> Vec<XlsxOp> {
+    fn derived(&mut self, model: &XlsxModel, cause: &XlsxOp) -> Result<Vec<XlsxOp>, Rejection> {
         let sheet = match cause {
             XlsxOp::Structure { sheet, .. } | XlsxOp::SetHeader { sheet, .. } => *sheet,
-            _ => return Vec::new(),
+            _ => return Ok(Vec::new()),
         };
         let Some(name) = model.sheet_name(sheet) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let mut lamport = model.max_lamport();
         let mut derived = Vec::new();
@@ -63,7 +102,9 @@ impl Materializer<XlsxModel> for JadeXlsx {
                 .value(sheet, row, column)
                 .filter(|v| **v != CellInput::Blank);
             if theirs.as_ref() != ours {
-                lamport += 1;
+                lamport = lamport
+                    .checked_add(1)
+                    .ok_or_else(|| Rejection::new("derived identifier space exhausted"))?;
                 derived.push(XlsxOp::Derived {
                     sheet,
                     row,
@@ -73,7 +114,7 @@ impl Materializer<XlsxModel> for JadeXlsx {
                 });
             }
         }
-        derived
+        Ok(derived)
     }
 
     fn materialize(
@@ -96,10 +137,10 @@ impl Materializer<XlsxModel> for JadeXlsx {
                 XlsxEffect::DeleteRow { sheet, at } => {
                     self.book.delete_rows(&sheet, at + 1, 1).map(drop)
                 }
-                XlsxEffect::InsertColumn { sheet, at } => self
-                    .book
-                    .insert_columns(&sheet, &column_label(at), 1)
-                    .map(drop),
+                XlsxEffect::InsertColumn { sheet, at } => {
+                    self.insert_column(&sheet, at)?;
+                    continue;
+                }
                 XlsxEffect::DeleteColumn { sheet, at } => self
                     .book
                     .delete_columns(&sheet, &column_label(at), 1)

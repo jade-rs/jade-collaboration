@@ -36,6 +36,50 @@ async fn start() -> (Server, String) {
     (server, format!("ws://{addr}/documents"))
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn atomic_client_snapshots_match_their_acknowledged_and_pending_edits() {
+    let (server, base) = start().await;
+    let url = format!("{base}/hello.docx/ws");
+    let writer: Client<DocxModel> = Client::connect(&url, None).await.unwrap();
+    let reader: Client<DocxModel> = Client::connect(&url, None).await.unwrap();
+    let count = |view: &DocxModel| {
+        view.paragraph_texts()[1]
+            .chars()
+            .filter(|c| *c == 'x')
+            .count()
+    };
+    for _ in 0..64 {
+        let view = writer.view();
+        for op in resolve(
+            &view,
+            &IntentOp::InsertText {
+                paragraph: 1,
+                offset: 0,
+                text: "x".into(),
+            },
+            &mut |n| writer.reserve(n),
+        )
+        .unwrap()
+        {
+            writer.submit(op).unwrap();
+        }
+        let snapshot = writer.snapshot();
+        assert_eq!(
+            count(&snapshot.view),
+            snapshot.seq as usize + snapshot.pending
+        );
+        let snapshot = reader.snapshot();
+        assert_eq!(snapshot.pending, 0);
+        assert_eq!(count(&snapshot.view), snapshot.seq as usize);
+        tokio::task::yield_now().await;
+    }
+    writer.settle().await.unwrap();
+    catch_up(&server, "hello.docx", &reader).await;
+    let snapshot = reader.snapshot();
+    assert_eq!(snapshot.seq, 64);
+    assert_eq!(count(&snapshot.view), 64);
+}
+
 /// Waits until `client` has caught up with the server's log.
 async fn catch_up<D>(server: &Server, name: &str, client: &Client<D>)
 where
@@ -172,7 +216,7 @@ async fn a_rejected_structural_edit_comes_back_to_its_author() {
     a.settle().await.unwrap();
 
     // Back online, B's join reaches the server after the table: refused.
-    let b: Client<DocxModel> = Client::resume(&url, offline, None).await.unwrap();
+    let b: Client<DocxModel> = Client::resume(&url, &offline, None).await.unwrap();
     b.settle().await.unwrap();
     let events = b.take_events();
     assert!(
@@ -278,7 +322,7 @@ async fn a_client_that_drops_resumes_where_it_left_off() {
     .unwrap();
     b.settle().await.unwrap();
 
-    let a = Client::resume(&url, replica, None).await.unwrap();
+    let a = Client::resume(&url, &replica, None).await.unwrap();
     catch_up(&server, "hello.docx", &a).await;
     assert_eq!(a.view(), b.view());
 }

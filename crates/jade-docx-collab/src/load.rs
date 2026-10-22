@@ -31,6 +31,8 @@ type RevisionKey = (
 pub enum LoadError {
     #[error("the document has no parsed body")]
     NoBody,
+    #[error("invalid document settings: {0}")]
+    Settings(String),
 }
 
 struct Loader {
@@ -424,12 +426,13 @@ impl DocxModel {
             endnotes: loader.endnotes,
             text_boxes: loader.text_boxes,
             comments,
-            tracking: false,
+            tracking: crate::settings::tracking(word).map_err(LoadError::Settings)?,
             authors: BTreeMap::new(),
             revisions: loader.revisions,
             inserted: loader.inserted,
             deleted: loader.deleted,
             max_lamport: loader.next - 1,
+            positions: Default::default(),
         })
     }
 }

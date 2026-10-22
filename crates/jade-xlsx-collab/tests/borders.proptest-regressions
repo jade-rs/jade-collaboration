@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 2f0c33ed585d04a3d7018e2a4f172d3ece92becfe14531cd58c664705bded5c5 # shrinks to steps = [(0, 0, (1, 0, 0, 0), RangeBorders { outline: None, inside: None, top: None, bottom: None, left: None, right: None, inside_horizontal: Some(BorderLine { style: Thin, color: Some("#00b050") }), inside_vertical: None, diagonal: None, diagonal_up: None, diagonal_down: None })]
+cc bfa973680f4c04d4b4537782910d739b27e26c531dc6518093c993550d4f796a # shrinks to steps = [(0, 0, (0, 0, 0, 0), RangeBorders { outline: None, inside: None, top: None, bottom: None, left: None, right: None, inside_horizontal: None, inside_vertical: None, diagonal: None, diagonal_up: None, diagonal_down: None })]

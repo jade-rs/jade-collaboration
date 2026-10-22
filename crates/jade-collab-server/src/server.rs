@@ -1,12 +1,13 @@
-use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::{mpsc, Arc, Mutex};
+#[cfg(test)]
+use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, FromRequestParts, Path, State};
 use axum::http::{header, StatusCode};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
@@ -23,11 +24,18 @@ use crate::auth::{
 };
 use crate::limits::{Bucket, PresenceLimits};
 use crate::outbox::{outbox, DEFAULT_OUTGOING_LIMIT};
+use crate::registry::Registry;
 use crate::room::{self, Command, Source};
-use crate::storage::{newest_generation, StorageOptions};
+use crate::storage::{newest_generation, snapshot_name, StorageOptions};
 use crate::wire::{ClientMessage, Format, ServerMessage};
-use jade_collab_sync::protocol::Rejected;
 use jade_collab_sync::{Rejection, SyncError};
+
+/// Maximum compressed document bytes accepted by HTTP PUT by default (64 MiB).
+/// This does not limit local files or growth through collaborative operations.
+pub const DEFAULT_UPLOAD_LIMIT: usize = 64 * 1024 * 1024;
+
+#[cfg(test)]
+mod tests;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
@@ -35,7 +43,7 @@ pub enum ServerError {
     NotFound(String),
     #[error("a document named {0} is already open")]
     Exists(String),
-    #[error("{0} is neither a .docx nor a .xlsx name")]
+    #[error("{0} is not a .docx, .xlsx or .pptx name")]
     UnknownFormat(String),
     #[error("{0:?} is not a usable document name")]
     InvalidName(String),
@@ -57,19 +65,22 @@ pub enum ServerError {
 
 struct RoomHandle {
     format: Format,
-    commands: mpsc::Sender<Command>,
+    actor: room::Actor,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Storage {
     dir: PathBuf,
     options: StorageOptions,
+    /// Kept open until every server clone has stopped its document actors.
+    _lock: std::fs::File,
 }
 
 /// Hosts named documents. Cheap to clone; clones share the documents.
 #[derive(Clone, Default)]
 pub struct Server {
-    rooms: Arc<Mutex<BTreeMap<String, RoomHandle>>>,
+    // Field order matters: join the actors before releasing the storage lease.
+    rooms: Arc<Registry<RoomHandle>>,
     storage: Option<Arc<Storage>>,
     /// The tokens in force; every connection watches them.
     tokens: Option<Arc<watch::Sender<Arc<Tokens>>>>,
@@ -77,11 +88,13 @@ pub struct Server {
     /// How many messages may wait for one connection; the default when
     /// `None`.
     outgoing: Option<usize>,
+    /// Compressed document bytes accepted by one HTTP upload.
+    upload: Option<usize>,
     audit: Audit,
 }
 
 /// A name that is a single plain file name, so it can name a directory too.
-fn valid_name(name: &str) -> bool {
+pub(crate) fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('.')
         && !name
@@ -96,7 +109,8 @@ impl Server {
     }
 
     /// A server whose documents are durable in `dir`, with every document
-    /// already there reopened as it was.
+    /// already there reopened as it was. Owns this directory exclusively
+    /// until all clones are dropped and their document threads have stopped.
     pub fn with_storage(dir: impl Into<PathBuf>) -> Result<Self, ServerError> {
         Self::with_storage_options(dir, StorageOptions::default())
     }
@@ -106,20 +120,38 @@ impl Server {
         options: StorageOptions,
     ) -> Result<Self, ServerError> {
         let dir = dir.into();
+        let dir: PathBuf = dir.components().collect();
         let storage_error = |message: String| ServerError::Storage {
             dir: dir.clone(),
             message,
         };
         std::fs::create_dir_all(&dir).map_err(|e| storage_error(e.to_string()))?;
+        // Never unlink this file: replacing its inode would let a second
+        // process lock a different file while the first still owns storage.
+        let lock = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.join(".lock"))
+            .map_err(|e| storage_error(e.to_string()))?;
+        lock.try_lock().map_err(|e| {
+            storage_error(match e {
+                std::fs::TryLockError::WouldBlock => "already in use by another server".to_string(),
+                std::fs::TryLockError::Error(e) => e.to_string(),
+            })
+        })?;
         let server = Self {
             rooms: Arc::default(),
             storage: Some(Arc::new(Storage {
                 dir: dir.clone(),
                 options,
+                _lock: lock,
             })),
             tokens: None,
             presence: PresenceLimits::default(),
             outgoing: None,
+            upload: None,
             audit: Audit::default(),
         };
         let entries = std::fs::read_dir(&dir).map_err(|e| storage_error(e.to_string()))?;
@@ -132,11 +164,17 @@ impl Server {
                 continue;
             };
             // A directory without a snapshot is an open that never finished.
-            if newest_generation(&entry.path())
-                .map_err(storage_error)?
-                .is_none()
-            {
+            let Some(generation) = newest_generation(&entry.path()).map_err(storage_error)? else {
                 continue;
+            };
+            let name = snapshot_name(&entry.path(), generation)
+                .map_err(storage_error)?
+                .unwrap_or(name);
+            if !valid_name(&name) || Format::of(&name) != Some(format) {
+                return Err(storage_error(format!(
+                    "{} holds an invalid or mismatched document name {name:?}",
+                    entry.path().display()
+                )));
             }
             server.start(
                 &name,
@@ -169,6 +207,15 @@ impl Server {
     /// for it.
     pub fn with_outgoing_limit(mut self, limit: usize) -> Self {
         self.outgoing = Some(limit.max(1));
+        self
+    }
+
+    /// Accepts at most `limit` compressed bytes per HTTP PUT, including
+    /// streamed bodies without Content-Length. Zero refuses nonempty uploads.
+    /// Authorization runs before the body is read. Over-limit or interrupted
+    /// uploads never open a document or reserve its durable storage.
+    pub fn with_upload_limit(mut self, limit: usize) -> Self {
+        self.upload = Some(limit);
         self
     }
 
@@ -262,15 +309,14 @@ impl Server {
 
     /// Opens `bytes` as the document `name` (its extension picks the format).
     /// On a durable server the document is stored before it is served.
+    /// Loading reserves this name while other documents remain accessible.
+    /// A failed load releases it; listings and connections see only ready rooms.
     pub fn open(&self, name: &str, bytes: Vec<u8>) -> Result<Format, ServerError> {
         if !valid_name(name) {
             return Err(ServerError::InvalidName(name.to_string()));
         }
         let format =
             Format::of(name).ok_or_else(|| ServerError::UnknownFormat(name.to_string()))?;
-        if self.rooms.lock().unwrap().contains_key(name) {
-            return Err(ServerError::Exists(name.to_string()));
-        }
         let source = match &self.storage {
             Some(storage) => Source::NewStored {
                 bytes,
@@ -284,33 +330,37 @@ impl Server {
     }
 
     fn start(&self, name: &str, format: Format, source: Source) -> Result<(), ServerError> {
-        let commands = room::spawn(name, format, source).map_err(|message| ServerError::Open {
+        self.start_with(name, format, || room::spawn(name, format, source))
+    }
+
+    fn start_with(
+        &self,
+        name: &str,
+        format: Format,
+        open: impl FnOnce() -> Result<room::Actor, String>,
+    ) -> Result<(), ServerError> {
+        // Only the name transition holds the registry mutex. Loading and
+        // storage initialization must not stall operations on another room.
+        let reservation = self
+            .rooms
+            .reserve(name)
+            .ok_or_else(|| ServerError::Exists(name.to_string()))?;
+        let actor = open().map_err(|message| ServerError::Open {
             name: name.to_string(),
             message,
         })?;
-        let mut rooms = self.rooms.lock().unwrap();
-        if rooms.contains_key(name) {
-            return Err(ServerError::Exists(name.to_string()));
-        }
-        rooms.insert(name.to_string(), RoomHandle { format, commands });
-        Ok(())
+        reservation
+            .publish(RoomHandle { format, actor })
+            .map_err(|_| ServerError::Exists(name.to_string()))
     }
 
     pub fn documents(&self) -> Vec<(String, Format)> {
-        self.rooms
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(name, room)| (name.clone(), room.format))
-            .collect()
+        self.rooms.list(|name, room| (name.to_owned(), room.format))
     }
 
-    fn commands(&self, name: &str) -> Result<mpsc::Sender<Command>, ServerError> {
+    fn commands(&self, name: &str) -> Result<room::Commands, ServerError> {
         self.rooms
-            .lock()
-            .unwrap()
-            .get(name)
-            .map(|room| room.commands.clone())
+            .with_ready(name, |room| room.actor.commands.clone())
             .ok_or_else(|| ServerError::NotFound(name.to_string()))
     }
 
@@ -322,6 +372,7 @@ impl Server {
         let (reply, answer) = oneshot::channel();
         self.commands(name)?
             .send(command(reply))
+            .await
             .map_err(|_| ServerError::Stopped(name.to_string()))?;
         answer
             .await
@@ -356,6 +407,9 @@ impl Server {
             .route("/documents", get(list))
             .route("/documents/{name}", get(download).put(upload))
             .route("/documents/{name}/ws", get(socket))
+            .layer(DefaultBodyLimit::max(
+                self.upload.unwrap_or(DEFAULT_UPLOAD_LIMIT),
+            ))
             .layer(middleware::from_fn_with_state(self.clone(), authenticate))
             .with_state(self.clone())
     }
@@ -415,31 +469,53 @@ async fn download(
     }
 }
 
+/// A parts-only extractor: forbidden uploads cannot poll even one body frame.
+struct UploadPermit {
+    name: String,
+    grant: Option<Grant>,
+}
+
+impl FromRequestParts<Server> for UploadPermit {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        server: &Server,
+    ) -> Result<Self, Self::Rejection> {
+        let Path(name) = Path::<String>::from_request_parts(parts, server)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        let grant = parts.extensions.get::<Grant>().cloned();
+        match access(grant.as_ref(), &name) {
+            Some(Role::Editor) => Ok(Self { name, grant }),
+            Some(Role::Viewer) => {
+                refused(server, grant.as_ref(), &name, StatusCode::FORBIDDEN);
+                Err((StatusCode::FORBIDDEN, "viewers cannot upload documents").into_response())
+            }
+            None => {
+                refused(server, grant.as_ref(), &name, StatusCode::FORBIDDEN);
+                Err(forbidden(&name))
+            }
+        }
+    }
+}
+
 async fn upload(
-    Path(name): Path<String>,
     State(server): State<Server>,
-    grant: Option<Extension<Grant>>,
-    body: Bytes,
+    UploadPermit { name, grant }: UploadPermit,
+    body: Result<Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Response {
-    let grant = grant.map(|Extension(grant)| grant);
-    match access(grant.as_ref(), &name) {
-        Some(Role::Editor) => {}
-        Some(Role::Viewer) => {
-            refused(&server, grant.as_ref(), &name, StatusCode::FORBIDDEN);
-            return (StatusCode::FORBIDDEN, "viewers cannot upload documents").into_response();
+    let body = match body {
+        Ok(body) => body,
+        Err(error) => {
+            refused(&server, grant.as_ref(), &name, error.status());
+            return error.into_response();
         }
-        None => {
-            refused(&server, grant.as_ref(), &name, StatusCode::FORBIDDEN);
-            return forbidden(&name);
-        }
-    }
+    };
     let audit = server.audit().clone();
-    let entry = serde_json::json!({ "document": name, "token": token_name(grant.as_ref()) });
+    let mut entry = serde_json::json!({ "document": name, "token": token_name(grant.as_ref()) });
     let opened = tokio::task::spawn_blocking(move || server.open(&name, body.to_vec())).await;
-    if matches!(opened, Ok(Ok(_))) {
-        audit.record("uploaded", entry);
-    }
-    match opened {
+    let response = match opened {
         Ok(Ok(format)) => (
             StatusCode::CREATED,
             Json(serde_json::json!({ "format": format })),
@@ -447,7 +523,16 @@ async fn upload(
             .into_response(),
         Ok(Err(error)) => error_response(error),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    };
+    if response.status().is_success() {
+        audit.record("uploaded", entry);
+    } else {
+        // Native parse/package-limit errors and name conflicts are refusals
+        // too. Keep payloads, decoder messages and credentials out of the log.
+        entry["status"] = response.status().as_u16().into();
+        audit.record("refused", entry);
     }
+    response
 }
 
 async fn socket(
@@ -533,6 +618,13 @@ impl Access {
         };
         let tokens = watched.tokens.borrow_and_update().clone();
         let (grant, role) = recheck(&tokens, &watched.token, &watched.document)?;
+        if self
+            .grant
+            .as_ref()
+            .is_some_and(|previous| previous.name != grant.name)
+        {
+            return Err("the token's principal changed; join again".into());
+        }
         self.grant = Some(grant);
         self.role = role;
         Ok(())
@@ -556,7 +648,68 @@ enum Ending {
     Overloaded,
     /// The document's thread is gone.
     Stopped,
+    InputBusy,
+    InputTooLarge {
+        limit: usize,
+    },
 }
+
+/// Capacity waits keep authorization and shutdown live on the socket's executor.
+async fn input_slot(
+    commands: &room::Commands,
+    bytes: usize,
+    access: &mut Access,
+    outbox: &crate::outbox::Outbox,
+    overloaded: &crate::outbox::Overloaded,
+    wait: Duration,
+) -> Result<crate::mailbox::Permit<Command>, Ending> {
+    let reserve = commands.reserve(bytes);
+    tokio::pin!(reserve);
+    let deadline = tokio::time::sleep(wait);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            biased;
+            () = access.changed() => access.refresh().map_err(Ending::Revoked)?,
+            () = overloaded.wait() => return Err(Ending::Overloaded),
+            () = outbox.stopped() => return Err(Ending::Stopped),
+            () = &mut deadline => return Err(Ending::InputBusy),
+            permit = &mut reserve => {
+                let permit = permit.map_err(|error| match error {
+                    crate::mailbox::Error::Closed => Ending::Stopped,
+                    crate::mailbox::Error::TooLarge { limit } => Ending::InputTooLarge { limit },
+                })?;
+                access.refresh().map_err(Ending::Revoked)?;
+                return Ok(permit);
+            }
+        }
+    }
+}
+
+async fn input_answer<T>(
+    answer: oneshot::Receiver<T>,
+    commands: &room::Commands,
+    access: &mut Access,
+    outbox: &crate::outbox::Outbox,
+    overloaded: &crate::outbox::Overloaded,
+) -> Result<T, Ending> {
+    tokio::pin!(answer);
+    let deadline = tokio::time::sleep(INPUT_WAIT);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            biased;
+            () = access.changed() => access.refresh().map_err(Ending::Revoked)?,
+            () = overloaded.wait() => return Err(Ending::Overloaded),
+            () = outbox.stopped() => return Err(Ending::Stopped),
+            () = commands.stopped() => return Err(Ending::Stopped),
+            () = &mut deadline => return Err(Ending::InputBusy),
+            result = &mut answer => return result.map_err(|_| Ending::Stopped),
+        }
+    }
+}
+
+const INPUT_WAIT: Duration = Duration::from_secs(10);
 
 /// The token's name, for the audit log; never the token.
 fn token_name(grant: Option<&Grant>) -> serde_json::Value {
@@ -579,7 +732,7 @@ fn refused(server: &Server, grant: Option<&Grant>, document: &str, status: Statu
 /// the limits of `settings`.
 async fn connection(
     socket: WebSocket,
-    commands: mpsc::Sender<Command>,
+    commands: room::Commands,
     mut access: Access,
     settings: Settings,
 ) {
@@ -647,6 +800,14 @@ async fn connection(
                 ending = Some(Ending::Overloaded);
                 continue;
             }
+            () = commands.stopped() => {
+                ending = Some(Ending::Stopped);
+                continue;
+            }
+            () = outbox.stopped() => {
+                ending = Some(Ending::Stopped);
+                continue;
+            }
             message = stream.next() => message,
         };
         let Some(Ok(message)) = message else { break };
@@ -654,6 +815,22 @@ async fn connection(
             Message::Text(text) => text,
             Message::Close(_) => break,
             _ => continue,
+        };
+        let permit = match input_slot(
+            &commands,
+            text.len(),
+            &mut access,
+            &outbox,
+            &overloaded,
+            INPUT_WAIT,
+        )
+        .await
+        {
+            Ok(permit) => permit,
+            Err(reason) => {
+                ending = Some(reason);
+                break;
+            }
         };
         let message = match serde_json::from_str::<ClientMessage>(&text) {
             Ok(message) => message,
@@ -664,6 +841,11 @@ async fn connection(
                 continue;
             }
         };
+        // Decoding a large frame may overlap a token reload on another thread.
+        if let Err(reason) = access.refresh() {
+            ending = Some(Ending::Revoked(reason));
+            break;
+        }
         match message {
             ClientMessage::Join | ClientMessage::Resume { .. } if replica.is_some() => {
                 say(ServerMessage::Error {
@@ -672,12 +854,17 @@ async fn connection(
             }
             ClientMessage::Join => {
                 let (reply, answer) = oneshot::channel();
-                let sent = commands.send(Command::Join {
+                let sent = permit.send(Command::Join {
+                    principal: access.grant.as_ref().map(|grant| grant.name.clone()),
                     outbox: outbox.clone(),
                     reply,
                 });
-                match (sent, answer.await) {
-                    (Ok(()), Ok(id)) => {
+                if sent.is_err() {
+                    ending = Some(Ending::Stopped);
+                    continue;
+                }
+                match input_answer(answer, &commands, &mut access, &outbox, &overloaded).await {
+                    Ok(Ok(id)) => {
                         replica = Some(id);
                         audit.record(
                             "joined",
@@ -688,13 +875,17 @@ async fn connection(
                             }),
                         );
                     }
-                    _ => ending = Some(Ending::Stopped),
+                    Ok(Err(error)) => say(ServerMessage::Error {
+                        message: error.to_string(),
+                    }),
+                    Err(reason) => ending = Some(reason),
                 }
             }
             ClientMessage::Resume { replica: id, seq } => {
                 let (reply, answer) = oneshot::channel();
-                if commands
+                if permit
                     .send(Command::Resume {
+                        principal: access.grant.as_ref().map(|grant| grant.name.clone()),
                         replica: id,
                         seq,
                         outbox: outbox.clone(),
@@ -705,7 +896,7 @@ async fn connection(
                     ending = Some(Ending::Stopped);
                     continue;
                 }
-                match answer.await {
+                match input_answer(answer, &commands, &mut access, &outbox, &overloaded).await {
                     Ok(Ok(())) => {
                         replica = Some(id);
                         audit.record(
@@ -726,9 +917,27 @@ async fn connection(
                     Ok(Err(error)) => say(ServerMessage::Error {
                         message: error.to_string(),
                     }),
-                    Err(_) => ending = Some(Ending::Stopped),
+                    Err(reason) => ending = Some(reason),
                 }
             }
+            ClientMessage::Inspect { request } => match replica {
+                Some(replica) => {
+                    if permit
+                        .send(Command::Inspect {
+                            replica,
+                            outbox: outbox.clone(),
+                            request,
+                        })
+                        .is_err()
+                    {
+                        ending = Some(Ending::Stopped);
+                    }
+                }
+                None => say(ServerMessage::InspectionFailed {
+                    request,
+                    message: "join a document before inspecting it".into(),
+                }),
+            },
             ClientMessage::Presence { state } => match replica {
                 Some(replica) => {
                     // Over a limit, it is dropped here, before the
@@ -751,7 +960,7 @@ async fn connection(
                         state,
                         outbox: outbox.clone(),
                     };
-                    if commands.send(command).is_err() {
+                    if permit.send(command).is_err() {
                         ending = Some(Ending::Stopped);
                     }
                 }
@@ -760,19 +969,16 @@ async fn connection(
                 }),
             },
             ClientMessage::Submit(submission) => match replica {
-                // Answered here: a viewer's operation never reaches the
-                // document, and its replica has nothing of its own in the log.
-                Some(_) if access.role != Role::Editor => say(ServerMessage::Rejected(Rejected {
-                    client_seq: submission.client_seq,
-                    reason: Rejection::new("this token is read-only (viewer)"),
-                })),
                 Some(replica) => {
                     let command = Command::Submit {
                         replica,
+                        outbox: outbox.clone(),
                         author: access.grant.as_ref().map(|grant| grant.name.clone()),
+                        refusal: (access.role != Role::Editor)
+                            .then(|| Rejection::new("this token is read-only (viewer)")),
                         submission,
                     };
-                    if commands.send(command).is_err() {
+                    if permit.send(command).is_err() {
                         ending = Some(Ending::Stopped);
                     }
                 }
@@ -782,17 +988,13 @@ async fn connection(
             },
         }
     }
-    if let Some(replica) = replica {
-        let _ = commands.send(Command::Leave {
-            replica,
-            outbox: outbox.clone(),
-        });
-    }
     let reason = match &ending {
         None => "client",
         Some(Ending::Revoked(_)) => "revoked",
         Some(Ending::Overloaded) => "overloaded",
         Some(Ending::Stopped) => "stopped",
+        Some(Ending::InputBusy) => "input-overloaded",
+        Some(Ending::InputTooLarge { .. }) => "input-too-large",
     };
     audit.record(
         "closed",
@@ -820,6 +1022,24 @@ async fn connection(
             close_code::AGAIN,
             "reading too slowly",
         )),
+        Some(Ending::InputBusy) => Some((
+            ServerMessage::Overloaded {
+                message:
+                    "document input remained busy for 10 seconds; resume to reconcile pending edits"
+                        .into(),
+            },
+            close_code::AGAIN,
+            "document input busy",
+        )),
+        Some(Ending::InputTooLarge { limit }) => Some((
+            ServerMessage::Error {
+                message: format!(
+                    "one message exceeds the {limit}-byte document input limit; split the edit"
+                ),
+            },
+            close_code::SIZE,
+            "document input too large",
+        )),
         None | Some(Ending::Stopped) => None,
     };
     if let Some(last) = last {
@@ -828,6 +1048,11 @@ async fn connection(
     }
     // The socket is gone; nothing more can be written to it.
     writer.abort();
+    // Cleanup follows accepted commands, including a join whose answer was
+    // cancelled before this connection learned its replica id.
+    let _ = commands
+        .send(Command::Disconnected { replica, outbox })
+        .await;
 }
 
 /// How long a closing connection gets to take its last word before the

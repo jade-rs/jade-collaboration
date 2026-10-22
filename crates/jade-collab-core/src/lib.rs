@@ -10,3 +10,5 @@ pub mod id;
 pub mod lww;
 pub mod marks;
 pub mod rga;
+
+pub mod text;

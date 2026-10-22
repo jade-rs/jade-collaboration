@@ -110,7 +110,7 @@ async fn sockets_are_audited_by_token_name_and_never_by_token() {
     }
 
     // Coming back is audited too.
-    let _back = Client::resume(&url, replica_back, Some("ada-secret"))
+    let _back = Client::resume(&url, &replica_back, Some("ada-secret"))
         .await
         .unwrap();
     let found = until(&log, |found| !event(found, "resumed").is_empty()).await;

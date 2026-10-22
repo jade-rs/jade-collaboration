@@ -15,6 +15,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+mod positions;
+#[cfg(test)]
+mod table_walk_tests;
 mod tracked;
 
 use jade_collab_core::grid::{Grid, GridOp, Merge};
@@ -204,6 +207,29 @@ pub(crate) struct Table {
 }
 
 impl Table {
+    /// Visit only stored cells, in alive grid order. Sparse imported merges
+    /// can span millions of absent positions; walking their Cartesian grid
+    /// would amplify a tiny package even without creating new stories.
+    fn visible_cells(&self, rows: &[Id], columns: &[Id]) -> Vec<(usize, usize, &[StoryKey])> {
+        let row_order: BTreeMap<Id, usize> =
+            rows.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+        let column_order: BTreeMap<Id, usize> =
+            columns.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+        let mut cells: Vec<_> = self
+            .layout
+            .iter()
+            .filter_map(|((row, column), shown)| {
+                Some((
+                    *row_order.get(row)?,
+                    *column_order.get(column)?,
+                    shown.as_slice(),
+                ))
+            })
+            .collect();
+        cells.sort_unstable_by_key(|(row, column, _)| (*row, *column));
+        cells
+    }
+
     /// A grid of single cells, each showing its own new story.
     pub(crate) fn new(rows: &[Id], columns: &[Id], locked: bool, top_level: bool) -> Self {
         let mut table = Self {
@@ -311,6 +337,8 @@ pub struct DocxModel {
     #[serde(default, with = "pairs")]
     pub(crate) deleted: BTreeMap<Id, BTreeSet<Id>>,
     pub(crate) max_lamport: u64,
+    #[serde(skip)]
+    pub(crate) positions: positions::Positions,
 }
 
 /// What a revision does.
@@ -629,6 +657,15 @@ impl FormatChange {
     /// Refuses values jade would write into the file verbatim but Word
     /// cannot read.
     pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::FontFamily { family } => {
+                jade_collab_core::text::check_xml_10(family).map_err(|e| e.to_string())?
+            }
+            Self::ParagraphStyle {
+                style_id: Some(style),
+            } => jade_collab_core::text::check_xml_10(style).map_err(|e| e.to_string())?,
+            _ => {}
+        }
         let ok = match self {
             Self::Underline {
                 style: Some(style), ..
@@ -1174,6 +1211,9 @@ fn comment_text(text: &str) -> Result<(), Rejection> {
     Ok(())
 }
 
+#[cfg(test)]
+mod position_tests;
+
 impl DocxModel {
     /// A body-only document, one paragraph per entry; ids belong to
     /// [`ReplicaId::ORIGIN`].
@@ -1215,10 +1255,13 @@ impl DocxModel {
             inserted: BTreeMap::new(),
             deleted: BTreeMap::new(),
             max_lamport: next - 1,
+            positions: positions::Positions::default(),
         }
     }
 
     fn walk(&self) -> Walk {
+        #[cfg(test)]
+        position_tests::walked();
         let mut out = Walk::default();
         self.walk_story(Root::Body, StoryId::Body, &self.body, &mut out, &mut 0);
         // Footnotes no body paragraph referenced, then endnotes in order of
@@ -1393,12 +1436,10 @@ impl DocxModel {
                     merges: table.merge_indices(),
                 });
             }
-            for &row in &rows {
-                for &column in &columns {
-                    for key in table.layout.get(&(row, column)).into_iter().flatten() {
-                        let cell = story_id(table_id, *key);
-                        self.walk_story(root, cell, &table.stories[key], out, counter);
-                    }
+            for (_, _, shown) in table.visible_cells(&rows, &columns) {
+                for key in shown {
+                    let cell = story_id(table_id, *key);
+                    self.walk_story(root, cell, &table.stories[key], out, counter);
                 }
             }
         }
@@ -1509,6 +1550,9 @@ impl DocxModel {
     /// Where each requested visible atom is; a mark reports its paragraph's
     /// end.
     fn locate(&self, ids: &BTreeSet<Id>) -> BTreeMap<Id, Located> {
+        if let Some(found) = self.positions.locate(self, ids) {
+            return found;
+        }
         let mut found = BTreeMap::new();
         for (ordinal, paragraph) in self.paragraphs().into_iter().enumerate() {
             let mut offset = 0;
@@ -1550,7 +1594,9 @@ impl DocxModel {
 
     /// jade's story position of the visible paragraph at `ordinal`.
     fn at(&self, ordinal: usize) -> ParagraphStory {
-        self.paragraphs()[ordinal].at.clone()
+        self.positions
+            .paragraph(self, ordinal)
+            .unwrap_or_else(|| self.paragraphs()[ordinal].at.clone())
     }
 
     /// The ordinal of the visible paragraph `mark` ends.
@@ -1586,11 +1632,28 @@ impl DocxModel {
         }
         self.editable_story(story)?;
         let count = text.chars().count() as u64;
-        self.story_mut(story).expect("checked").flow.insert_run(
+        let index = self.positions.take();
+        if let Err(error) = self.story_mut(story).expect("checked").flow.insert_run(
             first,
             parent,
             text.chars().map(Atom::Char),
-        )?;
+        ) {
+            // Invalid text facts must not build an index, and rejecting one
+            // must not throw away an existing healthy warm projection.
+            self.positions.restore(index);
+            return Err(error.into());
+        }
+        if let Some(index) = index {
+            let updated = index.inserted(
+                story,
+                first,
+                text,
+                &self.story(story).expect("checked").flow,
+            );
+            self.positions.put(updated);
+        }
+        // A cold index is constructed lazily from the successful new state
+        // by locate_one below. Optimistic/unsupported paths keep their walk.
         self.observe([first.offset(count - 1)]);
         Ok(self
             .locate_one(first)
@@ -1885,6 +1948,7 @@ impl DocxModel {
             GridOp::DeleteColumn { id } => table.grid.column_index(*id),
             _ => None,
         };
+        let (all_rows, all_columns) = (table.grid.all_rows(), table.grid.all_columns());
         // A merged cell's `w:tc` sits in its left column; deleting that
         // column leaves the `w:tc` (one column narrower) in the next one, so
         // what the merged cell and its followers show moves there.
@@ -1929,7 +1993,6 @@ impl DocxModel {
                     first <= *i && *i <= last
                 })
         });
-        let (all_rows, all_columns) = (table.grid.all_rows(), table.grid.all_columns());
         let table = self.tables.get_mut(&table_id).expect("checked");
         table.grid = grid;
         // A new cell a merge covers (not in the merge's left column) has no
@@ -2023,6 +2086,9 @@ impl DocxModel {
             .iter()
             .filter(|p| p.1 == merge.left && p.0 != merge.top)
             .count();
+        if followers > 0 {
+            first.last_in_run(followers as u64)?;
+        }
         let fresh = |k: usize| first.offset(k as u64);
         if (0..followers).any(|k| table.stories.contains_key(&StoryKey::Split(fresh(k)))) {
             return Err(reject(format!("story id {first} is taken")));
@@ -2078,6 +2144,9 @@ impl DocxModel {
             .ok_or_else(|| reject("no merged region starts at that cell"))?;
         let positions = table.positions(&merge);
         let freed: Vec<(Id, Id)> = positions.iter().copied().filter(|p| p.1 != left).collect();
+        if !freed.is_empty() {
+            first.last_in_run(freed.len() as u64)?;
+        }
         let fresh = |k: usize| first.offset(k as u64);
         if (0..freed.len()).any(|k| table.stories.contains_key(&StoryKey::Split(fresh(k)))) {
             return Err(reject(format!("story id {first} is taken")));
@@ -2648,6 +2717,7 @@ impl DocxModel {
         text: &str,
     ) -> Result<Vec<DocxEffect>, Rejection> {
         Self::new_story_text(text)?;
+        id.last_in_run(2 + text.chars().count() as u64)?;
         if self.footnotes.contains_key(&id) || self.endnotes.contains_key(&id) {
             return Err(reject(format!("note {id} already exists")));
         }
@@ -2685,6 +2755,7 @@ impl DocxModel {
         (width_px, height_px): (u32, u32),
     ) -> Result<Vec<DocxEffect>, Rejection> {
         Self::new_story_text(text)?;
+        id.last_in_run(1 + text.chars().count() as u64)?;
         if !(TEXT_BOX_PX.contains(&width_px) && TEXT_BOX_PX.contains(&height_px)) {
             return Err(reject(format!(
                 "a text box is {TEXT_BOX_PX:?} pixels wide and high"
@@ -2695,7 +2766,11 @@ impl DocxModel {
         }
         let (paragraph, offset, anchors) =
             self.place_anchor(story, parent, id, Placement::TextBox(id))?;
-        let (text_box, count) = Self::new_story(id.offset(1), text.chars());
+        let (text_box, count) = if text.is_empty() {
+            (Story::empty_paragraph(), 0)
+        } else {
+            Self::new_story(id.offset(1), text.chars())
+        };
         self.text_boxes.insert(id, text_box);
         self.observe([id.offset(count)]);
         Ok(vec![DocxEffect::InsertTextBox {
@@ -2827,7 +2902,293 @@ impl Document for DocxModel {
         }
     }
 
+    fn validate_submission(&self, op: &DocxOp, origin: ReplicaId) -> Result<(), Rejection> {
+        Self::check_text_fields(op)?;
+        let own = |id| jade_collab_sync::check_id_owner(id, origin);
+        match op {
+            DocxOp::InsertText { first, text, .. }
+            | DocxOp::TrackInsertText { first, text, .. } => {
+                if !text.is_empty() {
+                    own(*first)?;
+                }
+            }
+            DocxOp::SplitParagraph { id, .. }
+            | DocxOp::Mark { id, .. }
+            | DocxOp::AddComment { id, .. }
+            | DocxOp::ReplyToComment { id, .. }
+            | DocxOp::InsertNote { id, .. }
+            | DocxOp::InsertTextBox { id, .. } => own(*id)?,
+            DocxOp::TrackDeleteText { revision, .. } => own(*revision)?,
+            DocxOp::InsertTable {
+                id, rows, columns, ..
+            } => {
+                own(*id)?;
+                for id in rows.iter().chain(columns) {
+                    own(*id)?;
+                }
+            }
+            DocxOp::Table { op, .. } => match op {
+                GridOp::InsertRow { id, .. } | GridOp::InsertColumn { id, .. } => own(*id)?,
+                GridOp::DeleteRow { .. }
+                | GridOp::DeleteColumn { .. }
+                | GridOp::Merge(_)
+                | GridOp::Unmerge { .. } => {}
+            },
+            // These fields are unused when no new story is created. In
+            // particular the intent API deliberately emits an origin sentinel.
+            DocxOp::MergeCells { merge, first, .. } => {
+                if merge.top != merge.bottom {
+                    own(*first)?;
+                }
+            }
+            DocxOp::UnmergeCells {
+                table,
+                top,
+                left,
+                first,
+            } => {
+                if self
+                    .tables
+                    .get(table)
+                    .and_then(|t| {
+                        t.grid
+                            .merges()
+                            .iter()
+                            .find(|m| m.top == *top && m.left == *left)
+                    })
+                    .is_some_and(|m| m.left != m.right)
+                {
+                    own(*first)?;
+                }
+            }
+            DocxOp::DeleteText { .. }
+            | DocxOp::JoinParagraph { .. }
+            | DocxOp::DeleteTable { .. }
+            | DocxOp::Format { .. }
+            | DocxOp::ResolveComment { .. }
+            | DocxOp::DeleteComment { .. }
+            | DocxOp::UpdateComment { .. }
+            | DocxOp::DeleteNote { .. }
+            | DocxOp::DeleteTextBox { .. }
+            | DocxOp::Numbered { .. }
+            | DocxOp::SetTracking { .. }
+            | DocxOp::SetAuthor { .. }
+            | DocxOp::AcceptRevisions { .. }
+            | DocxOp::RejectRevisions { .. } => {}
+        }
+        // Location/revision maps address atoms by ID across all stories.
+        // A per-story RGA duplicate check alone cannot protect that identity.
+        self.check_atom_allocations(op)
+    }
+
     fn apply(&mut self, op: &DocxOp, ctx: &ApplyContext) -> Result<Vec<DocxEffect>, Rejection> {
+        self.check_table_budget(op)?;
+        self.apply_fact(op, ctx)
+    }
+
+    fn apply_recorded(
+        &mut self,
+        op: &DocxOp,
+        ctx: &ApplyContext,
+    ) -> Result<Vec<DocxEffect>, Rejection> {
+        self.apply_fact(op, ctx)
+    }
+
+    fn max_lamport(&self) -> u64 {
+        self.max_lamport
+    }
+}
+
+/// Serializes a map with non-string keys as a list of pairs.
+mod pairs {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+
+    pub fn serialize<K: Serialize, V: Serialize, S: Serializer>(
+        map: &BTreeMap<K, V>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(map.iter())
+    }
+
+    pub fn deserialize<'de, K, V, D>(deserializer: D) -> Result<BTreeMap<K, V>, D::Error>
+    where
+        K: Deserialize<'de> + Ord,
+        V: Deserialize<'de>,
+        D: Deserializer<'de>,
+    {
+        Ok(Vec::<(K, V)>::deserialize(deserializer)?
+            .into_iter()
+            .collect())
+    }
+}
+
+impl DocxModel {
+    fn check_atom_allocations(&self, op: &DocxOp) -> Result<(), Rejection> {
+        let (first, count) = match op {
+            DocxOp::InsertText { first, text, .. }
+            | DocxOp::TrackInsertText { first, text, .. } => (*first, text.chars().count() as u64),
+            DocxOp::SplitParagraph { id, .. } => (*id, 1),
+            // The anchor and note's leading tab are implicit atoms too.
+            DocxOp::InsertNote { id, text, .. } => (*id, 2 + text.chars().count() as u64),
+            DocxOp::InsertTextBox { id, text, .. } => (*id, 1 + text.chars().count() as u64),
+            _ => return Ok(()),
+        };
+        if count == 0 {
+            return Ok(());
+        }
+        let last = first.last_in_run(count)?;
+        for (_, story) in self.stories() {
+            let flow = &story.flow;
+            // Probe the shorter side. Ordinary typing uses ID hash lookups,
+            // never a scan of the whole document; long runs in small stories
+            // scan stored atoms, including tombstones and hidden stories.
+            let duplicate = if count > flow.len() as u64 {
+                flow.iter()
+                    .map(|node| node.id)
+                    .find(|id| id.replica == first.replica && *id >= first && *id <= last)
+            } else {
+                (0..count)
+                    .map(|offset| first.offset(offset))
+                    .find(|id| flow.contains(*id))
+            };
+            if let Some(id) = duplicate {
+                return Err(reject(format!("atom {id} already exists in the document")));
+            }
+        }
+        Ok(())
+    }
+
+    /// Resource admission is pure and precedes cell expansion or clock writes.
+    /// Existing serialized models and committed facts keep their original shape.
+    pub(crate) fn check_table_budget(&self, op: &DocxOp) -> Result<(), Rejection> {
+        match op {
+            DocxOp::InsertTable { rows, columns, .. } => {
+                crate::table_budget::check(rows.len(), columns.len())?;
+            }
+            DocxOp::Table { table, op } => {
+                if let Some(table) = self.tables.get(table) {
+                    match op {
+                        GridOp::InsertRow { .. } => {
+                            crate::table_budget::check(1, table.grid.stored_column_count())?;
+                        }
+                        GridOp::InsertColumn { .. } => {
+                            crate::table_budget::check(table.grid.stored_row_count(), 1)?;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            DocxOp::MergeCells { table, merge, .. } => {
+                if let Some(table) = self.tables.get(table) {
+                    Self::check_rectangle(table, merge)?;
+                }
+            }
+            DocxOp::UnmergeCells {
+                table, top, left, ..
+            } => {
+                if let Some(table) = self.tables.get(table) {
+                    if let Some(merge) = table
+                        .grid
+                        .merges()
+                        .iter()
+                        .find(|m| m.top == *top && m.left == *left)
+                    {
+                        Self::check_rectangle(table, merge)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn check_rectangle(table: &Table, merge: &Merge) -> Result<(), Rejection> {
+        let Some((top, bottom, left, right)) = table
+            .grid
+            .row_index(merge.top)
+            .zip(table.grid.row_index(merge.bottom))
+            .zip(
+                table
+                    .grid
+                    .column_index(merge.left)
+                    .zip(table.grid.column_index(merge.right)),
+            )
+            .map(|((t, b), (l, r))| (t, b, l, r))
+        else {
+            return Ok(());
+        };
+        // Invalid/inverted coordinates are still refused by normal grid
+        // validation; they allocate no rectangle.
+        if let (Some(rows), Some(columns)) = (
+            bottom.checked_sub(top).and_then(|n| n.checked_add(1)),
+            right.checked_sub(left).and_then(|n| n.checked_add(1)),
+        ) {
+            crate::table_budget::check(rows, columns)?;
+        }
+        Ok(())
+    }
+    fn check_text_fields(op: &DocxOp) -> Result<(), Rejection> {
+        use jade_collab_core::text::check_xml_10;
+        match op {
+            DocxOp::InsertText { text, .. }
+            | DocxOp::InsertNote { text, .. }
+            | DocxOp::InsertTextBox { text, .. }
+            | DocxOp::UpdateComment { text, .. } => check_xml_10(text)?,
+            DocxOp::TrackInsertText { text, date, .. } => {
+                check_xml_10(text)?;
+                if let Some(date) = date {
+                    check_xml_10(date)?;
+                }
+            }
+            DocxOp::TrackDeleteText {
+                date: Some(date), ..
+            } => check_xml_10(date)?,
+            DocxOp::AddComment { content, .. } | DocxOp::ReplyToComment { content, .. } => {
+                for text in std::iter::once(content.text.as_str()).chain(
+                    [
+                        content.author.as_deref(),
+                        content.initials.as_deref(),
+                        content.date.as_deref(),
+                    ]
+                    .into_iter()
+                    .flatten(),
+                ) {
+                    check_xml_10(text)?;
+                }
+            }
+            DocxOp::SetAuthor { name, .. } => check_xml_10(name)?,
+            DocxOp::Mark { change, .. } | DocxOp::Format { change, .. } => match change {
+                FormatChange::FontFamily { family } => check_xml_10(family)?,
+                FormatChange::ParagraphStyle {
+                    style_id: Some(style),
+                } => check_xml_10(style)?,
+                _ => {}
+            },
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn apply_fact(
+        &mut self,
+        op: &DocxOp,
+        ctx: &ApplyContext,
+    ) -> Result<Vec<DocxEffect>, Rejection> {
+        Self::check_text_fields(op)?;
+        if ctx.seq.is_some()
+            && matches!(
+                op,
+                DocxOp::InsertText { .. } | DocxOp::TrackInsertText { .. }
+            )
+        {
+            self.positions.enable();
+        } else {
+            // Internal structural mutations can query positions both before
+            // and after changing topology. Keep their canonical walk until
+            // the next ordinary insertion starts a new index.
+            self.positions.disable();
+        }
         match op {
             DocxOp::InsertText {
                 story,
@@ -2934,33 +3295,5 @@ impl Document for DocxModel {
             DocxOp::AcceptRevisions { revisions } => self.decide(revisions, true),
             DocxOp::RejectRevisions { revisions } => self.decide(revisions, false),
         }
-    }
-
-    fn max_lamport(&self) -> u64 {
-        self.max_lamport
-    }
-}
-
-/// Serializes a map with non-string keys as a list of pairs.
-mod pairs {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-    use std::collections::BTreeMap;
-
-    pub fn serialize<K: Serialize, V: Serialize, S: Serializer>(
-        map: &BTreeMap<K, V>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        serializer.collect_seq(map.iter())
-    }
-
-    pub fn deserialize<'de, K, V, D>(deserializer: D) -> Result<BTreeMap<K, V>, D::Error>
-    where
-        K: Deserialize<'de> + Ord,
-        V: Deserialize<'de>,
-        D: Deserializer<'de>,
-    {
-        Ok(Vec::<(K, V)>::deserialize(deserializer)?
-            .into_iter()
-            .collect())
     }
 }

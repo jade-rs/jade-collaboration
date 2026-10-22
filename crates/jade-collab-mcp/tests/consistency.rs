@@ -204,6 +204,7 @@ fn content(mut read: Value) -> Value {
     let object = read.as_object_mut().unwrap();
     object.remove("seq");
     object.remove("pending");
+    object.remove("snapshot");
     read
 }
 
@@ -366,7 +367,7 @@ async fn run(steps: Vec<Step>) {
         };
         expected["seq"] = json!(seq);
         expected["pending"] = json!(0);
-        assert_eq!(read, expected);
+        assert_eq!(common::without_snapshot(read), expected);
     }
     assert!(hosted.server.faults(DOCX).await.unwrap().is_empty());
     assert!(hosted.server.faults(XLSX).await.unwrap().is_empty());

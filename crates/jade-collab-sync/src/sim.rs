@@ -167,6 +167,9 @@ impl<D: Document, M: Materializer<D>> Simulation<D, M> {
 
     /// Delivers `client`'s oldest submission to the server.
     pub fn deliver_up(&mut self, client: usize) -> bool {
+        if self.server.failure().is_some() {
+            return false;
+        }
         let Some(submission) = self.up[client].pop_front() else {
             return false;
         };
@@ -192,7 +195,7 @@ impl<D: Document, M: Materializer<D>> Simulation<D, M> {
                 self.stats.rejected[slot(lane)] += 1;
                 self.down[client].push_back(outcome.downstream().expect("a rejection is answered"));
             }
-            SubmitOutcome::Duplicate => {}
+            SubmitOutcome::Duplicate | SubmitOutcome::Failed(_) => {}
         }
         true
     }
@@ -215,10 +218,12 @@ impl<D: Document, M: Materializer<D>> Simulation<D, M> {
 
     /// Delivers everything until no message is in flight.
     pub fn quiesce(&mut self) -> Result<(), SyncError> {
+        self.server.check_health()?;
         loop {
             let mut progressed = false;
             for client in 0..self.clients.len() {
                 while self.deliver_up(client) {
+                    self.server.check_health()?;
                     progressed = true;
                 }
             }

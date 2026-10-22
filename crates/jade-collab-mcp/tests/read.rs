@@ -11,6 +11,33 @@ use jade_docx_collab::{DocxModel, JadeDocx};
 use serde_json::json;
 
 #[test]
+fn read_document_reports_imported_spreadsheet_styles_and_the_default_style() {
+    use jade_xlsx_collab::{JadeXlsx, XlsxModel};
+    let jade = JadeXlsx::open(&fixture("public/fixtures/number-formats-workbook.xlsx")).unwrap();
+    let model = XlsxModel::from_workbook(jade.workbook(), Default::default()).unwrap();
+    let read = read_xlsx(&model, 0, 100);
+    for (sheet, reported) in model
+        .sheets()
+        .iter()
+        .zip(read["sheets"].as_array().unwrap())
+    {
+        assert_eq!(
+            reported["default_format"],
+            serde_json::to_value(model.default_format(sheet.id)).unwrap()
+        );
+        for (reference, format) in reported["formats"].as_object().unwrap() {
+            assert_eq!(
+                *format,
+                serde_json::to_value(jade.workbook().format_at(&sheet.name, reference).unwrap())
+                    .unwrap()
+            );
+        }
+    }
+    assert!(read["sheets"][0]["formats"].as_object().unwrap().len() >= 5);
+    assert_eq!(read["sheets"][0]["default_format"]["bold"], json!(false));
+}
+
+#[test]
 fn read_document_names_note_and_text_box_paragraphs() {
     let jade = JadeDocx::load(&fixture(
         "public/fixtures/footnote-table-textbox-order.docx",
@@ -88,7 +115,8 @@ fn read_document_shows_tracked_insertions_and_deletions() {
     let jade = JadeDocx::load(&fixture("public/fixtures/review.docx")).unwrap();
     let model = DocxModel::from_word_document(jade.word()).unwrap();
     let read = read_docx(&model, 0, 100);
-    assert_eq!(read["tracking"], json!(false));
+    // review.docx has <w:trackRevisions/> in its settings part.
+    assert_eq!(read["tracking"], json!(true));
     let revisions = read["revisions"].as_array().unwrap();
     assert_eq!(revisions.len(), 2);
     let insertion = &revisions[0];

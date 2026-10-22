@@ -298,7 +298,7 @@ pub fn derive(model: &mut DocxModel, jade: &mut JadeDocx, cause: &DocxOp) {
         base_seq: 0,
         seq: Some(1),
     };
-    for op in jade.derived(model, cause) {
+    for op in jade.derived(model, cause).unwrap() {
         let effect = model
             .apply(&op, &ctx)
             .unwrap_or_else(|e| panic!("derived {op:?}: {e}"));

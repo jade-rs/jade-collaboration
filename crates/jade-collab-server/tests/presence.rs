@@ -129,7 +129,7 @@ async fn leaving_clears_presence_everywhere() {
     until(&b, |m| !m.contains_key(&id)).await;
 
     // Coming back starts with no presence until it is set again.
-    let a = Client::resume(&url, replica, None).await.unwrap();
+    let a = Client::resume(&url, &replica, None).await.unwrap();
     a.set_presence(json!({"cursor": 8}));
     until(&b, |m| state_of(m, id) == Some(&json!({"cursor": 8}))).await;
     drop(a);
@@ -316,6 +316,9 @@ async fn presence_over_the_rate_is_dropped_but_operations_never_are() {
     for i in 0..10 {
         a.set_presence(json!({"cursor": i}));
         type_at_end(&a, &format!("{i}"));
+        // Each update must actually reach the wire: the SDK coalesces unsent
+        // presence, while this test checks the server's exact burst limit.
+        settled(&a).await;
     }
     settled(&a).await;
     assert_eq!(server.seq("hello.docx").await.unwrap(), 10);
@@ -338,7 +341,7 @@ async fn presence_over_the_rate_is_dropped_but_operations_never_are() {
 
     // The limit is per connection: a new one starts afresh.
     let replica = a.disconnect().await;
-    let a = Client::resume(&url, replica, None).await.unwrap();
+    let a = Client::resume(&url, &replica, None).await.unwrap();
     a.set_presence(json!({"cursor": "again"}));
     until(&b, |m| {
         state_of(m, a.id()) == Some(&json!({"cursor": "again"}))
@@ -346,38 +349,109 @@ async fn presence_over_the_rate_is_dropped_but_operations_never_are() {
     .await;
 }
 
+async fn raw_type_at_end(
+    raw: &mut raw::Raw,
+    replica: &mut jade_collab_sync::Replica<DocxModel>,
+    text: &str,
+) {
+    let parent = replica.view().paragraphs()[0].chars.last().copied();
+    let op = DocxOp::InsertText {
+        story: StoryId::Body,
+        parent,
+        first: replica.reserve(text.chars().count() as u64),
+        text: text.into(),
+    };
+    let submission = replica.submit(op).unwrap();
+    raw.send(&ClientMessage::Submit(
+        jade_collab_sync::protocol::Submission {
+            client_seq: submission.client_seq,
+            base_seq: submission.base_seq,
+            op: serde_json::to_value(submission.op).unwrap(),
+        },
+    ))
+    .await;
+}
+
+async fn raw_until_seq(
+    raw: &mut raw::Raw,
+    replica: &mut jade_collab_sync::Replica<DocxModel>,
+    seq: u64,
+) -> Vec<String> {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let mut rejected = Vec::new();
+        while replica.seq() < seq {
+            match raw.receive().await {
+                ServerMessage::PresenceRejected { reason } => rejected.push(reason),
+                ServerMessage::Committed(c) => {
+                    replica
+                        .receive(jade_collab_sync::protocol::Downstream::Committed(
+                            jade_collab_sync::protocol::Committed {
+                                seq: c.seq,
+                                origin: c.origin,
+                                client_seq: c.client_seq,
+                                base_seq: c.base_seq,
+                                op: serde_json::from_value(c.op).unwrap(),
+                            },
+                        ))
+                        .unwrap();
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        rejected
+    })
+    .await
+    .unwrap()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_default_server_limits_a_presence_flood_and_keeps_every_operation() {
     let (server, url) = start(Server::new()).await;
-    let flooder: Client<DocxModel> = Client::connect(&url, None).await.unwrap();
+    // A raw producer sends every update, bypassing SDK presence coalescing.
+    let mut flooder = raw::Raw::open(&url).await;
+    flooder.send(&ClientMessage::Join).await;
+    let ServerMessage::Welcome {
+        replica,
+        seq,
+        snapshot,
+        ..
+    } = flooder.receive().await
+    else {
+        panic!("welcome")
+    };
+    let mut replica =
+        jade_collab_sync::Replica::new(replica, seq, serde_json::from_value(snapshot).unwrap());
     let a: Client<DocxModel> = Client::connect(&url, None).await.unwrap();
     for i in 0..500 {
-        flooder.set_presence(json!({"cursor": i}));
+        flooder
+            .send(&ClientMessage::Presence {
+                state: json!({"cursor": i}),
+            })
+            .await;
         if i % 25 == 0 {
-            type_at_end(&flooder, "f");
+            raw_type_at_end(&mut flooder, &mut replica, "f").await;
             type_at_end(&a, "a");
         }
     }
-    // One more operation: its acknowledgement comes after the answers to
-    // every presence update sent before it, rejections included.
-    type_at_end(&flooder, "f");
-    settled(&flooder).await;
+    raw_type_at_end(&mut flooder, &mut replica, "f").await;
     settled(&a).await;
+    let rejected = raw_until_seq(&mut flooder, &mut replica, 41).await;
     assert_eq!(server.seq("hello.docx").await.unwrap(), 41);
-    let rejected = flooder.take_presence_rejections();
     assert!(rejected.len() > 300, "{} rejected", rejected.len());
-    // A huge state is refused whatever the rate.
-    flooder.set_presence(json!("x".repeat(PresenceLimits::default().max_bytes)));
-    type_at_end(&flooder, "f");
-    settled(&flooder).await;
-    let rejected = flooder.take_presence_rejections();
+    flooder
+        .send(&ClientMessage::Presence {
+            state: json!("x".repeat(PresenceLimits::default().max_bytes)),
+        })
+        .await;
+    raw_type_at_end(&mut flooder, &mut replica, "f").await;
+    let rejected = raw_until_seq(&mut flooder, &mut replica, 42).await;
     assert_eq!(rejected.len(), 1, "{rejected:?}");
     assert!(rejected[0].contains("bytes"), "{rejected:?}");
     tokio::time::timeout(Duration::from_secs(20), a.wait_for_seq(42))
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(a.view(), flooder.view());
+    assert_eq!(&a.view(), replica.view());
 }
 
 #[derive(Clone, Debug)]
@@ -422,7 +496,7 @@ proptest! {
                     }
                     Step::Reconnect { client } => {
                         let replica = clients[client].take().unwrap().disconnect().await;
-                        clients[client] = Some(Client::resume(&url, replica, None).await.unwrap());
+                        clients[client] = Some(Client::resume(&url, &replica, None).await.unwrap());
                         expected.remove(&ids[client]);
                     }
                 }
@@ -509,9 +583,8 @@ async fn resuming_on_a_new_connection_drops_the_old_connections_presence() {
     assert!(matches!(new.receive().await, ServerMessage::Resumed { .. }));
     until(&observer, |m| !m.contains_key(&replica)).await;
 
-    // A late update from the old connection is ignored. It is followed, on
-    // the same connection, by an operation; once that is in, the update
-    // has been handled.
+    // Late presence and edits from the replaced connection are ignored.
+    // Its error is a barrier proving that its presence has been handled.
     old.send(&ClientMessage::Presence {
         state: json!("stale"),
     })
@@ -523,12 +596,21 @@ async fn resuming_on_a_new_connection_drops_the_old_connections_presence() {
         first: jade_collab_core::id::Id::new(model.max_lamport() + 1, replica),
         text: "x".into(),
     };
-    old.send(&ClientMessage::Submit(Submission {
+    let submission = Submission {
         client_seq: 1,
         base_seq: 0,
         op: serde_json::to_value(op).unwrap(),
-    }))
-    .await;
+    };
+    old.send(&ClientMessage::Submit(submission.clone())).await;
+    assert!(
+        matches!(old.receive().await, ServerMessage::Error { message }
+        if message.contains("no longer owns"))
+    );
+    assert_eq!(observer.seq(), 0, "the stale edit was not committed");
+    // The same client sequence is still available to the current socket.
+    new.send(&ClientMessage::Submit(submission)).await;
+    assert!(matches!(new.receive().await, ServerMessage::Committed(c)
+        if c.client_seq == 1 && c.seq == 1));
     tokio::time::timeout(Duration::from_secs(10), observer.wait_for_seq(1))
         .await
         .unwrap()

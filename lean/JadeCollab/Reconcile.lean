@@ -4,8 +4,9 @@
 design.md §2: a client keeps the server-confirmed state and a queue of pending
 local operations; its optimistic view is `confirmed` with `pending` replayed on
 top. A remote *sequenced* operation forces `view = confirmed + pending` to be
-rebuilt, but a remote *convergent* operation is applied straight to the view.
-This module shows that shortcut is exact. Backs `Replica` in
+rebuilt. A remote *convergent* operation takes a shortcut only when all pending
+operations commute with it; pending sequenced guards require replay as well.
+This module shows the guarded shortcut is exact. Backs `Replica` in
 `jade-collab-sync`.
 -/
 
@@ -17,8 +18,7 @@ variable {S Op : Type} (step : S → Op → S)
 def view (confirmed : S) (pending : List Op) : S :=
   pending.foldl step confirmed
 
-/-- **Fast path soundness** (`fast_path_sound`, design.md §2 "Typing never
-rebases"): if the remote operation `c` commutes with every operation, applying
+/-- **Fast path soundness** (`fast_path_sound`, design.md §2 "Typing-only queues use a fast path"): if the remote operation `c` commutes with every operation, applying
 it to the optimistic view equals rebuilding the view from the new confirmed
 state. -/
 theorem fast_path_sound (c : Op) (hc : ∀ s o, step (step s c) o = step (step s o) c) :
@@ -31,6 +31,36 @@ theorem fast_path_sound (c : Op) (hc : ∀ s o, step (step s c) o = step (step s
     intro confirmed
     simp only [List.foldl_cons]
     rw [ih, hc]
+
+/-- The sufficient condition concerns the actual pending queue. Convergent
+operations commute with each other, while a pending sequenced guard can become
+inapplicable after a text edit and must be replayed. -/
+theorem fast_path_sound_pending (c : Op) (pending : List Op) :
+    (∀ o ∈ pending, ∀ s, step (step s c) o = step (step s o) c) →
+    ∀ confirmed, step (view step confirmed pending) c =
+      view step (step confirmed c) pending := by
+  induction pending with
+  | nil => intro _ confirmed; rfl
+  | cons o ps ih =>
+    intro hc confirmed
+    simp only [view, List.foldl_cons]
+    have tailCommutes := fun op member => hc op (List.mem_cons_of_mem o member)
+    have tailSound := ih tailCommutes (step confirmed o)
+    simp only [view] at tailSound
+    rw [tailSound, ← hc o List.mem_cons_self confirmed]
+
+def reconcile (fast : Bool) (confirmed : S) (pending : List Op) (remote : Op) : S :=
+  if fast then step (view step confirmed pending) remote
+  else view step (step confirmed remote) pending
+
+theorem guarded_reconciliation_is_replay (fast : Bool) (confirmed : S)
+    (pending : List Op) (remote : Op)
+    (allowed : fast = true → ∀ o ∈ pending, ∀ s,
+      step (step s remote) o = step (step s o) remote) :
+    reconcile step fast confirmed pending remote = view step (step confirmed remote) pending := by
+  cases fast with
+  | false => rfl
+  | true => exact fast_path_sound_pending step remote pending (allowed rfl) confirmed
 
 /-- The fast path for a batch of remote convergent operations. -/
 theorem fast_path_sound_many (cs : List Op)

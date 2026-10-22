@@ -31,7 +31,7 @@
 use std::collections::BTreeSet;
 
 use jade_collab_core::grid::Merge;
-use jade_collab_core::id::{Id, ReplicaId};
+use jade_collab_core::id::{Id, IdError, ReplicaId};
 use jade_collab_core::marks::Expand;
 use jade_collab_sync::Lane;
 use jade_docx_headless_api::{HeadlessCommand, HeadlessDeleteDirection};
@@ -228,6 +228,10 @@ pub enum IntentOp {
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum IntentError {
+    #[error(transparent)]
+    Identifiers(#[from] IdError),
+    #[error(transparent)]
+    TableBudget(#[from] crate::TableBudgetExceeded),
     #[error("paragraph {0} does not exist")]
     NoSuchParagraph(usize),
     #[error("offset {offset} is not a character boundary of paragraph {paragraph}")]
@@ -658,8 +662,8 @@ fn deletion(
     story: StoryId,
     atoms: &[Result<Id, Id>],
     context: &Context,
-    ids: &mut dyn FnMut(u64) -> Id,
-) -> Vec<DocxOp> {
+    ids: &mut dyn FnMut(u64) -> Result<Id, IdError>,
+) -> Result<Vec<DocxOp>, IntentError> {
     let chars: Vec<Id> = atoms.iter().filter_map(|a| a.ok()).collect();
     let (plain, tracked) = if view.tracking() {
         tracked_deletion(view, &chars, context)
@@ -674,7 +678,7 @@ fn deletion(
         ops.push(DocxOp::TrackDeleteText {
             story,
             ids: tracked,
-            revision: ids(1),
+            revision: ids(1)?,
             date: context.date.clone(),
         });
     }
@@ -684,7 +688,7 @@ fn deletion(
             .filter_map(|a| a.err())
             .map(|mark| DocxOp::JoinParagraph { story, mark }),
     );
-    ops
+    Ok(ops)
 }
 
 /// Splits characters a tracked deletion names into (removed outright,
@@ -805,6 +809,26 @@ pub fn resolve_with(
     context: &Context,
     ids: &mut dyn FnMut(u64) -> Id,
 ) -> Result<Vec<DocxOp>, IntentError> {
+    try_resolve_with(view, op, context, &mut |n| Ok(ids(n)))
+}
+
+/// Resolves with an allocator that can report identifier exhaustion.
+pub fn try_resolve(
+    view: &DocxModel,
+    op: &IntentOp,
+    ids: &mut dyn FnMut(u64) -> Result<Id, IdError>,
+) -> Result<Vec<DocxOp>, IntentError> {
+    try_resolve_with(view, op, &Context::default(), ids)
+}
+
+/// Checked allocation with revision context. No operations are returned if
+/// any reservation fails, including a later part of a replacement edit.
+pub fn try_resolve_with(
+    view: &DocxModel,
+    op: &IntentOp,
+    context: &Context,
+    ids: &mut dyn FnMut(u64) -> Result<Id, IdError>,
+) -> Result<Vec<DocxOp>, IntentError> {
     let paragraphs = view.paragraphs();
     // Typing: a tracked insertion when the document tracks changes.
     let typing = |story: StoryId, parent: Option<Id>, first: Id, text: &str| {
@@ -838,7 +862,7 @@ pub fn resolve_with(
             Ok(vec![typing(
                 at.story,
                 at.typing,
-                ids(text.chars().count() as u64),
+                ids(text.chars().count() as u64)?,
                 text,
             )])
         }
@@ -849,18 +873,18 @@ pub fn resolve_with(
         } => {
             let at = caret(&paragraphs, *paragraph, *offset)?;
             let mut parent = at.parent;
-            Ok((0..*count)
+            (0..*count)
                 .map(|_| {
-                    let id = ids(1);
+                    let id = ids(1)?;
                     let op = DocxOp::SplitParagraph {
                         story: at.story,
                         parent,
                         id,
                     };
                     parent = Some(id);
-                    op
+                    Ok(op)
                 })
-                .collect())
+                .collect()
         }
         IntentOp::DeleteText {
             paragraph,
@@ -871,10 +895,12 @@ pub fn resolve_with(
             let at = caret(&paragraphs, *paragraph, *offset)?;
             let atoms = story_atoms(&paragraphs, at.story);
             let range = match direction {
-                HeadlessDeleteDirection::Forward => at.index..(at.index + count).min(atoms.len()),
+                HeadlessDeleteDirection::Forward => {
+                    at.index..at.index.saturating_add(*count).min(atoms.len())
+                }
                 HeadlessDeleteDirection::Backward => at.index.saturating_sub(*count)..at.index,
             };
-            Ok(deletion(view, at.story, &atoms[range], context, ids))
+            deletion(view, at.story, &atoms[range], context, ids)
         }
         IntentOp::ReplaceRange {
             start_paragraph,
@@ -898,12 +924,12 @@ pub fn resolve_with(
                 &atoms[start.index..end.index],
                 context,
                 ids,
-            );
+            )?;
             if !text.is_empty() {
                 ops.push(typing(
                     start.story,
                     start.typing,
-                    ids(text.chars().count() as u64),
+                    ids(text.chars().count() as u64)?,
                     text,
                 ));
             }
@@ -957,7 +983,7 @@ pub fn resolve_with(
                         .expect("a view's characters are in their story, in order");
                     ops.push(DocxOp::Mark {
                         story,
-                        id: ids(1),
+                        id: ids(1)?,
                         start,
                         end,
                         change: change.clone(),
@@ -1053,7 +1079,7 @@ pub fn resolve_with(
                 story: start.story,
                 start: *first,
                 end: *last,
-                id: ids(1),
+                id: ids(1)?,
                 content: CommentContent {
                     text: text.clone(),
                     author: author.clone(),
@@ -1070,7 +1096,7 @@ pub fn resolve_with(
             date,
         } => Ok(vec![DocxOp::ReplyToComment {
             comment: comment(view, comment_id)?,
-            id: ids(1),
+            id: ids(1)?,
             content: CommentContent {
                 text: text.clone(),
                 author: author.clone(),
@@ -1108,7 +1134,7 @@ pub fn resolve_with(
                 _ => NoteKind::Endnote,
             };
             // The reference, then the note's tab and text.
-            let id = ids(2 + text.chars().count() as u64);
+            let id = ids(2 + text.chars().count() as u64)?;
             Ok(vec![DocxOp::InsertNote {
                 kind,
                 story: at.story,
@@ -1143,7 +1169,7 @@ pub fn resolve_with(
             Ok(vec![DocxOp::InsertTextBox {
                 story: at.story,
                 parent: at.parent,
-                id: ids(1 + text.chars().count() as u64),
+                id: ids(1 + text.chars().count() as u64)?,
                 text: text.clone(),
                 width_px: width_px.unwrap_or(216),
                 height_px: height_px.unwrap_or(96),
@@ -1190,12 +1216,25 @@ pub fn resolve_with(
                 bottom: row(*bottom_row, *right_column)?,
                 right: column(*bottom_row, *right_column)?,
             };
+            let height = bottom_row
+                .checked_sub(*top_row)
+                .and_then(|n| n.checked_add(1))
+                .ok_or(IntentError::InvertedRange)?;
+            let width = right_column
+                .checked_sub(*left_column)
+                .and_then(|n| n.checked_add(1))
+                .ok_or(IntentError::InvertedRange)?;
+            crate::table_budget::check(height, width)?;
             // One new story per follower: the cells below the top-left one.
             let followers = bottom_row.saturating_sub(*top_row) as u64;
             Ok(vec![DocxOp::MergeCells {
                 table: t.id,
                 merge,
-                first: ids(followers.max(1)),
+                first: if followers == 0 {
+                    Id::new(0, ReplicaId::ORIGIN)
+                } else {
+                    ids(followers)?
+                },
             }])
         }
         IntentOp::UnmergeTableCells { table, row, column } => {
@@ -1213,12 +1252,19 @@ pub fn resolve_with(
                     column: *column,
                 })?;
             // One new story per cell the merge removed (all but its first column).
-            let freed = ((bottom - top + 1) * (right - left)) as u64;
+            let height = bottom - top + 1;
+            let width = right - left + 1;
+            crate::table_budget::check(height, width)?;
+            let freed = (height * (width - 1)) as u64;
             Ok(vec![DocxOp::UnmergeCells {
                 table: t.id,
                 top: t.rows[top],
                 left: t.columns[left],
-                first: ids(freed.max(1)),
+                first: if freed == 0 {
+                    Id::new(0, ReplicaId::ORIGIN)
+                } else {
+                    ids(freed)?
+                },
             }])
         }
         IntentOp::SetTracking { on } => Ok(vec![DocxOp::SetTracking { on: *on }]),

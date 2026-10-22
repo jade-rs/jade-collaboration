@@ -9,12 +9,382 @@ Lean 4 proofs of the properties `docs/design.md` §7 lists for the
 
 ```sh
 cd lean
-lake build            # the proofs and the grid-oracle and marks-oracle executables
+lake build            # the proofs and five executable differential oracles
 ```
 
 The toolchain is pinned in `lean-toolchain` (`leanprover/lean4:v4.34.0`).
 
 ## What is proved
+
+### `JadeCollab/AtomIdentity.lean`: globally addressed DOCX flow atoms
+
+Sixteen theorems cover complete implicit allocation ranges, overlap refusal,
+exact owner/clock identity, acceptance of unused older clock slots, preservation
+of global uniqueness through arbitrary stateful histories, hidden atom
+reservations, processed refusals, duplicate non-revival and internal uniqueness
+of contiguous runs. Native writes, Rust operation field extraction,
+bounded arithmetic and snapshot IO remain assumptions. Rust tests check every
+flow-allocating operation and native histories with deletion, checkpoints,
+restore, SDK refusal and exported/reopened file agreement. Socket regressions
+check cross-story collisions before author registration and durable refusal
+through both checkpoint and journal-only restarts.
+
+### `JadeCollab/TextPositions.lean`: incremental DOCX text geometry
+
+Twenty-two theorems cover unaffected paragraphs/prefixes, UTF-8 byte repair,
+paragraph ends, equal-offset anchor ordering, stable widths/anchor counts,
+inserted run prefix widths, structural invalidation and canonical lookup.
+The native join specification also proves positional placeholder removal,
+anchor projection preservation and retention of matching user characters.
+Refused insertion attempts preserve the document/index and need no projection.
+The stateful scan counter proves at most one canonical projection for an
+eligible consecutive committed typing segment. Canonical walk fidelity, actual RGA
+predecessors, UTF-8 widths, maps, mutexes and native editing are assumptions.
+Rust compares accelerated effects with a forced canonical path across generated
+structure/revision histories, typing bursts, clone and restore; a 5,000-paragraph
+regression checks scan counts and paragraph-local repair without wall-clock
+thresholds. Native existing histories check integration.
+
+### `JadeCollab/AuthorIdentity.lean`: configured and persisted author labels
+
+Eighteen theorems prove nonblank XML name admission independent of roles,
+whole-table refusal and old-table preservation, exact accepted names, durable
+logical author refusal, viewer refusal without author mutation, duplicate
+non-revival, author-before-edit ordering, and a lossless attribute token codec
+that decodes references once. Native fatal errors use `NativeFailure` instead.
+Unicode blankness, lexical XML parsing/CRLF normalization, native writes, IO and
+socket delivery are assumptions. Rust stateful native socket histories cover
+bad reloads, role changes, rekeying, tracked edits, checkpoint/journal restarts
+and exact exported/reopened author labels; file tests cover aliases, nesting,
+literal entity-shaped names and whitespace-preserving cycles.
+
+### `JadeCollab/NativeFailure.lean`: unexpected writer failure
+
+Seventeen theorems cover no verdict/log/ticket advancement on live error,
+quarantined snapshots, immunity to arbitrary further histories, independent
+staged refusal/non-revival, recovery discarding arbitrary partial writes,
+restored agreement, and exactly-once successful retry. Origin failures preserve
+all client tickets and the committed prefix. Recovery denotes loading an
+independent healthy checkpoint/journal, never exporting quarantined state.
+Successful native writes, fork isolation and healthy journal IO are assumptions.
+Rust stateful PBT and native DOCX/XLSX/PPTX fault injection check transport
+closure, unknown pending edits, checkpoint/journal recovery, byte-identical
+healthy exports, origin-author boundaries and aborting failed replay.
+
+### `JadeCollab/TextBoundary.lean`: materialized text admission
+
+Sixteen theorems cover XML scalar ranges (including whitespace, BMP exclusions,
+surrogates and supplementary noncharacters), concatenation, whole-string
+admission, SpreadsheetML escape policy, normalized empty formulas and finite
+numbers. Refused payloads preserve model/native state; duplicates have no effect,
+valid histories remain valid, and successful lossless materialization preserves
+agreement. Native serialization, xstring encoding, formula normalization and
+successful application are explicit assumptions. Rust scalar PBT, field matrices,
+native stateful export/reopen histories and CLI/MCP tests check these boundaries.
+
+### `JadeCollab/AllocationOwner.lean`: minted identifier namespaces
+
+Twelve theorems prove that every admitted fresh ID/write stamp belongs to its
+origin, one forged owner causes refusal, shared targets do not affect admission,
+empty allocation sets and owned runs pass, and non-origin clients cannot mint
+origin IDs. Namespace refusal preserves content, log position and tracked author
+state while processing a new ticket. Duplicate tickets have no side effects and
+a corrected payload cannot revive a refused ticket. Trusted facts preserve their
+original content independently of current admission. The model abstracts successful
+logical application, per-format field extraction, connection auth and native IO;
+Rust field matrices, stateful native-model histories and durable socket tests
+check those boundaries, including unused DOCX merge sentinels.
+
+### `JadeCollab/Inbox.lean`: bounded document input
+
+Twelve theorems cover bounded admission, cancellation returning slots/bytes,
+publication preserving resources and FIFO order, processing retaining byte
+leases while releasing slots, completion returning bytes, and closure preserving
+accepted input while refusing further publication. Draining an empty queue does
+not depend on outstanding uncommitted reservations. Natural weights abstract
+wire lengths; Rust stateful PBT checks the actual semaphore/channel, and gated
+socket tests check token changes, deadlines, cancellation and shutdown. This is
+not a proof of global process memory or native parser behavior.
+
+### `JadeCollab/TableWork.lean`: per-request DOCX table work
+
+Checked cell products fit both machine and operation bounds; excessive or
+overflowing products refuse. Refusal leaves the model/clock unchanged, while
+small incremental steps may exceed the one-operation budget in aggregate.
+Currently admitted and trusted recorded operations share their logical meaning;
+recorded facts retain their result and logical errors remain errors. Zero new
+stories need no identifier headroom. Sparse visible output is bounded by stored
+cells, and deleted axes cannot appear. Parser behavior and grid ordering are
+abstracted; Rust stateful/native tests check those implementations and recovery.
+
+### `JadeCollab/PackageBudget.lean`: existing engine package budgets
+
+Admitted parts fit both per-part and remaining total capacity; failed/oversized
+reads leave accounting unchanged. Exact caps are accepted, cap-plus-one is
+refused, and accounting remains monotonic/bounded through histories. Declared
+ZIP sizes cannot authorize excessive actual output. This specifies the existing
+engine read contract, with ZIP/XML parsing, IO scheduling and total parser heap
+abstracted. Rust tests call that engine helper directly and exercise native
+DOCX/XLSX/PPTX service refusals, auth, retries, storage and server restarts.
+
+### `JadeCollab/DerivedBatch.lean`: complete native submission plans
+
+Publishing a failed or oversized plan preserves its document, file and log;
+a successful plan publishes the entire cause and derived suffix. Exact fits
+are accepted, full logs refuse, and failed tickets remain processed so retries
+cannot revive them. Origin identifier allocation accepts zero/exact counts and
+refuses overflow. Publication composes with the atomic journal batch model.
+Fork isolation and native editor behavior are abstract assumptions, checked by
+Rust fault injection and DOCX/XLSX byte comparisons across refusal and restarts.
+Stateful Rust tests compare mixed histories with independent counter/list models.
+
+### `JadeCollab/RecoveryBounds.lean`: bounded recovery
+
+Fresh replica ids are nonzero, have a bounded successor and never repeat.
+Replayed tickets strictly advance their watermark, while repeated/older tickets
+are refused without rewinding it. Retained tail positions fit their checkpoint
+and the numeric limit; an empty tail at the final position needs no successor.
+A full log has no next position. This specification abstracts parsing, IO and
+materialization; `DerivedBatch.lean` specifies complete cause/suffix publication
+at the live write boundary. Rust stateful histories use u128 reference counters;
+native DOCX/XLSX/PPTX tests check boundary restoration, refused joins/edits,
+existing replica resumption and unchanged exports across server restarts.
+
+### `JadeCollab/ClientPump.lean`: SDK outbound ordering
+
+Ticket selection is FIFO, an exclusive inspection barrier waits for earlier
+edits and precedes later ones, and continuous presence updates cannot starve
+ready edits/inspections. Presence coalesces to the latest value without changing
+document order; sending, cancellation and terminal failure retain the pending
+retry source. Failure prevents further transmission. The policy abstracts
+encoding, socket IO and locking. Rust stateful PBT checks mixed histories
+against a FIFO reference; gated-sink tests check backpressure, frame counts,
+inspection placement, waiter failure and retained pending operations.
+
+### `JadeCollab/InputFrame.lean`: bounded MCP records
+
+The bounded-buffer proofs from Upload are reused with one extra byte reserved
+for CRLF recognition. Buffered lengths and accepted payloads are bounded;
+exact-limit LF/EOF and CRLF records are accepted; a non-delimiter extra byte
+is refused. A refused record cannot recover before its boundary, and that
+boundary resets the next record independently of failure. This is a byte-count
+specification, with delimiter flags abstracted; it does not prove UTF-8/JSON
+parsing, allocator capacity or IO scheduling. Rust stateful framing PBT compares
+arbitrary bytes, fragmented delimiters, Unicode/invalid UTF-8 and EOF with an
+unbounded reference while checking retained length. Cancellation tests retain
+partial input and drain state. Actual stdio processes verify that oversized
+valid edit prefixes never run, malformed UTF-8 does not end the process, exact
+limits work for LF/CRLF/EOF and subsequent requests still execute. HTTP tests
+cover exact bounds, chunking, incomplete streams and typed-list publication.
+
+### `JadeCollab/Transport.lean`: secure endpoint policy
+
+HTTPS discovery maps to WSS and preserves encryption. Secure application bytes
+require successful certificate/hostname verification in the policy model;
+transitions cannot change the scheme, and verification failures are terminal.
+Verification booleans abstract the TLS library: this does not prove cryptography,
+URI parsing, native certificate loading or IO cancellation. Real TLS proxies and
+isolated CLI/MCP child processes test native-root overrides, wrong trust anchors,
+hostname mismatch, authenticated discovery, encoded names, all three formats,
+base-format inspection and native edits. Stateful histories mix session/process
+restarts, reads, edits and trust failures. Rust also checks scheme/authority/IPv6
+mapping, cancellation cleanup, redirect refusal and URL credential diagnostics.
+
+### `JadeCollab/Ownership.lean`: authenticated replica ownership
+
+A replica is resumed only by its stored principal. Unknown replicas and other
+principals are refused, and refusal preserves the entire room, including
+presence and socket ownership. Successful resumption changes only that
+replica's socket and presence, retaining the document, tickets and immutable
+owner binding. Anonymous/legacy replicas cannot be claimed by named callers.
+This specifies trusted principal checks, not bearer-token validation or disk IO.
+Rust stateful tests cover joins, refused attempts, access refusals, credential
+aliases, checkpoint/JSON/journal restore, rebinding and legacy metadata. Actor
+histories also exercise socket replacement and crash/restart. Socket tests run
+against all three formats, preserve the original connection and cursor, and
+restore both journals and checkpoints. Byte-cut and injected append/fsync tests
+ensure join and ownership are durable together before a welcome is published.
+
+### `JadeCollab/Reconnect.lean`: recoverable catch-up
+
+An accepted watermark never forgets known answers and its successor is within
+the next unissued ticket and the integer bound. Exactly the pending tickets
+above the watermark remain. Replaying a batch composes across concatenation;
+if an operation fails after a valid prefix, the atomic transaction retains its
+entire source, including when more operations follow. This specifies validation
+and staging, not HTTP/WebSocket behavior or native document guards. Rust stateful
+PBT checks remote commits, server refusals, invalid metadata/prefixes, allocation
+and retry against a pending-history model. Real socket histories for all three
+formats cover authentication failure, deadline expiry, canceled opens, malformed
+resume responses, disconnects during resends and deliberately lost answers;
+retry preserves local edits and the server commits each stable ticket once.
+The per-replica ticket model also proves that access refusal preserves the
+document, consumes a fresh ticket, never lowers the watermark, and prevents
+that ticket from committing after promotion. Permission refusals use the same
+durable rejected-ticket record as guard refusals; actor model histories check
+their watermarks through replacement,
+checkpoint and restart. Native socket tests restore lost refusals after role
+promotion and ensure they never become commits.
+
+### `JadeCollab/Address.lean`: opaque document path segments
+
+Percent encoding a byte sequence and decoding once returns the original bytes;
+encoding is injective, and its output contains no raw slash, question mark or
+hash. The unreserved ASCII set and uppercase hexadecimal digits match Rust's
+canonical codec. This proves a byte specification, not URI parsing or Unicode
+validation. Rust PBT checks UTF-8 names, query separation, malformed escapes
+and literal percent sequences. Stateful upload/MCP histories check independent
+names, authorization, retries, edits, leave/rejoin and durable restarts for
+DOCX/XLSX/PPTX; a CLI process test follows the actual printed URLs before and
+after restart. `address-oracle` executes the proved encoder on decimal UTF-8
+bytes (one sequence per line); CI compares it with actual Rust document paths:
+
+```sh
+JADE_LEAN_ADDRESS_ORACLE="$PWD/lean/.lake/build/bin/address-oracle" \
+  cargo test -p jade-collab-server --test address_oracle -- --ignored
+```
+
+### `JadeCollab/Receipts.lean`: late edit verdicts
+
+Observing a verdict preserves every known answer; another ticket's answer is
+unchanged. Completed receipts stay complete and an observed refusal stays
+refused. Reporting applied requires every answer, reporting rejected requires
+a refusal, and unanswered nonempty batches remain pending. An empty batch has
+no outstanding operations. For increasing FIFO tickets, checking the oldest
+pending one suffices to wait through a batch without waiting for later batches.
+These are specification properties, not a proof of transport or bounded cache
+code. Rust stateful PBT checks event routing, duplicates, unknown tickets,
+partial rejection, completion, eviction and disconnects. Socket tests exercise
+timeouts followed by late commits/rejections, later pending batches, lost
+connections, all document formats, token scope and capacity refusal before
+ID allocation/submission. Separate histories cover the replica's prefix test
+through acknowledgements/rejections/remote changes near ticket exhaustion.
+
+### `JadeCollab/Registry.lean`: document initialization reservations
+
+An occupied name refuses another reservation; an opening room is invisible.
+Only its owner can publish or cancel it. Failure permits retry, publication
+survives the completed guard's cleanup, and a ready room cannot be replaced by
+another initializer. Reserving, publishing and canceling a name leave other
+names unchanged. Opaque Rust ownership identities are abstract natural numbers
+in this specification; it does not prove mutex scheduling or OS file locks.
+Stateful Rust PBT compares interleaved reservations/publications/aborts with a
+separate lifecycle model. Controlled blocking-I/O tests verify independent
+document startup, real socket edits, exports, name conflicts and durable restore.
+Other tests cover initializer unwinding and per-directory initialization locks,
+including simultaneous aliases with the winner's content preserved.
+Snapshot-name persistence and validation are checked in Rust, including legacy
+headers, checkpoint updates and filesystem spelling changes across upload histories.
+
+### `JadeCollab/Upload.lean`: bounded upload admission
+
+An unauthorized upload cannot begin buffering. Refusal absorbs subsequent
+frames, and a complete body's admission depends only on its total byte count,
+independent of frame fragmentation. Exactly the bound is accepted, every
+accepted total is bounded, and incomplete bodies never publish. This is a
+specification of buffering and publication, not a proof of axum or HTTP parsing.
+Rust tests cover actual extractor ordering with an unpolled forbidden body,
+inclusive streaming bounds, mid-stream errors, audit statuses, and CLI requests
+with chunked transfer encoding. Stateful histories compare credentials, body
+fragments, malformed/oversized files, conflicts and durable restarts against
+an admission model with per-file content markers. Native exports preserve
+large unrelated parts in DOCX, XLSX and PPTX.
+
+### `JadeCollab/NativeInspection.lean`: one authoritative formatting capture
+
+The actor read preserves authoritative state and captures its model, projected
+native formatting and log position together, with zero optimistic pending
+operations. The returned edit guard keeps the request's connection and client
+ticket; a later local submission or a later committed log position refuses it.
+This specifies the actor transition and guard semantics, not OOXML style
+resolution or socket scheduling. Rust tests cover style cascades, Unicode
+partition validation, export/reimport, checkpoint/reconnect histories, viewer
+access, stale sockets, cancellation, late answers and terminal connections.
+The capture specification applies to both DOCX and PPTX. PPTX tests resolve
+master/layout/theme styles before autofit, explicit false marks and paragraph
+properties, and check UTF-8 segments containing soft breaks, empty paragraphs
+and cached fields. Stateful histories cover duplication, delivery/reconnection,
+checkpoint restores and native export/reimport; MCP cache histories also run
+against PPTX authoritative captures.
+
+### `JadeCollab/FormatRead.lean`: reading partial character formatting
+
+After the mark winner has been selected, unset values are omitted and explicit
+false values survive. Reported spans retain their original boundaries, and
+attaching formatting to paragraphs commutes with pagination. An omitted
+override inherits the base, including an unknown base; omission cannot establish
+that a property is false. This specifies the read projection, not OOXML styles
+or UTF-8 decoding. Rust stateful PBT decodes compressed JSON spans and compares
+each character/attribute with the mark specification through Unicode edits,
+splits, joins, clears and checkpoint roundtrips. Socket tests check peer edits,
+pinned snapshots and actual Word output.
+
+The same projection rules apply to PPTX character overrides. Their read-side
+grouping keys include both slide and shape identity: a shape shared by a
+duplicated slide cannot receive another slide's annotations. Appending runs
+keeps their order. Rust stateful PBT checks decoded per-character formats,
+visibility and pagination through duplication, moves, deletion, message
+delivery, reconnects and checkpoint restoration. Socket tests also inspect
+the written PPTX for paragraph alignment, explicit false and East Asian fonts.
+
+For native formatting, clipping a global run to a paragraph and translating
+its offsets preserves exactly the original covered bytes within that paragraph
+and retains its style. The proof uses natural-number ranges; Rust tests check
+actual UTF-8/UTF-16 conversion, clipping at soft breaks and maximal coalescing.
+
+### `JadeCollab/EditGuard.lean`: conditional local editing
+
+A mismatched version preserves the document, allocation clock and outgoing
+queue; a matching version executes the action. An action that advances the
+version prevents a competing old guard from executing. Different connection
+owners cannot share guards, and an advanced ticket prevents version reuse when
+the document, log position and pending count return to their previous values.
+The bounded ticket allocator advances strictly or refuses exhaustion. These
+proofs describe an atomic transition specification. Rust tests check the actual
+mutex boundary, submission order, rejected optimistic operations, and guarded
+DOCX/XLSX/PPTX edits over sockets.
+
+The fallible `tryRun` variant stages an action and publishes its state only on
+success. Planning failure preserves the original document, clock, version and
+queue, permitting a retry with the same guard. Successful publication appends
+the plan's contiguous frame group in lock order. Rust stateful PBT checks
+rollback and retry through pending acknowledgements/rejections and ID
+reservations; CLI process tests exercise locally invalid arrays and dependent
+successful edits in all three formats. Server acceptance remains per operation.
+
+### `JadeCollab/Snapshot.lean`: immutable session read snapshots
+
+Retaining a payload makes it readable by its session and token. Capturing
+another session leaves that lookup unchanged; replacing the token rejects
+the old one, and removing a session makes its snapshots unreadable. Editing
+the live replica preserves the retained payload, including capture metadata.
+This is a specification of the cache, not a proof of Rust mutex internals.
+Rust stateful tests check actual payloads, one-entry-per-session retention,
+cleanup and counter exhaustion; socket tests cover DOCX/XLSX/PPTX and atomic
+capture of the document, sequence and pending count.
+
+### `JadeCollab/Paging.lean`: sparse read pagination
+
+A positive page limit bounds the item count, and every continuation
+advances within an unchanged finite stream. A page followed by its unread
+tail reconstructs the stream in order. Saturating the addition at the
+machine-word cap before clipping to the total has the same boundary as
+natural-number addition. This proves slicing of an already constructed
+item stream; Rust stateful tests check how values, formats, notes, axis
+styles and merge geometry become those items. Passing the retained read
+snapshot on subsequent pages keeps that stream unchanged during live edits.
+
+### `JadeCollab/Style.lean`: imported spreadsheet styles and later edits
+
+Source style selection uses cell > row > column > default before looking
+up attributes. An unresolved cell attribute does not inherit a row's value.
+Per-attribute writes to cell/row/column registers have the same effective
+result as writing one merged register, so cross-layer concurrent updates
+commute. A Lamport tick above all four import priorities overrides the
+source, including unresolved attributes. Rust fixture comparisons check
+the OOXML-to-style projection; stateful tests cover delivery schedules,
+checkpoints, reconnects and file reimports. The proof does not verify XML
+parsing or the native writer.
 
 ### `JadeCollab/Rga.lean`: RGA specification (`rga::spec`)
 
@@ -55,6 +425,32 @@ valid exactly when the inserts it received are.
   write changes nothing.
 - `converges`: the same writes, in any order and with any duplication, give
   the same register.
+
+### `JadeCollab/IdAllocation.lean`: bounded identifier allocation
+
+`runEnd` validates a non-empty run and `reserve` allocates above the observed
+clock, both against an explicit bound (`u64Max` in the executable oracle).
+`accepted_run_no_wrap` proves every offset is between the first and last id
+and within the bound. `reserved_ids_are_fresh` proves every reserved id is
+newer than the observed clock and within the bound;
+`rejected_reservation_unchanged` leaves the clock unchanged on failure.
+
+`id-oracle` executes those definitions on `o <time>` (observe), `r <count>`
+(reserve) and `i <first> <count>` (validate a run). A stateful Rust differential
+test covers zero-sized reservations, arbitrary observations, exhaustion and
+retries, biased toward both ends of `u64`:
+
+```sh
+JADE_LEAN_ID_ORACLE="$PWD/lean/.lake/build/bin/id-oracle" \
+  cargo test -p jade-collab-core --test id_oracle -- --ignored
+```
+
+Run from the repository root after `lake build`. CI runs this test too.
+Independent `u128` reference tests check the Rust clock and RGA runs, including
+rejected operations and serialized/restored states. Format model and real
+WebSocket tests require overflowing operations to leave the document
+unchanged; CLI and MCP tests check that clock exhaustion is reported without
+losing the session's ability to read or perform edits that allocate no ids.
 
 ### `JadeCollab/Marks.lean`: marks over the RGA (`jade_collab_core::marks`)
 
@@ -129,9 +525,44 @@ every atom of `s` typed after `p` — as it is when its typist had seen them.
   `pending.foldl step confirmed` then gives the same result as rebuilding the
   view on the new confirmed state. `fast_path_sound_many` extends this to a
   batch of such operations.
+- `fast_path_sound_pending`, `guarded_reconciliation_is_replay`: it suffices
+  to commute with the actual pending queue. The guarded shortcut and replay
+  produce the same optimistic view. Rust uses the shortcut for an applied,
+  convergent-only queue; pending sequenced guards or inapplicable operations
+  force replay. Stateful core and native DOCX regressions cover a tentative
+  comment invalidated by a peer deleting its entire text range.
 - `quiescent_view_eq_server`, `quiescent_converges`: with nothing pending and
   the server's log fully folded into the confirmed state, the client's view
   equals the server's state.
+
+### `JadeCollab/Journal.lean`: atomic submission recovery
+
+A store holds a snapshot, complete operation batches and an incomplete final
+batch. `recover` folds only complete batches. `recover_appendBatch` proves
+that a cause and its derived suffix replay once, in order;
+`recover_interrupt` ignores every incomplete suffix; `recover_checkpoint`
+and `checkpoint_batch` preserve the recovered state when complete batches
+move into a snapshot. `recover_flatten` relates batches to the flat log.
+`split_checkpoint_duplicates_derived` demonstrates the former bug: including
+a derived effect in the snapshot and journaling it again applies it twice.
+These are statements about the recovery model, not filesystem guarantees.
+
+`journal-oracle` executes that model. Input is `a <numbers>` (commit a batch),
+`t <numbers>` (interrupt a write), `c` (checkpoint), or `r` (recover); it prints
+the recovered list after every command. The Rust differential stateful test
+drives the actual file store through the same transitions, including writes
+cut at random byte positions and reopening after each transition:
+
+```sh
+JADE_LEAN_JOURNAL_ORACLE="$PWD/lean/.lake/build/bin/journal-oracle" \
+  cargo test -p jade-collab-server --lib journal_matches_lean -- --ignored
+```
+
+Run that command from the repository root after `lake build`. CI runs it
+alongside the grid and marks oracle tests. The actor-level stateful test
+also exercises derived edits, rejections, retries, checkpoints, restart and
+resume against an independent list model; injected append/fsync failures
+check that no part of a failed batch is broadcast or checkpointed.
 
 ### `JadeCollab/Grid.lean`: the table grid (`jade_collab_core::grid::Grid`)
 

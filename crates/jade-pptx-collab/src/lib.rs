@@ -9,11 +9,16 @@
 //! model does not describe. [`intent`] accepts the slide-number / shape-id
 //! addressing jade's headless tools and agents use.
 
+mod inspection;
 pub mod intent;
 mod jade;
 mod load;
 mod model;
 
+pub use inspection::{
+    CharacterStyle, CharacterStyleRun, ParagraphFormat, ParagraphStyle, PptxFormatting,
+    ShapeFormatting, SlideFormatting, Spacing,
+};
 pub use jade::JadePptx;
 pub use load::LoadError;
 pub use model::MAX_PICTURE_BYTES;

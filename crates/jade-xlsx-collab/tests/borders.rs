@@ -520,7 +520,7 @@ fn an_outline_reaches_jade_and_survives_export() {
 /// "Format Same As Above" default); jade leaves it unformatted. The model
 /// follows jade: a new row is not part of a range drawn before it existed,
 /// so a box drawn around rows 6–8 is open on the left and right of the row
-/// inserted inside it, and the model knows no format for its cells.
+/// inserted inside it. The new cells show the file's default style.
 #[test]
 fn a_row_inserted_inside_a_box_is_not_bordered_as_in_jade() {
     let (mut model, mut jade) = open("grid-operations-workbook.xlsx");
@@ -553,9 +553,13 @@ fn a_row_inserted_inside_a_box_is_not_bordered_as_in_jade() {
             },
         },
     );
+    let format = model.format(sheet, stamp(2), columns[0]);
     assert_eq!(
-        model.format(sheet, stamp(2), columns[0]),
-        FormatChange::default()
+        common::masked(
+            &jade.workbook().format_at("Operations", "B7").unwrap(),
+            &format
+        ),
+        format
     );
     assert_eq!(
         jade_edges(&jade, "B7").border_left,
@@ -766,6 +770,7 @@ proptest! {
     ) {
         let (model, jade) = open("grid-operations-workbook.xlsx");
         let (sheet, rows, columns) = lines(&model, "B6:C7");
+        let initial: Vec<_> = REGION.iter().map(|r| jade_edges(&jade, r)).collect();
         let mut sim = Simulation::with_materializer(model, jade, 3);
         let mut writes: Vec<(Id, usize, usize, FormatChange)> = Vec::new();
         for (client, kind, (r0, r1, c0, c1), b) in steps {
@@ -812,7 +817,7 @@ proptest! {
                 let expected = writes
                     .iter()
                     .filter(|(_, wr, wc, _)| (*wr, *wc) == (r, c))
-                    .fold(FormatChange::default(), |under, (.., over)| overlay(&under, over));
+                    .fold(initial[r * 2 + c].clone(), |under, (.., over)| overlay(&under, over));
                 prop_assert_eq!(edges(server.document().format(sheet, *row, *column)), expected.clone());
                 if expected != FormatChange::default() {
                     let theirs = jade_edges(server.materializer(), REGION[r * 2 + c]);

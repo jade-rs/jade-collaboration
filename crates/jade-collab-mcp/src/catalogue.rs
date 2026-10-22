@@ -1,6 +1,6 @@
 //! The published interface: server instructions and the `tools/list`
 //! catalogue. Every argument and result field is described, and the edit
-//! variants mirror `IntentOp` and `XlsxIntent` (a test builds a payload
+//! variants mirror `IntentOp`, `XlsxIntent` and `PptxIntent` (a test builds a payload
 //! from each advertised schema and checks the intent APIs accept it).
 
 use jade_xlsx_collab::BorderStyle;
@@ -8,13 +8,13 @@ use serde_json::{json, Value};
 
 /// Usage notes returned from `initialize`.
 pub(crate) const INSTRUCTIONS: &str = "\
-jade-collab-mcp lets you co-edit .docx and .xlsx documents hosted by a jade-collab server, \
+jade-collab-mcp lets you co-edit .docx, .xlsx and .pptx documents hosted by a jade-collab server, \
 live, alongside people and other agents. You join a document as a replica: your edits apply \
 to your view at once and the server orders them with everyone else's.
 
-Workflow: `list_documents` (given the server's http:// address) names the documents and their \
-ws:// URLs; `join_document` returns a `session_id`; `read_document` shows your current view; \
-`apply_edits` submits edits and waits for the server's verdict on each; `wait_for_changes` \
+Workflow: `list_documents` (given the server's http:// or https:// address) names the documents and their \
+ws:// or wss:// URLs; `join_document` returns a `session_id`; `read_document` shows your current view; \
+`apply_edits` submits edits and waits for the server's verdict on each; `get_edit_status` queries its receipt; `wait_for_changes` \
 blocks until someone else's edit arrives; `leave_document` ends the session.
 
 Addressing: docx `paragraph` is a zero-based index over every paragraph `read_document` lists, \
@@ -23,13 +23,15 @@ after the paragraph that anchors it, each footnote's after the paragraph that fi
 then the other footnotes and the endnotes; each paragraph says which story it belongs to. `offset` \
 is a UTF-8 byte offset on a character boundary; text boxes and note references take no text \
 (a paragraph lists where they sit). xlsx cells use A1 references, 1-based rows and column letters. Indices shift \
-as the document changes, so read before editing; the edits of one call are resolved in order, \
+as the document changes, so pass read_document's snapshot token to apply_edits to refuse \
+edits when the local replica has changed since that read; read again after refusal. \
+The edits of one accepted call are resolved in order, \
 each against the view the previous ones left.
 
 Outcomes: `applied` (committed by the server), `rejected` (the document refused it — e.g. a \
 table between two paragraphs, an Excel table's header row — with a reason), `invalid` (it could \
 not be understood or does not address anything in your view), `pending` (no verdict before the \
-timeout; it may still commit).";
+timeout; it may still commit). Use apply_edits receipt with get_edit_status to learn late verdicts without submitting again. Receipts are held only in this process/session; an expired receipt or a connection error does not mean the edit failed.";
 
 fn integer(description: &str) -> Value {
     json!({ "type": "integer", "minimum": 0, "description": description })
@@ -37,6 +39,36 @@ fn integer(description: &str) -> Value {
 
 fn string(description: &str) -> Value {
     json!({ "type": "string", "description": description })
+}
+
+fn signed_integer(description: &str) -> Value {
+    json!({"type":"integer","description":description})
+}
+
+fn pptx_char_format() -> Value {
+    let variant = |attribute: &str, properties: Value, required: &[&str]| {
+        let mut properties = properties.as_object().unwrap().clone();
+        properties.insert(
+            "attribute".into(),
+            json!({"type":"string","const":attribute,"description":"The character attribute."}),
+        );
+        let mut fields = vec!["attribute"];
+        fields.extend_from_slice(required);
+        object(
+            "One explicit character attribute.",
+            Value::Object(properties),
+            &fields,
+        )
+    };
+    json!({"description":"One character attribute, tagged by attribute. Different attributes compose; the newest write wins for the same attribute.","anyOf":[
+        variant("bold",json!({"value":{"type":"boolean","description":"Bold on or off."}}), &["value"]),
+        variant("italic",json!({"value":{"type":"boolean","description":"Italic on or off."}}), &["value"]),
+        variant("underline",json!({"value":{"type":"boolean","description":"Underline on or off."}}), &["value"]),
+        variant("size",json!({"hundredths":{"type":"integer","minimum":100,"maximum":400000,"description":"Font size in hundredths of a point: 1800 is 18pt."}}), &["hundredths"]),
+        variant("font",json!({"typeface":string("Latin typeface.")}), &["typeface"]),
+        variant("east_asian_font",json!({"typeface":string("East Asian typeface.")}), &["typeface"]),
+        variant("color",json!({"color":string("Colour as #RRGGBB.")}), &["color"]),
+    ]})
 }
 
 fn object(description: &str, properties: Value, required: &[&str]) -> Value {
@@ -136,6 +168,45 @@ fn docx_format_change() -> Value {
     })
 }
 
+fn docx_character_change() -> Value {
+    let mut schema = docx_format_change();
+    schema["description"] = json!("One explicit collaborative character attribute. Missing attributes inherit the file's base formatting.");
+    schema["anyOf"].as_array_mut().unwrap().retain(|v| {
+        matches!(
+            v["title"].as_str(),
+            Some(
+                "bold"
+                    | "italic"
+                    | "underline"
+                    | "strike"
+                    | "font_size"
+                    | "font_family"
+                    | "font_color"
+                    | "highlight"
+            )
+        )
+    });
+    schema
+}
+
+fn native_character_style() -> Value {
+    let flag = |description| json!({"type":"boolean","description":description});
+    let text = |description| json!({"type":["string","null"],"description":description});
+    object("Resolved editable Word run properties: document defaults, paragraph style, character style, direct properties and collaborative marks. Unresolved font/colour values remain null; this does not describe rendered theme or conditional appearance.", json!({
+        "bold":flag("Bold."), "italic":flag("Italic."),
+        "bold_complex":flag("Complex-script bold, independently of bold."),
+        "italic_complex":flag("Complex-script italic, independently of italic."),
+        "underline":flag("Underline."), "underline_style":text("Underline kind; null with enabled underline means single."),
+        "underline_color":text("Underline colour token, possibly auto; null follows the text colour."),
+        "strike":flag("Single strikethrough."), "double_strike":flag("Double strikethrough."),
+        "font_size":json!({"type":["number","null"],"description":"Font size in points; format edits use half_points instead."}),
+        "font_family":text("Resolved font family, or null when unresolved."),
+        "font_color":text("Resolved colour token, possibly auto; null when unresolved."),
+        "highlight":text("Named Word highlight colour, or null if unset."),
+        "character_style":text("Declared character style id, or null."),
+    }), &["bold","italic","bold_complex","italic_complex","underline","underline_style","underline_color","strike","double_strike","font_size","font_family","font_color","highlight","character_style"])
+}
+
 fn xlsx_format_change() -> Value {
     let flag = |what: &str| json!({ "type": "boolean", "description": what });
     json!({
@@ -208,7 +279,11 @@ fn edits() -> Value {
     let paragraph = || integer("Zero-based paragraph index in your current view.");
     let offset = || integer("UTF-8 byte offset inside the paragraph, on a character boundary.");
     let sheet = || string("The sheet's name.");
-    let slide = || integer("The slide's number, from 1.");
+    let slide = || {
+        let mut value = integer("The slide's number, from 1.");
+        value["minimum"] = json!(1);
+        value
+    };
     let target = || {
         json!({
             "description": "`\"notes\"` for the speaker notes, or `{\"shape\": N}` for shape N's text.",
@@ -444,11 +519,11 @@ fn edits() -> Value {
                 edit("set_geometry", "pptx: move, resize or rotate a shape; each attribute is last-writer-wins.", json!({
                     "slide": slide(),
                     "shape": integer("The shape's number (read_document lists them)."),
-                    "x": integer("Left, in EMU."),
-                    "y": integer("Top, in EMU."),
+                    "x": signed_integer("Left, in EMU; negative positions are allowed."),
+                    "y": signed_integer("Top, in EMU; negative positions are allowed."),
                     "width": integer("Width, in EMU."),
                     "height": integer("Height, in EMU."),
-                    "rotation": integer("Rotation, in 1/60000 degree."),
+                    "rotation": signed_integer("Rotation, in 1/60000 degree; negative rotates counterclockwise."),
                 }), &["slide", "shape"]),
                 edit("insert_slide", "pptx: insert a slide that becomes slide `at`.", json!({
                     "at": integer("The new slide's number (from 1)."),
@@ -461,8 +536,8 @@ fn edits() -> Value {
                 edit("duplicate_slide", "pptx: copy a slide right after it.", json!({ "slide": slide() }), &["slide"]),
                 edit("insert_text_box", "pptx: add a text box.", json!({
                     "slide": slide(),
-                    "x": integer("Left, in EMU."),
-                    "y": integer("Top, in EMU."),
+                    "x": signed_integer("Left, in EMU; negative positions are allowed."),
+                    "y": signed_integer("Top, in EMU; negative positions are allowed."),
                     "width": integer("Width, in EMU."),
                     "height": integer("Height, in EMU."),
                     "text": string("Its text."),
@@ -471,9 +546,96 @@ fn edits() -> Value {
                     "slide": slide(),
                     "shape": integer("The shape's number."),
                 }), &["slide", "shape"]),
+                edit("format_text", "pptx: apply one character attribute to a shape's UTF-8 range. The newest write wins per attribute; typing at the end inherits it. Notes cannot be formatted by this operation.", json!({
+                    "slide":slide(), "shape":integer("The shape number from read_document."),
+                    "start_paragraph":paragraph(), "start_offset":offset(), "end_paragraph":paragraph(), "end_offset":offset(),
+                    "format":pptx_char_format(),
+                }), &["slide","shape","start_paragraph","start_offset","end_paragraph","end_offset","format"]),
+                edit("align_paragraphs", "pptx: align whole paragraphs of a shape; the range is inclusive and judged by the server.", json!({
+                    "slide":slide(), "shape":integer("The shape number from read_document."),
+                    "start_paragraph":paragraph(), "end_paragraph":paragraph(),
+                    "alignment":{"type":"string","enum":["left","center","right","justify","distributed"],"description":"Paragraph alignment."},
+                }), &["slide","shape","start_paragraph","end_paragraph","alignment"]),
+                edit("insert_picture", "pptx: insert a PNG or JPEG picture on top of the slide. Omit both dimensions to use its pixel size at 96 dpi; one dimension preserves the image ratio. Later geometry edits respect its aspect lock.", json!({
+                    "slide":slide(), "x":signed_integer("Left, in EMU."), "y":signed_integer("Top, in EMU."),
+                    "width":integer("Optional width in EMU."), "height":integer("Optional height in EMU."),
+                    "image":json!({"type":"string","contentEncoding":"base64","description":"PNG or JPEG bytes, encoded as standard base64, at most 8 MiB decoded.","examples":["iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="]}),
+                }), &["slide","x","y","image"]),
+                edit("set_slide_hidden", "pptx: hide a slide from the slide show or show it again. It remains in reads and keeps its slide number.", json!({
+                    "slide":slide(), "hidden":{"type":"boolean","description":"True to hide, false to show."},
+                }), &["slide","hidden"]),
             ],
         },
     })
+}
+
+fn pptx_native_paragraph() -> Value {
+    let style = object("Resolved authoring character properties before display autofit; theme colours and font references are resolved.", json!({
+        "bold":{"type":"boolean","description":"Resolved bold, including explicit false."},
+        "italic":{"type":"boolean","description":"Resolved italic, including explicit false."},
+        "underline":{"type":"boolean","description":"Resolved underline, including explicit false."},
+        "size_pt":{"type":"number","exclusiveMinimum":0,"description":"Authoring font size in points, before autofit."},
+        "font":{"type":["string","null"],"description":"Resolved Latin font, or null when unspecified."},
+        "east_asian_font":{"type":["string","null"],"description":"Resolved East Asian font, or null when unspecified."},
+        "color":string("Resolved colour, such as #A020F0."),
+    }), &["bold","italic","underline","size_pt","font","east_asian_font","color"]);
+    let spacing = json!({"type":["object","null"],"description":"Spacing as {mode: percent, value: 100} for single spacing or {mode: points, value: 6}; null when unspecified.","properties":{"mode":{"type":"string","enum":["percent","points"],"description":"Whether the value is a percentage or points."},"value":{"type":"number","description":"Amount in the specified units."}},"required":["mode","value"]});
+    let paragraph = object("The native paragraph containing this text segment; soft-break segments share paragraph properties.", json!({
+        "alignment":{"type":["string","null"],"enum":["left","center","right","justify","distributed",null],"description":"Resolved horizontal paragraph alignment."},
+        "bullet":{"type":["string","null"],"enum":["none","character","numbered",null],"description":"Resolved bullet type."},
+        "character":{"type":["string","null"],"description":"Bullet character for character bullets."},
+        "scheme":{"type":["string","null"],"description":"Numbering scheme for numbered bullets."},
+        "start_at":{"type":["integer","null"],"description":"Restart value for a numbered paragraph, or null."},
+        "bullet_font":{"type":["string","null"],"description":"Resolved bullet font, or null when unspecified."},
+        "level":{"type":["integer","null"],"description":"Zero-based outline level."},
+        "margin_left_pt":{"type":["number","null"],"description":"Left paragraph margin in points, or null when unspecified."},
+        "margin_right_pt":{"type":["number","null"],"description":"Right paragraph margin in points, or null when unspecified."},
+        "indent_pt":{"type":["number","null"],"description":"First-line indent in points; negative means hanging. Null when unspecified."},
+        "line_spacing":spacing, "space_before":spacing, "space_after":spacing,
+    }), &["alignment","bullet","character","scheme","start_at","bullet_font","level","margin_left_pt","margin_right_pt","indent_pt","line_spacing","space_before","space_after"]);
+    object("With include_base_formatting: one zero-based paragraph of the shape's newline-separated text.", json!({
+        "index":integer("Paragraph number used by text edits."),
+        "text":string("Text without its terminating newline."),
+        "paragraph_format":paragraph,
+        "resolved_formatting":{"type":"array","description":"Contiguous maximal UTF-8 runs partitioning this paragraph; an empty paragraph has no runs.","items":object("A run with one resolved style.",json!({"start":integer("First UTF-8 byte."),"end":integer("Exclusive end UTF-8 byte."),"style":style}),&["start","end","style"])},
+    }), &["index","text","paragraph_format","resolved_formatting"])
+}
+
+fn pptx_shape_read() -> Value {
+    object(
+        "One addressable shape.",
+        json!({
+            "shape":integer("The shape number edits take."),
+            "kind":string("shape, picture, group, table or chart."),
+            "text":json!({"type":["string","null"],"description":"Text with paragraphs joined by newlines; null when there is no text body."}),
+            "editable":json!({"type":"boolean","description":"Whether its text can be edited."}),
+            "deletable":json!({"type":"boolean","description":"Whether the shape can be deleted."}),
+            "aspect_locked":json!({"type":"boolean","description":"Width/height changes retain the aspect ratio and travel through sequenced resize."}),
+            "group":json!({"type":["integer","null"],"description":"The nearest addressable enclosing group's shape number on this slide, or null when none is known."}),
+            "geometry":json!({"type":["object","null"],"description":"Top-level placement: x/y/width/height in EMU and rotation in 1/60000 degree; null when it cannot be placed."}),
+            "formatting":{
+                "type":"array","description":"Collaborative character overrides, ordered by paragraph, attribute, then byte offset. Runs of different attributes may overlap; the file's base formatting is not included.",
+                "items":object("A maximal run of one character attribute.", json!({
+                    "paragraph":integer("Zero-based paragraph in this shape's text."),
+                    "start":integer("First UTF-8 byte within that paragraph."),
+                    "end":integer("Exclusive end UTF-8 byte within that paragraph."),
+                    "format":pptx_char_format(),
+                }), &["paragraph","start","end","format"]),
+            },
+            "paragraphs":{"type":"array","description":"Present for text bodies with include_base_formatting: authoritative resolved character and paragraph properties. Omitted for pictures/groups/tables/charts and shapes without a text body. Notes are plain text only.","items":pptx_native_paragraph()},
+        }),
+        &[
+            "shape",
+            "kind",
+            "text",
+            "editable",
+            "deletable",
+            "aspect_locked",
+            "group",
+            "geometry",
+            "formatting",
+        ],
+    )
 }
 
 fn session_id() -> Value {
@@ -514,14 +676,41 @@ struct Tool {
     idempotent: bool,
 }
 
+fn receipt_output() -> Value {
+    object(
+        "Retained outcomes for one accepted apply_edits call, with live session progress.",
+        json!({
+            "receipt":string("Opaque get_edit_status token; session- and MCP-instance-scoped."),
+            "complete":{"type":"boolean","description":"Every submitted operation in this batch has been answered. Invalid edits and no-ops have no unanswered operations."},
+            "unresolved":integer("Submitted operations in this batch whose verdict is still unknown; zero when complete."),
+            "results":{"type":"array","description":"One entry per edit, in input order.","items":object("One edit's outcome.",json!({
+                "index":integer("Position in the original edits array."),
+                "status":{"type":"string","enum":["applied","rejected","invalid","pending"],"description":"Applied when all its operations committed, rejected when any refused, invalid when parsing/resolution failed, or pending without a verdict. No-op edits are applied."},
+                "reason":string("Rejected: why the edit was refused."),
+                "error":string("Invalid: what is wrong with the edit."),
+            }), &["index","status"])},
+            "seq":seq(), "pending":pending(),
+            "connection_error":string("The connection failed while verdicts were outstanding. Pending means unknown, not rejected; a submitted edit may have committed."),
+        }),
+        &[
+            "receipt",
+            "complete",
+            "unresolved",
+            "results",
+            "seq",
+            "pending",
+        ],
+    )
+}
+
 fn tools() -> Vec<Tool> {
     vec![
         Tool {
             name: "list_documents",
             title: "List hosted documents",
-            description: "List the documents a jade-collab server hosts, with the ws:// URL to join each.",
+            description: "List the documents a jade-collab server hosts, with the ws:// or wss:// URL to join each.",
             input: object("Arguments.", json!({
-                "server": string("The server's address, `http://host:port`."),
+                "server": string("The server's address, `http://host:port` or `https://host:port`. HTTPS discovery returns wss:// socket URLs."),
                 "token": string("Access token, when the server requires one (defaults to $JADE_COLLAB_TOKEN)."),
             }), &["server"]),
             output: object("The hosted documents.", json!({
@@ -531,7 +720,7 @@ fn tools() -> Vec<Tool> {
                     "items": object("A hosted document.", json!({
                         "name": string("The document's name."),
                         "format": string("`docx`, `xlsx` or `pptx`."),
-                        "url": string("The ws:// URL join_document takes."),
+                        "url": string("The ws:// or wss:// socket URL join_document takes."),
                     }), &["name", "format", "url"]),
                 },
             }), &["documents"]),
@@ -544,7 +733,7 @@ fn tools() -> Vec<Tool> {
             title: "Join a document",
             description: "Join a hosted document as a new replica and return the `session_id` the other tools take. The format comes from the document's name.",
             input: object("Arguments.", json!({
-                "url": string("The document's socket, `ws://host:port/documents/<name>/ws` (as list_documents gives it)."),
+                "url": string("The document's socket URL from list_documents. The name is one percent-encoded UTF-8 path segment; preserve its encoding. A ?token= query is supported."),
                 "token": string("Access token, when the server requires one (defaults to $JADE_COLLAB_TOKEN)."),
             }), &["url"]),
             output: object("The new session.", json!({
@@ -561,29 +750,60 @@ fn tools() -> Vec<Tool> {
         Tool {
             name: "read_document",
             title: "Read a document",
-            description: "Your current view, a page at a time. docx: paragraphs (index, text, which story — body, a table cell, a text box, a footnote or an endnote — where its text boxes and note references sit, and which bytes tracked changes cover: deleted text stays in `text` until the deletion is accepted), the comments, the top-level tables, whether Track Changes is on and every revision with its author; xlsx: every sheet's size and its non-blank cells in A1 form, paged over all sheets in order; pptx: slides (numbered from 1) with their shapes' numbers, text and geometry and the speaker notes. Your own unanswered edits are included.",
+            description: "Read a page of your live view, or pass the snapshot token from a previous read to keep that same immutable view across pages. docx: paragraphs (index, text, which story — body, a table cell, a text box, a footnote or an endnote — where its text boxes and note references sit, and which bytes tracked changes cover: deleted text stays in `text` until the deletion is accepted), explicit collaborative character-format spans (UTF-8 offsets; base and paragraph styles are not included), the comments, the top-level tables, whether Track Changes is on and every revision with its author; xlsx: every sheet's size and default style, with one sparse page across cells (value, note and resolved base format), row styles, column styles and merge ranges, in sheet order. Follow next until null; entry_count counts these items and cell_count counts non-blank values. Pass the same snapshot on every page for a stable walk while edits continue; pptx: slides (numbered from 1) with their shapes' numbers, text, collaborative formatting, geometry, aspect locks and enclosing group numbers, plus speaker notes and the slide's hidden flag. Hidden slides remain in the read order. For DOCX and PPTX, include_base_formatting captures the committed server model with resolved native character and paragraph styles at the same seq (PPTX shape text only; notes remain plain text); this view is authoritative and pending is zero. Default live reads include your own unanswered edits. The process retains one snapshot per session: reading without snapshot replaces it, and leaving removes it. Pinned reads keep seq and pending as captured; apply_edits and wait_for_changes continue to use the live replica.",
             input: object("Arguments.", json!({
                 "session_id": session_id(),
-                "start": integer("First paragraph (docx), cell (xlsx) or slide (pptx, zero-based) to list; default 0."),
+                "snapshot": string("Optional opaque token returned by read_document. Omit for a fresh live view, replacing this session's previous snapshot. Pass it unchanged for subsequent pages or retries; expired/foreign-session tokens fail explicitly."),
+                "include_base_formatting": json!({"type":"boolean","description":"DOCX and PPTX, default false. Capture the server's committed model and resolved native character/paragraph formatting at one log position. Earlier queued edits are processed first; pending is zero and view is authoritative. On later pages omit this option or keep its original value; a snapshot's mode cannot change."}),
+                "start": integer("First paragraph (docx), sparse entry (xlsx: cell, row style, column style or merge), or slide (pptx), zero-based; default 0."),
                 "limit": json!({
                     "type": "integer",
                     "minimum": 1,
                     "description": format!("How many to list; default {}.", crate::DEFAULT_LIMIT),
                 }),
             }), &["session_id"]),
-            output: object("The view.", json!({
+            output: object("The captured view.", json!({
+                "snapshot": string("Opaque session-scoped token for this retained immutable read view. Pass it to read_document on subsequent pages."),
                 "format": string("`docx`, `xlsx` or `pptx`."),
-                "seq": seq(),
-                "pending": pending(),
+                "view": json!({"type":"string","const":"authoritative","description":"Present for include_base_formatting: the server's committed view at seq, excluding local edits submitted after the capture request."}),
+                "seq": integer("Replication sequence at snapshot capture."),
+                "pending": integer("Unanswered optimistic operations included at snapshot capture."),
                 "start": integer("The `start` this page begins at."),
                 "next": next(),
                 "paragraph_count": integer("docx: how many paragraphs there are."),
+                "formatting_scope": json!({
+                    "type": "string", "const": "collaborative_overrides",
+                    "description": "docx/pptx: formatting lists explicit collaborative character overrides, including false values. It excludes file base styles and paragraph styles; an omitted attribute inherits the base and does not mean false. DOCX clears remove overrides except highlight.",
+                }),
                 "paragraphs": {
                     "type": "array",
                     "description": "docx: the paragraphs of this page.",
                     "items": object("A paragraph.", json!({
                         "index": integer("Its index, as edits address it."),
                         "text": string("Its text."),
+                        "resolved_formatting": {
+                            "type":"array",
+                            "description":"With include_base_formatting: contiguous maximal runs of the same resolved native style. They partition this paragraph's UTF-8 text; empty paragraphs have no runs.",
+                            "items": object("A native character style run.", json!({
+                                "start":integer("First UTF-8 byte."), "end":integer("Exclusive end UTF-8 byte."),
+                                "style":native_character_style(),
+                            }), &["start","end","style"]),
+                        },
+                        "paragraph_format": object("With include_base_formatting: the native paragraph style and formatting.", json!({
+                            "style_id":json!({"type":["string","null"],"description":"Declared paragraph style id; null uses the document default."}),
+                            "alignment":json!({"type":["string","null"],"description":"Paragraph alignment token, or null when unset."}),
+                            "indent":json!({"type":["object","null"],"description":"Indent in points: nullable left, right, first_line and hanging."}),
+                            "spacing":json!({"type":["object","null"],"description":"Nullable before/after spacing in points, line, and line_rule (auto: line is a multiplier; exact/at_least: points)."}),
+                        }), &["style_id","alignment","indent","spacing"]),
+                        "formatting": {
+                            "type": "array",
+                            "description": "Explicit collaborative character changes, as maximal UTF-8 byte runs per attribute. Runs of different attributes may overlap; runs of one attribute are disjoint. Ordered by bold, italic, underline, strike, font size, family, colour, highlight, then start. The file's base formatting is not included; an empty array does not mean unformatted text.",
+                            "items": object("One character attribute over a half-open byte range of text.", json!({
+                                "start": integer("First byte of the run, on a UTF-8 boundary."),
+                                "end": integer("Exclusive end byte, on a UTF-8 boundary."),
+                                "change": docx_character_change(),
+                            }), &["start", "end", "change"]),
+                        },
                         "story": {
                             "type": "object",
                             "description": "Where it is: `{kind: body}`, `{kind: table_cell, table, row, column}` (zero-based), or `{kind: nested_table_cell}`.",
@@ -592,7 +812,7 @@ fn tools() -> Vec<Tool> {
                             "type": "array",
                             "description": "Tracked changes in it, if any: `{kind: insertion|deletion, revision, start, end}` (UTF-8 byte offsets into `text`).",
                         },
-                    }), &["index", "text", "story"]),
+                    }), &["index", "text", "story", "formatting"]),
                 },
                 "comments": {
                     "type": "array",
@@ -636,9 +856,10 @@ fn tools() -> Vec<Tool> {
                     }), &["index", "rows", "columns", "locked", "merges"]),
                 },
                 "cell_count": integer("xlsx: how many non-blank cells all sheets hold."),
+                "entry_count": integer("xlsx: how many sparse read items all sheets hold. start/next index these items, including blank cells with styles or notes, axis styles and merge geometry."),
                 "sheets": {
                     "type": "array",
-                    "description": "xlsx: every sheet, with the cells of this page.",
+                    "description": "xlsx: every sheet, with only this page's cells, axis styles and merge geometry. Default style and dimensions are repeated metadata.",
                     "items": object("A sheet.", json!({
                         "name": string("Its name."),
                         "rows": integer("Rows in the editable grid."),
@@ -649,17 +870,30 @@ fn tools() -> Vec<Tool> {
                         },
                         "formats": {
                             "type": "object",
-                            "description": "A1 reference → the format attributes written through this collaboration that show at the cell (as set_format takes them, borders included; its row's and column's formats count, a merged cell shows its anchor's). Listed for cells formatted on their own or merged; formats the file already had are not listed.",
+                            "description": "A1 reference → the known resolved base format of a cell on this page, including cells with values, explicit styles or merge anchors. Shares one page item with its value. Conditional styles are not included; covered cells use the anchor named by a merge range.",
                         },
+                        "notes": {
+                            "type": "object",
+                            "description": "A1 reference → legacy note text for cells on this page, including notes on blank cells. Shares the cell's page item with its value and format.",
+                        },
+                        "merges": {
+                            "type": "array",
+                            "description": "Merged A1 ranges on this page. Each range occupies one item; covered coordinates are not expanded. The top-left cell is a separate cell item with the resolved format.",
+                            "items": string("An inclusive A1 range, e.g. E1:F1."),
+                        },
+                        "default_format": json!({
+                            "type": "object",
+                            "description": "The imported default cell style, before explicit cell/row/column styles and subsequent collaborative changes. Unresolved attributes are omitted.",
+                        }),
                         "row_formats": {
                             "type": "object",
-                            "description": "Row number (`3`) → the whole-row format written through this collaboration.",
+                            "description": "Row number (`3`) → the imported intentional row style and collaborative changes to that row; only row-style items on this page.",
                         },
                         "column_formats": {
                             "type": "object",
-                            "description": "Column letter (`B`) → the whole-column format written through this collaboration.",
+                            "description": "Column letter (`B`) → the imported column style and collaborative changes to that column; only column-style items on this page.",
                         },
-                    }), &["name", "rows", "columns", "cells", "formats", "row_formats", "column_formats"]),
+                    }), &["name", "rows", "columns", "cells", "formats", "default_format", "row_formats", "column_formats", "merges", "notes"]),
                 },
                 "slide_count": integer("pptx: how many slides there are."),
                 "slides": {
@@ -667,15 +901,17 @@ fn tools() -> Vec<Tool> {
                     "description": "pptx: the slides of this page.",
                     "items": object("A slide.", json!({
                         "slide": integer("Its number, as edits address it (from 1)."),
+                        "hidden": json!({"type":"boolean","description":"Skipped in the slide show; it still appears in reads and keeps its number."}),
                         "shapes": {
                             "type": "array",
-                            "description": "Its shapes: `shape` (the number edits take), `kind`, `text` (null when jade cannot edit it), `editable`, `deletable`, `geometry` (EMU; rotation in 1/60000 degree).",
+                            "description": "Its shapes, including group children, in depth-first order.",
+                            "items": pptx_shape_read(),
                         },
                         "notes": string("Speaker notes, paragraphs joined with newlines."),
                         "notes_editable": json!({ "type": "boolean", "description": "Whether the notes can be edited." }),
-                    }), &["slide", "shapes", "notes", "notes_editable"]),
+                    }), &["slide", "hidden", "shapes", "notes", "notes_editable"]),
                 },
-            }), &["format", "seq", "pending", "start", "next"]),
+            }), &["format", "seq", "pending", "start", "next", "snapshot"]),
             read_only: true,
             destructive: false,
             idempotent: true,
@@ -683,33 +919,31 @@ fn tools() -> Vec<Tool> {
         Tool {
             name: "apply_edits",
             title: "Apply edits",
-            description: "Submit edits and wait for the server's verdict on each: `applied`, `rejected` (with the reason), `invalid` (with the error), or `pending` if the timeout passed first. Edits are applied in order against your view as it evolves; a failed one does not stop the rest.",
+            description: "Submit edits and wait for the server's verdict on each: `applied`, `rejected` (with the reason), `invalid` (with the error), or `pending` if the timeout passed first. The receipt token permits later get_edit_status calls without resending. Up to 64 receipts are retained per session; completed ones may expire, and a full cache of unanswered receipts refuses a new call before allocation/submission. Connection loss preserves known results and reports unanswered operations as pending with connection_error. Pass snapshot from read_document to require that this session's local replica is unchanged since that read; a stale, expired or foreign token refuses the whole call before allocation or submission. The version check, edit resolution and queueing hold one replica lock. Without snapshot, use the current local view. Once accepted, edits run in order against the evolving view; a failed edit does not stop the rest or roll back earlier edits. This is a local version precondition, not a server-wide transaction.",
             input: object("Arguments.", json!({
                 "session_id": session_id(),
                 "edits": edits(),
+                "snapshot": string("Optional read_document token. Refuse the entire call if the local replica changed since capture. Read again and reconsider edits after refusal. The token remains readable; submitting an operation makes it stale for further editing."),
                 "timeout_ms": timeout_ms(crate::DEFAULT_TIMEOUT_MS),
             }), &["session_id", "edits"]),
-            output: object("What became of each edit.", json!({
-                "results": {
-                    "type": "array",
-                    "description": "One entry per edit, in order.",
-                    "items": object("An edit's outcome.", json!({
-                        "index": integer("The edit's position in `edits`."),
-                        "status": json!({
-                            "type": "string",
-                            "enum": ["applied", "rejected", "invalid", "pending"],
-                            "description": "What became of it.",
-                        }),
-                        "reason": string("rejected: why the document refused it."),
-                        "error": string("invalid: what is wrong with it."),
-                    }), &["index", "status"]),
-                },
-                "seq": seq(),
-                "pending": pending(),
-            }), &["results", "seq", "pending"]),
+            output: receipt_output(),
             read_only: false,
             destructive: true,
             idempotent: false,
+        },
+        Tool {
+            name: "get_edit_status",
+            title: "Get edit status",
+            description: "Look up an apply_edits receipt without resubmitting edits. A receipt is scoped to its session and this MCP process. Default timeout is zero; optionally wait for that batch's submitted operations, including rejections that do not advance seq. Later batches do not delay it. Complete means every submitted operation in the batch has an answer; a rejected edit may still have other submitted operations pending. Unknown outcomes stay pending if the connection fails, with connection_error; they may have committed. Up to 64 receipts are retained per session; only completed ones may be evicted, and leaving removes them. An expired receipt does not establish failure.",
+            input: object("Arguments.",json!({
+                "session_id":session_id(),
+                "receipt":string("The opaque token returned by apply_edits in this session."),
+                "timeout_ms":timeout_ms(0),
+            }), &["session_id","receipt"]),
+            output:receipt_output(),
+            read_only:true,
+            destructive:false,
+            idempotent:true,
         },
         Tool {
             name: "wait_for_changes",

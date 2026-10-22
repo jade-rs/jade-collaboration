@@ -83,3 +83,18 @@ jobs:
         run: cargo test -p jade-collab-core --test marks_oracle --locked -- --ignored
         env:
           JADE_LEAN_MARKS_ORACLE: ${{ github.workspace }}/lean/.lake/build/bin/marks-oracle
+
+      - name: Differential test of journal recovery against the Lean model
+        run: cargo test -p jade-collab-server --lib journal_matches_lean --locked -- --ignored
+        env:
+          JADE_LEAN_JOURNAL_ORACLE: ${{ github.workspace }}/lean/.lake/build/bin/journal-oracle
+
+      - name: Differential test of bounded identifiers against the Lean model
+        run: cargo test -p jade-collab-core --test id_oracle --locked -- --ignored
+        env:
+          JADE_LEAN_ID_ORACLE: ${{ github.workspace }}/lean/.lake/build/bin/id-oracle
+
+      - name: Differential test of document paths against the Lean byte codec
+        run: cargo test -p jade-collab-server --test address_oracle --locked -- --ignored
+        env:
+          JADE_LEAN_ADDRESS_ORACLE: ${{ github.workspace }}/lean/.lake/build/bin/address-oracle

@@ -15,20 +15,29 @@
 //! queue is full ([`Server::with_outgoing_limit`]), and every access can be
 //! written to an audit log ([`Server::with_audit_log`]).
 
+mod address;
 mod audit;
 mod auth;
 mod client;
 mod limits;
+mod mailbox;
 mod outbox;
+mod registry;
 mod room;
 mod server;
 mod storage;
+pub mod transport;
 pub mod wire;
 
+pub use address::{document_name_from_url, document_path, document_socket_path};
 pub use auth::{DocumentRole, DocumentRule, Grant, Role, Tokens, TokensError};
-pub use client::{Client, ClientError, Presence};
+pub use client::{
+    Client, ClientEdit, ClientError, ClientSnapshot, EditError, Inspection, Presence,
+    StaleSnapshot, DEFAULT_CONNECT_TIMEOUT,
+};
 pub use limits::PresenceLimits;
+pub use mailbox::{DEFAULT_INCOMING_BYTES, DEFAULT_INCOMING_LIMIT};
 pub use outbox::DEFAULT_OUTGOING_LIMIT;
-pub use server::{Server, ServerError};
+pub use server::{Server, ServerError, DEFAULT_UPLOAD_LIMIT};
 pub use storage::{Fsync, StorageOptions};
 pub use wire::Format;
