@@ -91,11 +91,35 @@ fn ordinary_notes_typing_keeps_native_plain_runs_bounded_across_restore() {
     }
     let count = runs(&notes_xml(&jade));
     assert!(
-        count <= 31,
+        count <= 17,
         "plain native runs grew to {count} after 128 prepends"
     );
     let reopened = PptxModel::from_pptx(&jade.export(&model).unwrap()).unwrap();
     assert_eq!(reopened.slides()[0].notes, expected);
+}
+
+#[test]
+fn checkpoint_replay_has_the_exact_same_native_bytes_as_uninterrupted_edits() {
+    let mut live = Session::new(&fixture());
+    for _ in 0..9 {
+        live.prepend(1, "prefix");
+    }
+    let checkpoint = live.jade.export(&live.model).unwrap();
+    let mut restored = Session {
+        model: live.model.clone(),
+        jade: JadePptx::restore(&checkpoint, &live.model).unwrap(),
+        seq: live.seq,
+        next: live.next,
+    };
+    assert_eq!(live.jade.bytes(), restored.jade.bytes());
+    for _ in 0..16 {
+        live.prepend(1, "suffix");
+        restored.prepend(1, "suffix");
+        assert!(
+            live.jade.bytes() == restored.jade.bytes(),
+            "checkpoint replay changed the native archive despite identical operations"
+        );
+    }
 }
 
 struct Session {
@@ -165,8 +189,9 @@ proptest! {
         steps in prop::collection::vec((0u8..6,any::<usize>(),any::<usize>(),0usize..8),1..40),
     ) {
         let mut session=Session::new(&fixture());
+        let mut live=Session::new(&fixture());
         let mut reference=session.model.slides()[0].notes.clone();
-        for i in 0..24 { let text=format!("[{i}]字🙂"); session.prepend(1,&text); reference.insert_str(0,&text); }
+        for i in 0..24 { let text=format!("[{i}]字🙂"); session.prepend(1,&text); live.prepend(1,&text); reference.insert_str(0,&text); }
         for (kind,a,b,t) in steps {
             let length=reference.chars().count();
             let a=a%(length+1); let b=b%(length+1);
@@ -176,7 +201,8 @@ proptest! {
                     let choices=["", "字🙂", "a & < >", "e\u{301}", "\t", "\n", "fiمرحبا", "one\ntwo"];
                     let text=choices[t];
                     let (sp,so)=point(&reference,a); let (ep,eo)=point(&reference,b);
-                    session.intent(PptxIntent::ReplaceRange {slide:1,target:Target::Notes,start_paragraph:sp,start_offset:so,end_paragraph:ep,end_offset:eo,text:text.into()});
+                    let intent=PptxIntent::ReplaceRange {slide:1,target:Target::Notes,start_paragraph:sp,start_offset:so,end_paragraph:ep,end_offset:eo,text:text.into()};
+                    live.intent(intent.clone()); session.intent(intent);
                     let from=reference.char_indices().nth(a).map(|(i,_)|i).unwrap_or(reference.len());
                     let to=reference.char_indices().nth(b).map(|(i,_)|i).unwrap_or(reference.len());
                     reference.replace_range(from..to,text);
@@ -199,6 +225,7 @@ proptest! {
             prop_assert_eq!(&session.model.slides()[0].notes,&reference);
             let native=jade_pptx_writer::notes_text(session.jade.bytes(),0).unwrap();
             prop_assert_eq!(&native.text,&reference);
+            prop_assert!(session.jade.bytes()==live.jade.bytes(),"restore/fork changed native replay bytes");
         }
         let reopened=PptxModel::from_pptx(&session.jade.export(&session.model).unwrap()).unwrap();
         prop_assert_eq!(&reopened.slides()[0].notes,&reference);
@@ -224,7 +251,7 @@ fn fragmented_fixture(count: usize) -> Vec<u8> {
     package.write().unwrap()
 }
 #[test]
-fn moving_a_large_notes_story_invalidates_the_ordinal_maintenance_cadence() {
+fn moving_a_large_notes_story_compacts_at_its_current_ordinal() {
     let mut s = Session::new(&fragmented_fixture(128));
     s.prepend(2, "warm");
     s.intent(PptxIntent::MoveSlide { slide: 1, to: 2 });
@@ -243,7 +270,7 @@ fn moving_a_large_notes_story_invalidates_the_ordinal_maintenance_cadence() {
             &rels.by_type_suffix("/notesSlide")[0].target,
         ))
         .unwrap();
-    assert!(runs(&xml) <= 31);
+    assert!(runs(&xml) <= 17);
     assert_eq!(
         jade_pptx_writer::notes_text(s.jade.bytes(), 1)
             .unwrap()
@@ -275,7 +302,7 @@ fn a_noop_does_not_publish_a_staged_xml_compaction() {
     .unwrap();
     assert_eq!(jade.bytes(), bytes);
     assert!(!jade.session().is_dirty());
-    // A no-op must not postpone the first maintenance of a restored story.
+    // A subsequent actual edit still normalizes the restored story.
     let next = model.max_lamport() + 100;
     let mut session = Session {
         model,
@@ -285,8 +312,8 @@ fn a_noop_does_not_publish_a_staged_xml_compaction() {
     };
     session.prepend(1, "real edit");
     assert!(
-        runs(&notes_xml(&session.jade)) <= 31,
-        "a no-op consumed the restored-story maintenance check"
+        runs(&notes_xml(&session.jade)) <= 17,
+        "the actual edit did not normalize the restored story"
     );
 }
 
@@ -365,7 +392,7 @@ fn note_compaction_and_typing_leave_every_other_package_part_exact() {
             assert_eq!(old.part(part), new.part(part), "untouched part {part}");
         }
     }
-    assert!(runs(&notes_xml(&session.jade)) <= 31);
+    assert!(runs(&notes_xml(&session.jade)) <= 17);
 }
 
 #[test]
@@ -445,7 +472,7 @@ fn grown_notes_native_path_comparison() {
                 .text,
             reference
         );
-        assert!(runs(&notes_xml(&optimized.jade)) <= 31);
+        assert!(runs(&notes_xml(&optimized.jade)) <= 17);
     }
     let old = OpcPackage::open(native.bytes()).unwrap();
     let new = OpcPackage::open(optimized.jade.bytes()).unwrap();

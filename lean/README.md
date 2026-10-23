@@ -39,15 +39,18 @@ implementation, native IO and the toolchain's trusted kernel remain boundaries.
 Twelve theorems cover joining adjacent equivalent plain runs, preserving their
 character/whitespace-mode stream and the exact order and payloads of opaque
 anchors through arbitrary rewrite histories. Every interpreter of that stream
-therefore agrees. A separate count model proves that checking every eight
-text-changing inputs keeps an eligible group at most 31 runs, assuming each
+therefore agrees. A separate count model proves that checking before each
+text-changing input keeps an eligible group at most 17 runs, assuming each
 native prepend adds at most two; the first check also bounds an arbitrarily
 large restored group. Failed and no-op staged inputs preserve the original
-archive exactly.
+archive exactly. An archive-determined transition composes across any checkpoint;
+a counterexample shows how an unpersisted maintenance counter changes replayed
+run layout. Native transition determinism remains a Rust verification boundary.
 
 This does not prove the XML parser, namespace resolution, native run-growth
 assumption or Office rendering. Native Rust PBT checks decoded text, edit
-capabilities, Unicode, opaque XML positions, edit/restore/fork histories and
+capabilities, Unicode, opaque XML positions, exact uninterrupted-versus-restored
+archives through edit/restore/fork histories and
 unchanged other package parts. Rich, foreign, nonadjacent and otherwise unknown
 runs remain barriers. The count bound concerns one eligible plain group under
 the stated edit pattern, not arbitrary rich-note documents. An ignored

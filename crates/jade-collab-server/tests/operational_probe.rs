@@ -171,6 +171,19 @@ fn download(base: &str, name: &str) -> Vec<u8> {
     output.stdout
 }
 
+fn check_export(root: &Path, stage: &str, name: &str, actual: &[u8], expected: &[u8]) {
+    if actual != expected {
+        let expected_path = root.join(format!("{stage}-expected-{name}"));
+        let actual_path = root.join(format!("{stage}-actual-{name}"));
+        fs::write(&expected_path, expected).unwrap();
+        fs::write(&actual_path, actual).unwrap();
+        panic!(
+            "{stage} export differs: {name}; expected {}, actual {}; set JADE_PROBE_KEEP_DATA=1 to retain files",
+            expected_path.display(), actual_path.display()
+        );
+    }
+}
+
 fn docx(client: &Client<DocxModel>, worker: usize, n: u64) {
     let intent = IntentOp::InsertText {
         paragraph: 0,
@@ -552,10 +565,12 @@ async fn probe(count: usize, duration: Duration, pace: Duration, report_path: Op
         .into_iter()
         .zip(&bytes)
     {
-        assert_eq!(
+        check_export(
+            root,
+            "crash-recovery",
+            name,
             &download(&base, name),
             expected,
-            "crash recovery export: {name}"
         );
     }
     recovered.kill();
@@ -575,10 +590,12 @@ async fn probe(count: usize, duration: Duration, pace: Duration, report_path: Op
         .into_iter()
         .zip(&bytes)
     {
-        assert_eq!(
+        check_export(
+            root,
+            "backup-restore",
+            name,
             &download(&base, name),
             expected,
-            "backup restore export: {name}"
         );
     }
     writable(&base, "probe.docx", &a, docx).await;

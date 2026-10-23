@@ -4,7 +4,6 @@ use quick_xml::{events::Event, name::ResolveResult, NsReader};
 use std::ops::Range;
 
 pub(crate) const MIN_RUNS: usize = 16;
-pub(crate) const CHECK_EVERY: usize = 8;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Ns {

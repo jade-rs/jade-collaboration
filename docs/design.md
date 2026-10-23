@@ -2170,9 +2170,8 @@ The grown operational fixture accumulated 9,857 unformatted runs in one notes
 body. Repeated native notes input scanned and retained that fragmentation,
 slowing both live acknowledgments and replay of an existing journal. A regression
 first showed 255 runs after 128 ordinary prepends. The collaboration materializer
-now checks at the first text-changing notes input after open/restore, then every
-eight successful changes. Slide-order edits invalidate this ordinal-keyed cadence.
-No-op/refused inputs do not consume a check.
+now checks before each native notes input, deciding from the current archive
+alone. No maintenance counter needs to survive a checkpoint, fork or slide move.
 
 The optimization resolves one internal notes relationship and one active body
 placeholder, matching the native fallback branch policy. A namespace-aware XML
@@ -2192,11 +2191,21 @@ Undo cache may be rebased, while the collaboration log remains authoritative.
 No journal format or engine-submodule change is needed, including old-journal replay.
 
 Native stateful PBT checks insert/replace/delete, Unicode, paragraph splits,
-export/restore/fork, refused edits, opaque positions, exact other parts and the
-no-op cadence regression. `NotesRuns.lean` proves character/whitespace-stream
+export/restore/fork, refused edits, opaque positions, exact other parts and no-op
+publication. Histories compare exact native archives with an uninterrupted
+reference after every step. `NotesRuns.lean` proves character/whitespace-stream
 equivalence, opaque order/payload preservation through arbitrary rewrites, and
 failed/no-op publication preservation. A separate invariant bounds one eligible
-plain group at 31 runs when successful maintenance checks every eight changes
+plain group at 17 runs when successful maintenance checks before each input
 and native prepends add at most two runs. Parsing, namespace/placeholder fidelity,
 native growth and Office rendering remain Rust/native verification boundaries;
 the theorem is not a size bound for arbitrary rich-note XML.
+
+The first long operational run exposed a checkpoint bug in an earlier scheduled
+implementation: restored sessions reset its external counter and normalized at
+a different edit than live sessions. Native text agreed, but the PPTX notes part
+had 7 runs after recovery versus 15 before it, breaking exact export identity.
+A fixed regression fails on that implementation. Eligibility now depends only
+on persisted XML, and the Lean module includes checkpoint composition and a
+counterexample for the discarded external-counter schedule. The process probe's
+byte equality check remains unchanged in strength.

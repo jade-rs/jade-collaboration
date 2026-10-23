@@ -24,8 +24,6 @@ pub struct JadePptx {
     ids: BTreeMap<(Id, Id), u32>,
     /// What jade reads back from the current bytes, dropped on every write.
     cache: RefCell<Cache>,
-    /// A per-slide maintenance cadence. Slide-order edits invalidate these keys.
-    notes_edits: BTreeMap<usize, usize>,
 }
 
 #[derive(Default)]
@@ -48,7 +46,6 @@ impl JadePptx {
             session,
             ids: BTreeMap::new(),
             cache: RefCell::default(),
-            notes_edits: BTreeMap::new(),
         }
     }
 
@@ -138,33 +135,23 @@ impl JadePptx {
             soft_break: false,
             history: None,
         };
-        let count = self
-            .notes_edits
-            .get(&slide)
-            .copied()
-            .unwrap_or(crate::notes_runs::CHECK_EVERY);
-        let due = count >= crate::notes_runs::CHECK_EVERY;
-        let next = if due { 1 } else { count + 1 };
-        if let Some(mut staged) = due.then(|| self.compact_notes_session(slide)).flatten() {
+        // Eligibility depends only on the current archive. A volatile cadence
+        // changes run boundaries after checkpoint/replay and breaks exact exports.
+        if let Some(mut staged) = self.compact_notes_session(slide) {
             // Native input validates text, locking, capabilities and offsets on
             // the staged file too. Any failed optimization leaves the original
             // session untouched and uses its existing native path instead.
             if let Ok(result) = staged.apply_notes_input(slide, &edit) {
                 if result.changed {
                     self.session = staged;
-                    self.notes_edits.insert(slide, next);
                 }
                 return Ok(());
             }
         }
-        let result = self
-            .session
+        self.session
             .apply_notes_input(slide, &edit)
-            .map_err(|e| e.to_string())?;
-        if result.changed {
-            self.notes_edits.insert(slide, next);
-        }
-        Ok(())
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 
     pub fn bytes(&self) -> &[u8] {
@@ -354,15 +341,6 @@ impl JadePptx {
     }
 
     fn realise(&mut self, effect: PptxEffect) -> Result<(), String> {
-        if matches!(
-            &effect,
-            PptxEffect::InsertSlide { .. }
-                | PptxEffect::DeleteSlide { .. }
-                | PptxEffect::MoveSlide { .. }
-                | PptxEffect::DuplicateSlide { .. }
-        ) {
-            self.notes_edits.clear();
-        }
         let result = self.write(effect);
         *self.cache.get_mut() = Cache::default();
         result

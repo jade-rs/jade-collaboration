@@ -3,9 +3,10 @@ import Std
 /-! Notes run maintenance preserves the paragraph's styled character stream and
 opaque XML anchors. Parsing/namespaces, raw XML joins and native Office rendering
 are Rust/native-PBT boundaries, not assumed to be proved by this model.
-The count bound is for one eligible group under successful text-changing native
-prepends adding at most two runs, checked every eight changes. Rich/opaque
-barriers remain separate. Publication lemmas concern the native archive only. -/
+The count bound is for one eligible group checked before each successful
+text-changing native prepend adding at most two runs. Rich/opaque barriers
+remain separate. Publication/replay lemmas concern the native archive only;
+the deterministic native transition is a Rust/native verification boundary. -/
 namespace JadeCollab.NotesRuns
 
 inductive Piece (Char Meta : Type) where
@@ -73,52 +74,46 @@ theorem an_eligible_group_is_small_after_a_check (runs : Nat) : compactCount run
   unfold compactCount
   split <;> omega
 
-structure State where
-  runs : Nat
-  inputsSinceCheck : Nat
+def tick (runs added : Nat) : Nat := compactCount runs + added
 
-def tick (s : State) (added : Nat) : State :=
-  if 8 ≤ s.inputsSinceCheck then
-    ⟨compactCount s.runs + added, 1⟩
-  else ⟨s.runs + added, s.inputsSinceCheck + 1⟩
-
-def Bounded (s : State) : Prop :=
-  s.inputsSinceCheck ≤ 8 ∧ s.runs ≤ 15 + 2 * s.inputsSinceCheck
-
-theorem the_first_check_bounds_an_arbitrarily_large_restored_group
+theorem every_prepend_bounds_even_an_arbitrarily_large_restored_group
     (runs added : Nat) (nativeGrowth : added ≤ 2) :
-    Bounded (tick ⟨runs,8⟩ added) := by
+    tick runs added ≤ 17 := by
   have h := an_eligible_group_is_small_after_a_check runs
-  simp [tick, Bounded]
-  omega
-
-theorem bounded_native_growth_preserves_the_maintenance_invariant
-    (s : State) (added : Nat) (bounded : Bounded s) (nativeGrowth : added ≤ 2) :
-    Bounded (tick s added) := by
-  have h := an_eligible_group_is_small_after_a_check s.runs
   unfold tick
-  split <;> simp only [Bounded] at * <;> omega
-
-theorem repeated_prepends_never_leave_more_than_31_runs
-    (s : State) (bounded : Bounded s) : s.runs ≤ 31 := by
-  unfold Bounded at bounded
   omega
 
-def run (s : State) : List Nat → State
-  | [] => s
-  | added :: rest => run (tick s added) rest
+def run (runs : Nat) : List Nat → Nat
+  | [] => runs
+  | added :: rest => run (tick runs added) rest
 
-theorem arbitrary_bounded_growth_histories_remain_bounded
-    (s : State) (steps : List Nat) (bounded : Bounded s)
-    (nativeGrowth : ∀ n ∈ steps, n ≤ 2) : Bounded (run s steps) := by
-  induction steps generalizing s with
-  | nil => exact bounded
+theorem arbitrary_bounded_growth_histories_keep_at_most_17_runs
+    (runs : Nat) (steps : List Nat) (initialBound : runs ≤ 17)
+    (nativeGrowth : ∀ n ∈ steps, n ≤ 2) : run runs steps ≤ 17 := by
+  induction steps generalizing runs with
+  | nil => exact initialBound
   | cons n rest ih =>
     apply ih
-    · exact bounded_native_growth_preserves_the_maintenance_invariant s n bounded
+    · exact every_prepend_bounds_even_an_arbitrarily_large_restored_group runs n
         (nativeGrowth n (by simp))
     · intro x hx
       exact nativeGrowth x (by simp [hx])
+
+def replay (step : Archive → Input → Archive) (archive : Archive) (inputs : List Input) : Archive :=
+  inputs.foldl step archive
+
+theorem archive_determined_steps_replay_exactly_from_any_checkpoint
+    (step : Archive → Input → Archive) (archive : Archive) (pre post : List Input) :
+    replay step (replay step archive pre) post = replay step archive (pre ++ post) := by
+  simp [replay, List.foldl_append]
+
+/- A historical counterexample: persisting XML but resetting an external age
+counter can choose different run layouts for the same next operation. -/
+def oldScheduled (runs age added : Nat) : Nat :=
+  (if 8 ≤ age then compactCount runs else runs) + added
+
+theorem an_unpersisted_cadence_can_change_replayed_run_layout :
+    oldScheduled 17 1 2 ≠ oldScheduled 17 8 2 := by decide
 
 def publish (original candidate : Archive) (valid changed : Bool) : Archive :=
   if valid && changed then candidate else original
