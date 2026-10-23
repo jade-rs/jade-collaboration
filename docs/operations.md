@@ -37,6 +37,12 @@ its tombstoned, invisible cell story. UI integrations must surface refusals rath
 than report every local optimistic edit as saved. Lean grid invariants,
 multi-client PBT and native-file comparisons cover these rules.
 
+These guarantees apply within the supported editing capabilities. Ragged and
+nested DOCX tables support text editing, but their structural editing is not
+implemented; PPTX table cell-content and structural editing are also unsupported.
+Check the [implementation scope](design.md) against the intended documents. Passing the
+conflict tests does not add those unsupported operations.
+
 ## Single-owner baseline
 
 Build an identified revision with `cargo build --release --locked`. Keep the
@@ -48,7 +54,7 @@ jade-collab serve \
   --addr 127.0.0.1:8787 \
   --data /srv/jade/data \
   --fsync every \
-  --checkpoint-every 10 \
+  --checkpoint-every 101 \
   --tokens /etc/jade/tokens.json \
   --audit-log /var/log/jade/access.jsonl
 ```
@@ -112,7 +118,7 @@ repository root, with existing writable directories:
 JADE_PROBE_CLIENTS_PER_FORMAT=4 \
 JADE_PROBE_SECONDS=600 \
 JADE_PROBE_INTERVAL_MS=100 \
-JADE_PROBE_CHECKPOINT_EVERY=10 \
+JADE_PROBE_CHECKPOINT_EVERY=101 \
 JADE_PROBE_DATA_PARENT=/srv/jade/probes \
 JADE_PROBE_REPORT=/srv/jade/probe-report.json \
 cargo test --release --workspace --test operational_probe --locked \
@@ -147,12 +153,16 @@ Note edits now stage conservative coalescing of adjacent unformatted runs before
 native input. This also applies when replaying an old journal, without editing
 its records. Rich or unknown XML remains a barrier, so this optimization is not
 a recovery-time guarantee for arbitrary imported notes.
-The example deployment/probe commands use 10 records to reduce future replay
-work at the cost of more checkpoint IO. The server's general default remains
-1000; it is not a recovery-time guarantee. Changing the interval cannot shorten
-an already persisted journal: recover that prefix once and take a healthy
-checkpoint before expecting the shorter recovery window. Check retained state
-and exported files during this maintenance step; do not edit journal records.
+The example deployment/probe commands use 101 records, matching the release
+profile measured below. The earlier 10-record mitigation reduced future replay
+work but increased checkpoint IO; after the native notes fix, the 101-record
+profile gave lower p99 latency across all three formats in the measured
+10-minute workload. The server's general default remains 1000; none of these
+counts is a recovery-time guarantee for arbitrary workloads. Changing the
+interval by itself cannot shorten an already persisted journal: recover that
+prefix once and take a healthy checkpoint before expecting a shorter replay
+window. Check retained state and exported files during maintenance; do not edit
+journal records.
 
 The report includes actual acknowledged-edit counts, per-format p50/p95/p99/max
 client-to-ack latency (including local planning), sampled peak server RSS during
@@ -182,3 +192,66 @@ Recorded local examples from 2026-10-23 are available for the
 These record their implementation revision and build/storage conditions. Both
 preserved acknowledged edits and exact exports through both restores; they are
 functional/recovery evidence, not release-build performance or a production SLO.
+
+Release measurements of the conservative plain-note maintenance are recorded in
+the [native-path comparison](verification/2026-10-23-release-notes-native.json)
+and [retained-state process probe](verification/2026-10-23-release-notes-grown.json).
+The former applies the same 32 prepends to a notes part containing 9,857 runs:
+median native-path time was 158 ms before and 6 ms with maintenance, with equal
+text and exact other package parts. This excludes CRDT planning and networking.
+The latter replays the original retained journal that previously took about
+41 seconds, without modifying its 13 source files. Initial authenticated readiness
+took 1.87 seconds with checkpoints every 101 records. It preserves the 40,259
+previously acknowledged positions, admits 10,855 further edits from 12 clients
+over 120 seconds, and checks exact exports after both forced termination and
+cold backup restore. PPTX acknowledgment p99 was 71 ms; server load RSS peaked
+at 863 MiB. Both measurements use a release binary on a shared macOS workstation
+with RAM-backed APFS; they do not establish remote or physical-disk performance.
+
+The [failed earlier cadence run](verification/2026-10-23-notes-cadence-failure.json)
+is retained separately. Its volatile maintenance counter changed native run
+layout across recovery despite equal text. An ordinary regression and native
+stateful histories now compare exact uninterrupted/restored archives, and the
+implementation decides eligibility from persisted XML alone. The long process
+probe keeps the same exact-export requirement; a faster but unequal export is
+a failure.
+
+The following release runs use four clients per format, 100 ms between each
+client's acknowledged edits and `--fsync every`. Each row links its complete
+measurements, revision and build/storage conditions. The 600-second runs start
+from fresh fixtures on RAM-backed APFS; the disk row uses internal physical
+APFS for data, journals and backup copies.
+
+| Run | Checkpoint records | Acknowledged edits | DOCX p99 ms | XLSX p99 ms | PPTX p99 ms | Peak server MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| [Before notes fix, 600 s](verification/2026-10-23-release-before-notes-600s.json) | 10 | 43,498 | 257 | 86 | 2,070 | 480 |
+| [After fix, 600 s](verification/2026-10-23-release-notes-600s-checkpoint10.json) | 10 | 41,508 | 491 | 163 | 364 | 961 |
+| [After fix, 600 s](verification/2026-10-23-release-notes-600s-checkpoint101.json) | 101 | 56,142 | 233 | 80 | 169 | 480 |
+| [After fix, disk, 120 s](verification/2026-10-23-release-notes-disk.json) | 101 | 12,974 | 36 | 25 | 40 | 71 |
+
+All runs in this table passed acknowledged-content, replica convergence, exact
+exports after both restores, fresh replica IDs and post-restore writes. The
+101-record 600-second run reached authenticated readiness 2.62 seconds after
+forced termination and 2.18 seconds after cold backup restore. This is a
+closed-loop comparison on a shared workstation: faster formats submit more
+edits and grow larger documents, and background load varies. It does not isolate
+causation or establish deployment capacity. In particular, the fixed code with
+10-record checkpoints improved PPTX while DOCX/XLSX tails and peak RSS worsened;
+those results are retained rather than omitted.
+
+The [physical-backup restore rehearsal](verification/2026-10-23-release-notes-physical-backup.json)
+copies the stopped 600-second run's complete storage tree from RAM-backed APFS
+onto internal physical APFS. All thirteen files (43,166,583 bytes) and directories
+are synced, and file SHA-256 values match. A fresh process restores from a copy
+of that physical backup, preserving all 56,142 prior acknowledged positions;
+twelve clients add 93 further edits, reconnect after forced termination and cold
+backup restore, and verify exact native exports and fresh post-restore writes.
+Initial authenticated readiness took 2.98 seconds. The physical source's hashes
+remain unchanged. This tests independent storage media on one host; it does not
+simulate a storage power cut or loss of that host.
+
+The [source revision's CI record](verification/2026-10-23-notes-ci.json) identifies
+all three successful jobs, 819 regular Rust tests, six executable Lean oracle
+comparisons and the audit of 3,587 production declarations. The notes maintenance
+model has twelve theorems; parser/native execution remain the explicit Rust
+verification boundaries described in the [proof documentation](../lean/README.md).

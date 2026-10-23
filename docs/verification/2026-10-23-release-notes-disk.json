@@ -1,0 +1,58 @@
+{
+  "implementation_revision": "21737765a6d0bef2706fc11d98ed64c262062bce",
+  "native_revision": "cabfe3205b7e3320c23f229a1ea5880ccadfa5a6",
+  "binary_sha256": "a19d25c14a6e17b32631c7a47601eab4bb99a369fc0b59455f12965e19ba327e",
+  "date": "2026-10-23",
+  "os": "macOS 27.0.1 arm64",
+  "cpu": "Apple M6",
+  "host_memory_gib": 32,
+  "rustc": "1.93.1 (01f6ddf75 2026-02-11)",
+  "profile": "release",
+  "storage_medium": "Internal physical APFS (data, journals and backup copies)",
+  "total_acknowledged_edits": 12974,
+  "rss_scope": "server process during load only; excludes clients and recovery",
+  "scope": "12 loopback clients on a shared workstation; same-host cold backup copies, not a storage power-cut or independent-host disaster-recovery test. Not a deployment SLO.",
+  "measurements": {
+    "acknowledged_edits_preserved": true,
+    "backup_restore_ms": 1405.607083,
+    "checkpoint_every": 101,
+    "clients_per_format": 4,
+    "crash_recovery_ms": 1448.325166,
+    "docx": {
+      "acknowledged_edits": 4299,
+      "clients": 4,
+      "max_ms": 200.95625,
+      "p50_ms": 9.349207999999999,
+      "p95_ms": 16.383333999999998,
+      "p99_ms": 35.802958000000004,
+      "seq": 4299
+    },
+    "elapsed_seconds": 121.174493417,
+    "exports_byte_identical_after_both_restores": true,
+    "fresh_replica_ids_and_post_restore_writes": true,
+    "fsync": "every",
+    "initial_readiness_ms": 467.903708,
+    "pace_ms": 100,
+    "peak_server_rss_kib": 73168,
+    "pptx": {
+      "acknowledged_edits": 4209,
+      "clients": 4,
+      "max_ms": 148.339584,
+      "p50_ms": 11.461,
+      "p95_ms": 18.878916999999998,
+      "p99_ms": 40.214042,
+      "seq": 4209
+    },
+    "requested_seconds": 120.0,
+    "status": "passed",
+    "xlsx": {
+      "acknowledged_edits": 4466,
+      "clients": 4,
+      "max_ms": 140.872375,
+      "p50_ms": 4.777416,
+      "p95_ms": 9.883625,
+      "p99_ms": 25.0045,
+      "seq": 4466
+    }
+  }
+}

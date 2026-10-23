@@ -1,0 +1,81 @@
+{
+  "implementation_revision": "21737765a6d0bef2706fc11d98ed64c262062bce",
+  "native_revision": "cabfe3205b7e3320c23f229a1ea5880ccadfa5a6",
+  "date": "2026-10-23",
+  "profile": "release",
+  "rustc": "1.93.1 (01f6ddf75 2026-02-11)",
+  "backup_source_medium": "RAM-backed APFS, writer stopped",
+  "backup_medium": "Internal physical APFS",
+  "restore_data_medium": "Fresh RAM-backed APFS directory",
+  "backup_files": 13,
+  "backup_bytes": 43166583,
+  "backup_files_and_directories_fsynced": true,
+  "backup_sha256_manifest": {
+    ".lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "probe.docx/.initialize.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "probe.docx/log-174.jsonl": "100369be5c6451174cd10d19df64239be4838437f28003faa001aec1f0b3d150",
+    "probe.docx/snapshot-174.docx": "f5809b0774dc81b7fabe25a7482d938c97f09d5819f3171aeac831b1745e8c23",
+    "probe.docx/snapshot-174.json": "177492e56da96b0e4e2beb857f17a008c8f648c68e67834ac01255064fc0f850",
+    "probe.pptx/.initialize.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "probe.pptx/log-177.jsonl": "f60bf0083e085e50c5ddc183decfe916adde242e961d426d4f7e25cc5a42155c",
+    "probe.pptx/snapshot-177.json": "cf86a861dfd040e7db2a66441a9e03a6b9f2859d0e4a5e952a4ccced0b280f6e",
+    "probe.pptx/snapshot-177.pptx": "bf7e0311a5f65e20042d808ca22465cfdd37e68cacdfa678f296f0670a2ccd22",
+    "probe.xlsx/.initialize.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "probe.xlsx/log-206.jsonl": "f3f7590316df48abccd26523af1d1b637031ee469a2feca595ae7cd420bf363a",
+    "probe.xlsx/snapshot-206.json": "2d6e1b4a1c665be35c38223c12f19c55860c7061df9d0d6752ad472ad7a7e0a7",
+    "probe.xlsx/snapshot-206.xlsx": "0ee914e06748b1afa25135b3f00e863f40adba0c3d4223007ce5ba8b6c5e27f0"
+  },
+  "backup_files_unchanged_by_probe": true,
+  "prior_seq": {
+    "docx": 17552,
+    "xlsx": 20757,
+    "pptx": 17833
+  },
+  "prior_acknowledged_edits": 56142,
+  "additional_acknowledged_edits": 93,
+  "retained_prefix_seq_verified": true,
+  "scope": "Same host, independent storage medium; restore/reconnect/write verification, not a latency benchmark, storage power-cut or independent-host disaster-recovery test.",
+  "measurements": {
+    "acknowledged_edits_preserved": true,
+    "backup_restore_ms": 2667.314792,
+    "checkpoint_every": 101,
+    "clients_per_format": 4,
+    "crash_recovery_ms": 2839.0195839999997,
+    "docx": {
+      "acknowledged_edits": 26,
+      "clients": 4,
+      "max_ms": 212.012334,
+      "p50_ms": 53.743542,
+      "p95_ms": 208.920917,
+      "p99_ms": 212.012334,
+      "seq": 17578
+    },
+    "elapsed_seconds": 6.01954525,
+    "exports_byte_identical_after_both_restores": true,
+    "fresh_replica_ids_and_post_restore_writes": true,
+    "fsync": "every",
+    "initial_readiness_ms": 2981.2574170000003,
+    "pace_ms": 100,
+    "peak_server_rss_kib": 827472,
+    "pptx": {
+      "acknowledged_edits": 31,
+      "clients": 4,
+      "max_ms": 153.987666,
+      "p50_ms": 39.196124999999995,
+      "p95_ms": 144.440583,
+      "p99_ms": 153.987666,
+      "seq": 17864
+    },
+    "requested_seconds": 1.0,
+    "status": "passed",
+    "xlsx": {
+      "acknowledged_edits": 36,
+      "clients": 4,
+      "max_ms": 53.824458,
+      "p50_ms": 7.951333,
+      "p95_ms": 39.760708,
+      "p99_ms": 53.824458,
+      "seq": 20793
+    }
+  }
+}

@@ -1,0 +1,66 @@
+{
+  "implementation_revision": "21737765a6d0bef2706fc11d98ed64c262062bce",
+  "native_revision": "cabfe3205b7e3320c23f229a1ea5880ccadfa5a6",
+  "date": "2026-10-23",
+  "os": "macOS 27.0.1 arm64",
+  "cpu": "Apple M6",
+  "host_memory_gib": 32,
+  "rustc": "1.93.1 (01f6ddf75 2026-02-11)",
+  "profile": "release",
+  "storage_medium": "RAM-backed APFS",
+  "rss_scope": "server process during load only; excludes clients and recovery",
+  "scope": "12 loopback clients on a shared workstation; not a deployment SLO",
+  "source_seed_manifest_sha256": "6e222603f3c9ebfa620efd89936b35a009ba3433e0feef5fc3275714ab53e721",
+  "source_seed_files_unchanged": true,
+  "retained_prefix_seq_verified": true,
+  "prior_seq": {
+    "docx": 15724,
+    "xlsx": 19606,
+    "pptx": 4929
+  },
+  "prior_acknowledged_edits": 40259,
+  "additional_acknowledged_edits": 10855,
+  "measurements": {
+    "acknowledged_edits_preserved": true,
+    "backup_restore_ms": 2092.879709,
+    "checkpoint_every": 101,
+    "clients_per_format": 4,
+    "crash_recovery_ms": 1953.630375,
+    "docx": {
+      "acknowledged_edits": 3062,
+      "clients": 4,
+      "max_ms": 257.31037499999996,
+      "p50_ms": 48.322875,
+      "p95_ms": 84.11925000000001,
+      "p99_ms": 117.53754099999999,
+      "seq": 18786
+    },
+    "elapsed_seconds": 121.916795166,
+    "exports_byte_identical_after_both_restores": true,
+    "fresh_replica_ids_and_post_restore_writes": true,
+    "fsync": "every",
+    "initial_readiness_ms": 1869.2506250000001,
+    "pace_ms": 100,
+    "peak_server_rss_kib": 884032,
+    "pptx": {
+      "acknowledged_edits": 3679,
+      "clients": 4,
+      "max_ms": 144.565209,
+      "p50_ms": 19.307542,
+      "p95_ms": 50.532208000000004,
+      "p99_ms": 70.873458,
+      "seq": 8608
+    },
+    "requested_seconds": 120.0,
+    "status": "passed",
+    "xlsx": {
+      "acknowledged_edits": 4114,
+      "clients": 4,
+      "max_ms": 158.962292,
+      "p50_ms": 3.784417,
+      "p95_ms": 31.702083,
+      "p99_ms": 49.876375,
+      "seq": 23720
+    }
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "checkpoint_every": 101,
+  "clients_per_format": 4,
+  "docx": {
+    "acknowledged_edits": 2944,
+    "clients": 4,
+    "max_ms": 1009.3635,
+    "p50_ms": 42.717166,
+    "p95_ms": 119.526333,
+    "p99_ms": 339.012791,
+    "seq": 18668
+  },
+  "elapsed_seconds": 121.268024667,
+  "fsync": "every",
+  "initial_readiness_ms": 1154.299416,
+  "peak_server_rss_kib": 1106224,
+  "pptx": {
+    "acknowledged_edits": 3614,
+    "clients": 4,
+    "max_ms": 427.999666,
+    "p50_ms": 14.725125,
+    "p95_ms": 64.9445,
+    "p99_ms": 130.75575,
+    "seq": 8543
+  },
+  "requested_seconds": 120.0,
+  "status": "failed_crash_recovery_export_identity",
+  "xlsx": {
+    "acknowledged_edits": 3976,
+    "clients": 4,
+    "max_ms": 352.945334,
+    "p50_ms": 2.479083,
+    "p95_ms": 38.5585,
+    "p99_ms": 96.9575,
+    "seq": 23582
+  },
+  "implementation_revision": "75f1cec80745551c30213ccf64bf76cd687a1677",
+  "failure": "PPTX run layout depends on ephemeral maintenance cadence; replica/native text checks passed before crash, resumed replicas matched, exact export failed",
+  "source_seed_manifest_sha256": "6e222603f3c9ebfa620efd89936b35a009ba3433e0feef5fc3275714ab53e721",
+  "native_part": "ppt/notesSlides/notesSlide-copy1.xml",
+  "before_runs": 15,
+  "recovered_runs": 7,
+  "same_decoded_notes_text": true,
+  "replicas_matched_after_resume": true,
+  "exports_byte_identical": false,
+  "backup_restore_tested": false
+}

@@ -1,0 +1,57 @@
+{
+  "implementation_revision": "21737765a6d0bef2706fc11d98ed64c262062bce",
+  "native_revision": "cabfe3205b7e3320c23f229a1ea5880ccadfa5a6",
+  "date": "2026-10-23",
+  "os": "macOS 27.0.1 arm64",
+  "cpu": "Apple M6",
+  "host_memory_gib": 32,
+  "rustc": "1.93.1 (01f6ddf75 2026-02-11)",
+  "profile": "release",
+  "storage_medium": "RAM-backed APFS",
+  "total_acknowledged_edits": 41508,
+  "rss_scope": "server process during load only; excludes clients and recovery",
+  "scope": "12 loopback clients on a shared workstation; closed-loop edit mix and document growth change as a format becomes faster. Single run, not a controlled capacity limit or deployment SLO.",
+  "measurements": {
+    "acknowledged_edits_preserved": true,
+    "backup_restore_ms": 876.1978750000001,
+    "checkpoint_every": 10,
+    "clients_per_format": 4,
+    "crash_recovery_ms": 1547.1523750000001,
+    "docx": {
+      "acknowledged_edits": 12502,
+      "clients": 4,
+      "max_ms": 969.289917,
+      "p50_ms": 26.092042,
+      "p95_ms": 301.60833399999996,
+      "p99_ms": 491.24183300000004,
+      "seq": 12502
+    },
+    "elapsed_seconds": 606.312109375,
+    "exports_byte_identical_after_both_restores": true,
+    "fresh_replica_ids_and_post_restore_writes": true,
+    "fsync": "every",
+    "initial_readiness_ms": 341.889875,
+    "pace_ms": 100,
+    "peak_server_rss_kib": 984512,
+    "pptx": {
+      "acknowledged_edits": 12775,
+      "clients": 4,
+      "max_ms": 825.846125,
+      "p50_ms": 28.685917,
+      "p95_ms": 239.648167,
+      "p99_ms": 364.140917,
+      "seq": 12775
+    },
+    "requested_seconds": 600.0,
+    "status": "passed",
+    "xlsx": {
+      "acknowledged_edits": 16231,
+      "clients": 4,
+      "max_ms": 461.816625,
+      "p50_ms": 5.6511249999999995,
+      "p95_ms": 94.870875,
+      "p99_ms": 163.409209,
+      "seq": 16231
+    }
+  }
+}

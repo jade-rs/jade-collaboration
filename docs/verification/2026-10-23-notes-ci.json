@@ -1,0 +1,25 @@
+{
+  "implementation_revision": "21737765a6d0bef2706fc11d98ed64c262062bce",
+  "run_url": "https://github.com/jade-rs/jade-collaboration/actions/runs/39912631608",
+  "conclusion": "success",
+  "jobs": {
+    "lean": "success",
+    "rust": "success",
+    "lean-oracle": "success"
+  },
+  "rust": {
+    "passed": 819,
+    "failed": 0,
+    "ignored": 8,
+    "suite_summaries": 121
+  },
+  "lean_oracles": {
+    "passed": 6,
+    "failed": 0,
+    "ignored": 0,
+    "suite_summaries": 6
+  },
+  "axiom_audited_declarations": 3587,
+  "notes_theorems": 12,
+  "ignored_tests": "Six compiled Lean oracle tests run in the separate oracle job; long operational probe and optional grown-notes comparison run locally."
+}
