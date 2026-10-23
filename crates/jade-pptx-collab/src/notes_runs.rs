@@ -165,15 +165,14 @@ fn body_paragraphs(nodes: &[Node]) -> Option<Vec<usize>> {
             {
                 pending.extend(nodes[fallback].children.iter().copied().rev());
             }
-        } else if n.ns.presentation() && matches!(n.tag.as_str(), "sp" | "pic" | "cxnSp" | "grpSp")
-        {
-            if child(nodes, i, "nvSpPr")
+        } else if n.ns.presentation()
+            && matches!(n.tag.as_str(), "sp" | "pic" | "cxnSp" | "grpSp")
+            && child(nodes, i, "nvSpPr")
                 .and_then(|j| child(nodes, j, "nvPr"))
                 .and_then(|j| child(nodes, j, "ph"))
                 .is_some_and(|j| nodes[j].body)
-            {
-                bodies.push(i);
-            }
+        {
+            bodies.push(i);
         }
     }
     if bodies.len() != 1 || nodes[bodies[0]].tag != "sp" {
