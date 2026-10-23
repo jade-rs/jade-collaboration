@@ -1,0 +1,53 @@
+{
+  "implementation_revision": "2cb1c80e5c2a51d1349062bb16e04dd0aa327a65",
+  "native_revision": "cabfe32",
+  "date": "2026-10-23",
+  "os": "macOS 27.0.1 arm64",
+  "host_memory_gib": 32,
+  "rustc": "1.93.1 (01f6ddf75 2026-02-11)",
+  "profile": "dev, unoptimized, debug info disabled",
+  "storage_medium": "RAM-backed APFS volume",
+  "checkpoint_every": 101,
+  "rss_scope": "sampled server process during edit load, not client process or recovery",
+  "measurements": {
+    "acknowledged_edits_preserved": true,
+    "backup_restore_ms": 15287.238834,
+    "clients_per_format": 4,
+    "crash_recovery_ms": 19573.821375000003,
+    "data_parent": "/Volumes/jade-collab-verify/tmp",
+    "docx": {
+      "acknowledged_edits": 3423,
+      "clients": 4,
+      "max_ms": 235.893958,
+      "p50_ms": 27.789667,
+      "p95_ms": 94.925833,
+      "p99_ms": 138.74941700000002,
+      "seq": 3423
+    },
+    "elapsed_seconds": 121.745725708,
+    "exports_byte_identical_after_both_restores": true,
+    "fresh_replica_ids_and_post_restore_writes": true,
+    "fsync": "every",
+    "pace_ms": 100,
+    "peak_server_rss_kib": 81328,
+    "pptx": {
+      "acknowledged_edits": 661,
+      "clients": 4,
+      "max_ms": 1982.796459,
+      "p50_ms": 577.030125,
+      "p95_ms": 1381.433666,
+      "p99_ms": 1489.1251670000001,
+      "seq": 661
+    },
+    "requested_seconds": 120.0,
+    "xlsx": {
+      "acknowledged_edits": 3908,
+      "clients": 4,
+      "max_ms": 138.258875,
+      "p50_ms": 13.653167000000002,
+      "p95_ms": 45.196625,
+      "p99_ms": 67.725334,
+      "seq": 3908
+    }
+  }
+}

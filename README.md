@@ -21,6 +21,8 @@ combines a CRDT with a central sequencer:
   every part of the file the model does not describe are preserved.
 
 The full design, and why, is in [docs/design.md](docs/design.md).
+Deployment ownership/routing, cold backup recovery and the configurable
+process-kill/load probe are described in [docs/operations.md](docs/operations.md).
 
 ## Layout
 

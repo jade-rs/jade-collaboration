@@ -1,0 +1,53 @@
+{
+  "implementation_revision": "2cb1c80e5c2a51d1349062bb16e04dd0aa327a65",
+  "native_revision": "cabfe32",
+  "date": "2026-10-23",
+  "os": "macOS 27.0.1 arm64",
+  "host_memory_gib": 32,
+  "rustc": "1.93.1 (01f6ddf75 2026-02-11)",
+  "profile": "dev, unoptimized, debug info disabled",
+  "storage_medium": "internal APFS filesystem",
+  "checkpoint_every": 101,
+  "rss_scope": "sampled server process during edit load, not client process or recovery",
+  "measurements": {
+    "acknowledged_edits_preserved": true,
+    "backup_restore_ms": 7644.528792,
+    "clients_per_format": 4,
+    "crash_recovery_ms": 7657.827041,
+    "data_parent": "/private/tmp",
+    "docx": {
+      "acknowledged_edits": 717,
+      "clients": 4,
+      "max_ms": 59.53275,
+      "p50_ms": 9.632292000000001,
+      "p95_ms": 18.345709000000003,
+      "p99_ms": 39.907125,
+      "seq": 717
+    },
+    "elapsed_seconds": 20.537280542,
+    "exports_byte_identical_after_both_restores": true,
+    "fresh_replica_ids_and_post_restore_writes": true,
+    "fsync": "every",
+    "pace_ms": 100,
+    "peak_server_rss_kib": 53136,
+    "pptx": {
+      "acknowledged_edits": 264,
+      "clients": 4,
+      "max_ms": 493.258875,
+      "p50_ms": 192.71616699999998,
+      "p95_ms": 416.670875,
+      "p99_ms": 461.69458299999997,
+      "seq": 264
+    },
+    "requested_seconds": 20.0,
+    "xlsx": {
+      "acknowledged_edits": 699,
+      "clients": 4,
+      "max_ms": 49.186541,
+      "p50_ms": 12.841040999999999,
+      "p95_ms": 20.158625,
+      "p99_ms": 32.0775,
+      "seq": 699
+    }
+  }
+}
