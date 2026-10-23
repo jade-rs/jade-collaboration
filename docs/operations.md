@@ -93,7 +93,8 @@ uses an authenticated document sync, not just an open port.
 ## Repeatable local/staging probe
 
 The `operational_probe` integration test starts the actual CLI subprocess with
-authentication, `--data` and `--fsync every`. Independent clients edit DOCX text,
+authentication, `--data` and `--fsync every`, with checkpoints every 101 records.
+Independent clients edit DOCX text,
 different XLSX cells and PPTX notes concurrently. Every local edit must receive
 exactly one acknowledgment with no refusal. At the end it verifies replica
 convergence and the acknowledged text/values in exported native files. It kills
@@ -121,6 +122,13 @@ client has at most one edit awaiting a verdict. The duration excludes setup and
 recovery; catch-up may extend it. The temporary data/backup trees are removed
 afterward; the optional JSON report remains at the requested path. Use a data
 parent on the intended storage medium, with room for three copies plus logs.
+Set `JADE_PROBE_KEEP_DATA=1` to retain the printed data directory and startup logs
+for investigation after success or failure. Otherwise the temporary trees are
+removed. A report is first written with `status: load_completed_recovery_pending`;
+only a successful recovery/backup/write check replaces it with `status: passed`.
+The total startup-to-authenticated-sync deadline remains 30 seconds, including
+the full snapshot transfer. A separate one-second connection cutoff would
+incorrectly reject a large but otherwise timely snapshot and is regression-tested.
 
 The report includes actual acknowledged-edit counts, per-format p50/p95/p99/max
 client-to-ack latency (including local planning), sampled peak server RSS during

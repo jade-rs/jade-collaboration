@@ -33,6 +33,52 @@ impl Drop for Process {
     }
 }
 
+async fn ready(base: &str) -> Result<Client<DocxModel>, jade_collab_server::ClientError> {
+    Client::<DocxModel>::connect_with_timeout(
+        &format!("{base}/documents/probe.docx/ws"),
+        Some(TOKEN),
+        DEADLINE,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn readiness_allows_a_snapshot_taking_more_than_one_second() {
+    use futures_util::{SinkExt, StreamExt};
+    use jade_collab_core::id::ReplicaId;
+    use jade_collab_server::wire::{Format, ServerMessage};
+    use tokio_tungstenite::tungstenite::Message;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("ws://{}", listener.local_addr().unwrap());
+    let peer = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        socket.next().await.unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        socket
+            .send(Message::Text(
+                ServerMessage::Welcome {
+                    format: Format::Docx,
+                    replica: ReplicaId(1),
+                    seq: 0,
+                    snapshot: serde_json::to_value(DocxModel::from_paragraphs(&["snapshot"]))
+                        .unwrap(),
+                }
+                .to_json()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let _ = socket.next().await;
+    });
+    let client = tokio::time::timeout(DEADLINE, ready(&base))
+        .await
+        .unwrap()
+        .expect("a completed sync inside the total deadline is ready");
+    client.disconnect().await;
+    peer.await.unwrap();
+}
+
 async fn start(root: &Path, data: &Path, first: bool, stage: &str) -> (Process, String) {
     let log = root.join(format!("{stage}.log"));
     let output = fs::File::create(&log).unwrap();
@@ -72,13 +118,7 @@ async fn start(root: &Path, data: &Path, first: bool, stage: &str) -> (Process, 
                     .unwrap();
                 let base = url.split("/documents/").next().unwrap().to_owned();
                 // Printed paths alone are not readiness: require authenticated sync.
-                if let Ok(client) = Client::<DocxModel>::connect_with_timeout(
-                    &format!("{base}/documents/probe.docx/ws"),
-                    Some(TOKEN),
-                    Duration::from_secs(1),
-                )
-                .await
-                {
+                if let Ok(client) = ready(&base).await {
                     client.disconnect().await;
                     break base;
                 }
@@ -87,7 +127,13 @@ async fn start(root: &Path, data: &Path, first: bool, stage: &str) -> (Process, 
         }
     })
     .await
-    .expect("server startup deadline");
+    .unwrap_or_else(|error| {
+        panic!(
+            "server startup deadline at {stage}: {error}; log {}: {}",
+            log.display(),
+            fs::read_to_string(&log).unwrap()
+        )
+    });
     (process, base)
 }
 
@@ -347,7 +393,14 @@ async fn probe(count: usize, duration: Duration, pace: Duration, report_path: Op
     } else {
         tempfile::tempdir().unwrap()
     };
-    let root = root.path();
+    let path = if std::env::var_os("JADE_PROBE_KEEP_DATA").is_some_and(|s| s == "1") {
+        let path = root.keep();
+        println!("PROBE_DATA_DIR {}", path.display());
+        path
+    } else {
+        root.path().to_owned()
+    };
+    let root = path.as_path();
     let core = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../jade-core");
     for (source, name) in [
         ("hello.docx", "probe.docx"),
@@ -450,6 +503,14 @@ async fn probe(count: usize, duration: Duration, pace: Duration, report_path: Op
             .collect::<Vec<_>>(),
         deck.slides().iter().map(|s| &s.notes).collect::<Vec<_>>()
     );
+    if let Some(path) = &report_path {
+        // Retain the measurements even if a later recovery assertion fails.
+        let load = json!({"status":"load_completed_recovery_pending", "clients_per_format":count,
+            "requested_seconds":duration.as_secs_f64(), "elapsed_seconds":elapsed, "fsync":"every",
+            "checkpoint_every":101, "data_parent":root.parent(), "peak_server_rss_kib":peak_rss,
+            "docx":doc_metrics, "xlsx":book_metrics, "pptx":deck_metrics});
+        fs::write(path, serde_json::to_vec_pretty(&load).unwrap()).unwrap();
+    }
     process.kill(); // SIGKILL/TerminateProcess: no graceful save or final checkpoint.
     let a = disconnected(a).await;
     let b = disconnected(b).await;
@@ -496,7 +557,7 @@ async fn probe(count: usize, duration: Duration, pace: Duration, report_path: Op
     writable(&base, "probe.xlsx", &b, xlsx).await;
     writable(&base, "probe.pptx", &c, pptx).await;
     restored.kill();
-    let report = json!({"clients_per_format":count, "requested_seconds":duration.as_secs_f64(), "elapsed_seconds":elapsed,
+    let report = json!({"status":"passed", "checkpoint_every":101, "clients_per_format":count, "requested_seconds":duration.as_secs_f64(), "elapsed_seconds":elapsed,
         "pace_ms":pace.as_millis(), "fsync":"every", "data_parent":root.parent(), "peak_server_rss_kib":peak_rss,
         "docx":doc_metrics, "xlsx":book_metrics, "pptx":deck_metrics, "crash_recovery_ms":crash_recovery_ms,
         "backup_restore_ms":backup_restore_ms, "acknowledged_edits_preserved":true,
