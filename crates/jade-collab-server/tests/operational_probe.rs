@@ -79,14 +79,22 @@ async fn readiness_allows_a_snapshot_taking_more_than_one_second() {
     peer.await.unwrap();
 }
 
-async fn start(root: &Path, data: &Path, first: bool, stage: &str) -> (Process, String) {
+async fn start(
+    root: &Path,
+    data: &Path,
+    first: bool,
+    stage: &str,
+    checkpoint_every: u64,
+) -> (Process, String) {
     let log = root.join(format!("{stage}.log"));
     let output = fs::File::create(&log).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_jade-collab"));
     command
         .args(["serve", "--addr", "127.0.0.1:0", "--data"])
         .arg(data)
-        .args(["--fsync", "every", "--checkpoint-every", "101", "--tokens"])
+        .args(["--fsync", "every", "--checkpoint-every"])
+        .arg(checkpoint_every.to_string())
+        .arg("--tokens")
         .arg(root.join("tokens.json"))
         .args(["--tokens-poll", "0", "--audit-log"])
         .arg(root.join("audit.jsonl"))
@@ -389,6 +397,7 @@ fn rss_kib(pid: u32) -> Option<u64> {
 }
 
 async fn probe(count: usize, duration: Duration, pace: Duration, report_path: Option<PathBuf>) {
+    let checkpoint_every = setting("JADE_PROBE_CHECKPOINT_EVERY", 101, 1_000_000);
     let root = if let Some(parent) = std::env::var_os("JADE_PROBE_DATA_PARENT") {
         tempfile::tempdir_in(parent).unwrap()
     } else {
@@ -433,7 +442,7 @@ async fn probe(count: usize, duration: Duration, pace: Duration, report_path: Op
             .expect("seed data must have no live writer");
         copy_tree(source, &data);
     }
-    let (mut process, base) = start(root, &data, seed.is_none(), "initial").await;
+    let (mut process, base) = start(root, &data, seed.is_none(), "initial", checkpoint_every).await;
     let pid = process.0.id();
     let (stop, stopping) = tokio::sync::oneshot::channel();
     let memory = tokio::spawn(async move {
@@ -522,7 +531,7 @@ async fn probe(count: usize, duration: Duration, pace: Duration, report_path: Op
         // Retain the measurements even if a later recovery assertion fails.
         let load = json!({"status":"load_completed_recovery_pending", "seed_data":seed, "clients_per_format":count,
             "requested_seconds":duration.as_secs_f64(), "elapsed_seconds":elapsed, "fsync":"every",
-            "checkpoint_every":101, "data_parent":root.parent(), "peak_server_rss_kib":peak_rss,
+            "checkpoint_every":checkpoint_every, "data_parent":root.parent(), "peak_server_rss_kib":peak_rss,
             "docx":doc_metrics, "xlsx":book_metrics, "pptx":deck_metrics});
         fs::write(path, serde_json::to_vec_pretty(&load).unwrap()).unwrap();
     }
@@ -531,7 +540,7 @@ async fn probe(count: usize, duration: Duration, pace: Duration, report_path: Op
     let b = disconnected(b).await;
     let c = disconnected(c).await;
     let restore = Instant::now();
-    let (mut recovered, base) = start(root, &data, false, "recovered").await;
+    let (mut recovered, base) = start(root, &data, false, "recovered", checkpoint_every).await;
     let crash_recovery_ms = restore.elapsed().as_secs_f64() * 1000.0;
     resumed(&base, "probe.docx", &a, &doc).await;
     resumed(&base, "probe.xlsx", &b, &book).await;
@@ -553,7 +562,8 @@ async fn probe(count: usize, duration: Duration, pace: Duration, report_path: Op
     let restored_data = root.join("restored");
     copy_tree(&backup, &restored_data);
     let restore = Instant::now();
-    let (mut restored, base) = start(root, &restored_data, false, "restored").await;
+    let (mut restored, base) =
+        start(root, &restored_data, false, "restored", checkpoint_every).await;
     let backup_restore_ms = restore.elapsed().as_secs_f64() * 1000.0;
     resumed(&base, "probe.docx", &a, &doc).await;
     resumed(&base, "probe.xlsx", &b, &book).await;
@@ -572,7 +582,7 @@ async fn probe(count: usize, duration: Duration, pace: Duration, report_path: Op
     writable(&base, "probe.xlsx", &b, xlsx).await;
     writable(&base, "probe.pptx", &c, pptx).await;
     restored.kill();
-    let report = json!({"status":"passed", "seed_data":seed, "checkpoint_every":101, "clients_per_format":count, "requested_seconds":duration.as_secs_f64(), "elapsed_seconds":elapsed,
+    let report = json!({"status":"passed", "seed_data":seed, "checkpoint_every":checkpoint_every, "clients_per_format":count, "requested_seconds":duration.as_secs_f64(), "elapsed_seconds":elapsed,
         "pace_ms":pace.as_millis(), "fsync":"every", "data_parent":root.parent(), "peak_server_rss_kib":peak_rss,
         "docx":doc_metrics, "xlsx":book_metrics, "pptx":deck_metrics, "crash_recovery_ms":crash_recovery_ms,
         "backup_restore_ms":backup_restore_ms, "acknowledged_edits_preserved":true,

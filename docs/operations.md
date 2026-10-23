@@ -48,6 +48,7 @@ jade-collab serve \
   --addr 127.0.0.1:8787 \
   --data /srv/jade/data \
   --fsync every \
+  --checkpoint-every 10 \
   --tokens /etc/jade/tokens.json \
   --audit-log /var/log/jade/access.jsonl
 ```
@@ -93,7 +94,8 @@ uses an authenticated document sync, not just an open port.
 ## Repeatable local/staging probe
 
 The `operational_probe` integration test starts the actual CLI subprocess with
-authentication, `--data` and `--fsync every`, with checkpoints every 101 records.
+authentication, `--data` and `--fsync every`. The probe defaults to checkpoints
+every 101 records; set `JADE_PROBE_CHECKPOINT_EVERY` to match the deployment.
 Independent clients edit DOCX text,
 different XLSX cells and PPTX notes concurrently. Every local edit must receive
 exactly one acknowledgment with no refusal. At the end it verifies replica
@@ -110,6 +112,7 @@ repository root, with existing writable directories:
 JADE_PROBE_CLIENTS_PER_FORMAT=4 \
 JADE_PROBE_SECONDS=600 \
 JADE_PROBE_INTERVAL_MS=100 \
+JADE_PROBE_CHECKPOINT_EVERY=10 \
 JADE_PROBE_DATA_PARENT=/srv/jade/probes \
 JADE_PROBE_REPORT=/srv/jade/probe-report.json \
 cargo test --release --workspace --test operational_probe --locked \
@@ -117,7 +120,8 @@ cargo test --release --workspace --test operational_probe --locked \
 ```
 
 Settings are bounded: 1–64 clients per format (three times that many total),
-1–86,400 seconds, and 1–60,000 ms between a client's acknowledged edits. Each
+1–86,400 seconds, 1–60,000 ms between a client's acknowledged edits, and
+1–1,000,000 records per checkpoint. Each
 client has at most one edit awaiting a verdict. The duration excludes setup and
 recovery; catch-up may extend it. The temporary data/backup trees are removed
 afterward; the optional JSON report remains at the requested path. Use a data
@@ -135,6 +139,15 @@ new workload, while log positions include the retained prefix.
 The total startup-to-authenticated-sync deadline remains 30 seconds, including
 the full snapshot transfer. A separate one-second connection cutoff would
 incorrectly reject a large but otherwise timely snapshot and is regression-tested.
+
+The grown 10-minute local PPTX workload exceeded the 30-second startup target
+with the 101-record interval; profiling showed repeated native notes replay.
+The example deployment/probe commands use 10 records to reduce future replay
+work at the cost of more checkpoint IO. The server's general default remains
+1000; it is not a recovery-time guarantee. Changing the interval cannot shorten
+an already persisted journal: recover that prefix once and take a healthy
+checkpoint before expecting the shorter recovery window. Check retained state
+and exported files during this maintenance step; do not edit journal records.
 
 The report includes actual acknowledged-edit counts, per-format p50/p95/p99/max
 client-to-ack latency (including local planning), sampled peak server RSS during
