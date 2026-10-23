@@ -1410,6 +1410,7 @@ dependencies = [
  "jade-pptx-reader",
  "jade-pptx-writer",
  "proptest",
+ "quick-xml",
  "serde",
  "serde_json",
  "thiserror",

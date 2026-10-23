@@ -2163,3 +2163,40 @@ native/session tests retain the CI seed rather than relaxing admission checks.
 arbitrary reordering histories, exact join endpoints and adjacency refusal,
 plus counterexamples for stale ordinals and stale adjacency. Native mapping,
 story preservation and UTF-8/rendered conversion are Rust verification boundaries.
+
+### Plain-note run maintenance
+
+The grown operational fixture accumulated 9,857 unformatted runs in one notes
+body. Repeated native notes input scanned and retained that fragmentation,
+slowing both live acknowledgments and replay of an existing journal. A regression
+first showed 255 runs after 128 ordinary prepends. The collaboration materializer
+now checks at the first text-changing notes input after open/restore, then every
+eight successful changes. Slide-order edits invalidate this ordinal-keyed cadence.
+No-op/refused inputs do not consume a check.
+
+The optimization resolves one internal notes relationship and one active body
+placeholder, matching the native fallback branch policy. A namespace-aware XML
+scan joins physically adjacent runs only when they have no direct formatting or
+unknown attributes/children and contain a single plain text element with the same
+whitespace mode. Sixteen eligible runs trigger a join. Paragraph boundaries,
+rich/foreign runs, comments, CDATA and unknown XML are barriers. Raw text spans
+retain entity spelling; literal carriage returns and joins that would manufacture
+an illegal `]]>` remain barriers. Bytes outside each eligible group stay exact;
+other OPC parts are retained without modification.
+
+Normalization is staged in a fresh native writer. The normal native notes input
+still validates expected text, locking, capabilities and offsets. Only a successful
+text-changing input publishes that writer; failed/no-op inputs leave the original
+archive intact. An optimization failure uses the existing native path. The native
+Undo cache may be rebased, while the collaboration log remains authoritative.
+No journal format or engine-submodule change is needed, including old-journal replay.
+
+Native stateful PBT checks insert/replace/delete, Unicode, paragraph splits,
+export/restore/fork, refused edits, opaque positions, exact other parts and the
+no-op cadence regression. `NotesRuns.lean` proves character/whitespace-stream
+equivalence, opaque order/payload preservation through arbitrary rewrites, and
+failed/no-op publication preservation. A separate invariant bounds one eligible
+plain group at 31 runs when successful maintenance checks every eight changes
+and native prepends add at most two runs. Parsing, namespace/placeholder fidelity,
+native growth and Office rendering remain Rust/native verification boundaries;
+the theorem is not a size bound for arbitrary rich-note XML.

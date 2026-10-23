@@ -140,8 +140,13 @@ The total startup-to-authenticated-sync deadline remains 30 seconds, including
 the full snapshot transfer. A separate one-second connection cutoff would
 incorrectly reject a large but otherwise timely snapshot and is regression-tested.
 
-The grown 10-minute local PPTX workload exceeded the 30-second startup target
-with the 101-record interval; profiling showed repeated native notes replay.
+Before plain-note run maintenance, the grown 10-minute local PPTX workload
+exceeded the 30-second startup target with the 101-record interval; profiling
+showed repeated native notes replay over thousands of redundant runs.
+Note edits now stage conservative coalescing of adjacent unformatted runs before
+native input. This also applies when replaying an old journal, without editing
+its records. Rich or unknown XML remains a barrier, so this optimization is not
+a recovery-time guarantee for arbitrary imported notes.
 The example deployment/probe commands use 10 records to reduce future replay
 work at the cost of more checkpoint IO. The server's general default remains
 1000; it is not a recovery-time guarantee. Changing the interval cannot shorten
@@ -152,7 +157,8 @@ and exported files during this maintenance step; do not edit journal records.
 The report includes actual acknowledged-edit counts, per-format p50/p95/p99/max
 client-to-ack latency (including local planning), sampled peak server RSS during
 the edit load (excluding clients and recovery), and
-startup-to-authenticated-readiness recovery timings. Failed acknowledgments,
+startup-to-authenticated-readiness timings for the initial load (including a
+seed's retained journal), crash recovery and backup restore. Failed acknowledgments,
 inconsistent state/files, duplicate commits on resume or failed recovery fail
 the test. Performance numbers are measurements to compare with your deployment
 budget; the probe does not silently invent a latency or memory SLO.

@@ -34,6 +34,27 @@ implementation, native IO and the toolchain's trusted kernel remain boundaries.
 
 ## What is proved
 
+### `JadeCollab/NotesRuns.lean`: bounded plain-note run maintenance
+
+Twelve theorems cover joining adjacent equivalent plain runs, preserving their
+character/whitespace-mode stream and the exact order and payloads of opaque
+anchors through arbitrary rewrite histories. Every interpreter of that stream
+therefore agrees. A separate count model proves that checking every eight
+text-changing inputs keeps an eligible group at most 31 runs, assuming each
+native prepend adds at most two; the first check also bounds an arbitrarily
+large restored group. Failed and no-op staged inputs preserve the original
+archive exactly.
+
+This does not prove the XML parser, namespace resolution, native run-growth
+assumption or Office rendering. Native Rust PBT checks decoded text, edit
+capabilities, Unicode, opaque XML positions, edit/restore/fork histories and
+unchanged other package parts. Rich, foreign, nonadjacent and otherwise unknown
+runs remain barriers. The count bound concerns one eligible plain group under
+the stated edit pattern, not arbitrary rich-note documents. An ignored
+`notes_runs` native-path comparison accepts `JADE_NOTES_GROWN_PPTX` and optionally
+`JADE_NOTES_COMPARISON_REPORT`; it checks equivalence and records timings without
+turning a machine-dependent speed ratio into a test assertion.
+
 ### `JadeCollab/StableSurfaces.lean`: native indices across helper steps
 
 Eight theorems prove that resolving a stable address in each faithful frame

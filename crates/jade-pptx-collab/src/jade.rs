@@ -24,6 +24,8 @@ pub struct JadePptx {
     ids: BTreeMap<(Id, Id), u32>,
     /// What jade reads back from the current bytes, dropped on every write.
     cache: RefCell<Cache>,
+    /// A per-slide maintenance cadence. Slide-order edits invalidate these keys.
+    notes_edits: BTreeMap<usize, usize>,
 }
 
 #[derive(Default)]
@@ -46,6 +48,7 @@ impl JadePptx {
             session,
             ids: BTreeMap::new(),
             cache: RefCell::default(),
+            notes_edits: BTreeMap::new(),
         }
     }
 
@@ -89,8 +92,79 @@ impl JadePptx {
         Ok(jade)
     }
 
+    /// The current native writer cache. Its Undo history may be rebased by
+    /// equivalent notes compaction; collaboration history lives in the log.
     pub fn session(&self) -> &EditSession {
         &self.session
+    }
+
+    /// Stage a lossless run compaction. The collaboration log is authoritative;
+    /// native writer history is a cache and can be rebased at this boundary.
+    fn compact_notes_session(&self, slide: usize) -> Option<EditSession> {
+        use jade_opc::{parse_relationships, rels_part_name, resolve_target, OpcPackage};
+        let deck = self.deck();
+        let slide_part = &deck.slides.get(slide)?.part_name;
+        let mut package = OpcPackage::open_preserving(self.bytes()).ok()?;
+        let relationships = parse_relationships(
+            &package
+                .required_part_str(&rels_part_name(slide_part))
+                .ok()?,
+        )
+        .ok()?;
+        let notes = relationships.by_type_suffix("/notesSlide");
+        if notes.len() != 1 || notes[0].external {
+            return None;
+        }
+        let part = resolve_target(slide_part, &notes[0].target);
+        let xml = package.required_part_str(&part).ok()?;
+        let compact = crate::notes_runs::compact(&xml)?;
+        package.replace(&part, compact.into_bytes());
+        EditSession::open(&package.write().ok()?).ok()
+    }
+
+    fn replace_notes(
+        &mut self,
+        slide: usize,
+        start: usize,
+        end: usize,
+        text: &str,
+    ) -> Result<(), String> {
+        let expected_text = self.text_of(slide, &TextTarget::Notes)?;
+        let edit = NotesInputEdit {
+            start,
+            end,
+            text: text.into(),
+            expected_text,
+            soft_break: false,
+            history: None,
+        };
+        let count = self
+            .notes_edits
+            .get(&slide)
+            .copied()
+            .unwrap_or(crate::notes_runs::CHECK_EVERY);
+        let due = count >= crate::notes_runs::CHECK_EVERY;
+        let next = if due { 1 } else { count + 1 };
+        if let Some(mut staged) = due.then(|| self.compact_notes_session(slide)).flatten() {
+            // Native input validates text, locking, capabilities and offsets on
+            // the staged file too. Any failed optimization leaves the original
+            // session untouched and uses its existing native path instead.
+            if let Ok(result) = staged.apply_notes_input(slide, &edit) {
+                if result.changed {
+                    self.session = staged;
+                    self.notes_edits.insert(slide, next);
+                }
+                return Ok(());
+            }
+        }
+        let result = self
+            .session
+            .apply_notes_input(slide, &edit)
+            .map_err(|e| e.to_string())?;
+        if result.changed {
+            self.notes_edits.insert(slide, next);
+        }
+        Ok(())
     }
 
     pub fn bytes(&self) -> &[u8] {
@@ -274,27 +348,21 @@ impl JadePptx {
                     },
                 )
                 .map(drop),
-            TextTarget::Notes => {
-                let expected_text = self.text_of(slide, target)?;
-                self.session
-                    .apply_notes_input(
-                        slide,
-                        &NotesInputEdit {
-                            start,
-                            end,
-                            text: text.to_string(),
-                            expected_text,
-                            soft_break: false,
-                            history: None,
-                        },
-                    )
-                    .map(drop)
-            }
+            TextTarget::Notes => return self.replace_notes(slide, start, end, text),
         };
         result.map_err(|e| e.to_string())
     }
 
     fn realise(&mut self, effect: PptxEffect) -> Result<(), String> {
+        if matches!(
+            &effect,
+            PptxEffect::InsertSlide { .. }
+                | PptxEffect::DeleteSlide { .. }
+                | PptxEffect::MoveSlide { .. }
+                | PptxEffect::DuplicateSlide { .. }
+        ) {
+            self.notes_edits.clear();
+        }
         let result = self.write(effect);
         *self.cache.get_mut() = Cache::default();
         result

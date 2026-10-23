@@ -335,6 +335,15 @@ bytes. Fields retain their cached authoring text, matching the model's offsets.
 Non-text shapes omit `paragraphs`, and speaker notes remain plain text. Snapshot
 paging, edit preconditions and viewer authorization work as for DOCX.
 
+Repeated plain-note edits periodically coalesce redundant adjacent unformatted
+runs in the active notes-body placeholder. The native input is validated on a
+staged file before publication; refused and unchanged inputs retain the original
+archive. Text, paragraph boundaries, rich/unknown XML and every other package
+part are preserved. Native writer Undo history may be rebased at this boundary;
+the collaboration log retains the editing history. Lean and native stateful PBT
+cover the maintenance contract and its explicit limits
+([proof details](lean/README.md#jadecollabnotesrunslean-bounded-plain-note-run-maintenance)).
+
 ### Durable documents
 
 ```sh

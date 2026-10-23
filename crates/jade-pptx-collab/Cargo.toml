@@ -13,6 +13,7 @@ jade-opc = { path = "../../jade-core/crates/jade-opc" }
 jade-pptx-reader = { path = "../../jade-core/crates/jade-pptx-reader" }
 jade-pptx-layout = { path = "../../jade-core/crates/jade-pptx-layout" }
 jade-pptx-writer = { path = "../../jade-core/crates/jade-pptx-writer" }
+quick-xml = "0.39"
 serde.workspace = true
 thiserror.workspace = true
 

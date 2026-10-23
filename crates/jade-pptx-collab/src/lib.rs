@@ -14,6 +14,7 @@ pub mod intent;
 mod jade;
 mod load;
 mod model;
+mod notes_runs;
 
 pub use inspection::{
     CharacterStyle, CharacterStyleRun, ParagraphFormat, ParagraphStyle, PptxFormatting,

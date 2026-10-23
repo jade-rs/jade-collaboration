@@ -442,7 +442,9 @@ async fn probe(count: usize, duration: Duration, pace: Duration, report_path: Op
             .expect("seed data must have no live writer");
         copy_tree(source, &data);
     }
+    let initial = Instant::now();
     let (mut process, base) = start(root, &data, seed.is_none(), "initial", checkpoint_every).await;
+    let initial_readiness_ms = initial.elapsed().as_secs_f64() * 1000.0;
     let pid = process.0.id();
     let (stop, stopping) = tokio::sync::oneshot::channel();
     let memory = tokio::spawn(async move {
@@ -531,7 +533,8 @@ async fn probe(count: usize, duration: Duration, pace: Duration, report_path: Op
         // Retain the measurements even if a later recovery assertion fails.
         let load = json!({"status":"load_completed_recovery_pending", "seed_data":seed, "clients_per_format":count,
             "requested_seconds":duration.as_secs_f64(), "elapsed_seconds":elapsed, "fsync":"every",
-            "checkpoint_every":checkpoint_every, "data_parent":root.parent(), "peak_server_rss_kib":peak_rss,
+            "checkpoint_every":checkpoint_every, "initial_readiness_ms":initial_readiness_ms,
+            "data_parent":root.parent(), "peak_server_rss_kib":peak_rss,
             "docx":doc_metrics, "xlsx":book_metrics, "pptx":deck_metrics});
         fs::write(path, serde_json::to_vec_pretty(&load).unwrap()).unwrap();
     }
@@ -583,7 +586,8 @@ async fn probe(count: usize, duration: Duration, pace: Duration, report_path: Op
     writable(&base, "probe.pptx", &c, pptx).await;
     restored.kill();
     let report = json!({"status":"passed", "seed_data":seed, "checkpoint_every":checkpoint_every, "clients_per_format":count, "requested_seconds":duration.as_secs_f64(), "elapsed_seconds":elapsed,
-        "pace_ms":pace.as_millis(), "fsync":"every", "data_parent":root.parent(), "peak_server_rss_kib":peak_rss,
+        "pace_ms":pace.as_millis(), "fsync":"every", "initial_readiness_ms":initial_readiness_ms,
+        "data_parent":root.parent(), "peak_server_rss_kib":peak_rss,
         "docx":doc_metrics, "xlsx":book_metrics, "pptx":deck_metrics, "crash_recovery_ms":crash_recovery_ms,
         "backup_restore_ms":backup_restore_ms, "acknowledged_edits_preserved":true,
         "exports_byte_identical_after_both_restores":true, "fresh_replica_ids_and_post_restore_writes":true});

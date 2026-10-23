@@ -26,6 +26,7 @@ import JadeCollab.DerivedBatch
 import JadeCollab.PackageBudget
 import JadeCollab.TextPositions
 import JadeCollab.StableSurfaces
+import JadeCollab.NotesRuns
 import JadeCollab.AuthorIdentity
 import JadeCollab.AuthoredAdmission
 import JadeCollab.NativeFailure
