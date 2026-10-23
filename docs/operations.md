@@ -126,6 +126,12 @@ Set `JADE_PROBE_KEEP_DATA=1` to retain the printed data directory and startup lo
 for investigation after success or failure. Otherwise the temporary trees are
 removed. A report is first written with `status: load_completed_recovery_pending`;
 only a successful recovery/backup/write check replaces it with `status: passed`.
+To replay a retained grown state, set `JADE_PROBE_SEED_DATA_DIR` to its `data/`
+directory. The probe requires and holds the source storage lease while copying
+it to its own temporary directory; an active writer is refused. The source is
+not edited. Seed directories must contain the three `probe.*` documents created
+by this harness. The report records the seed path; edit counts cover only the
+new workload, while log positions include the retained prefix.
 The total startup-to-authenticated-sync deadline remains 30 seconds, including
 the full snapshot transfer. A separate one-second connection cutoff would
 incorrectly reject a large but otherwise timely snapshot and is regression-tested.

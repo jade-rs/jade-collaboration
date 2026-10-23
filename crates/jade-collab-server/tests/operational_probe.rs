@@ -118,10 +118,11 @@ async fn start(root: &Path, data: &Path, first: bool, stage: &str) -> (Process, 
                     .unwrap();
                 let base = url.split("/documents/").next().unwrap().to_owned();
                 // Printed paths alone are not readiness: require authenticated sync.
-                if let Ok(client) = ready(&base).await {
-                    client.disconnect().await;
-                    break base;
-                }
+                let client = ready(&base)
+                    .await
+                    .unwrap_or_else(|error| panic!("authenticated readiness at {stage}: {error}"));
+                client.disconnect().await;
+                break base;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -418,7 +419,21 @@ async fn probe(count: usize, duration: Duration, pace: Duration, report_path: Op
     )
     .unwrap();
     let data = root.join("data");
-    let (mut process, base) = start(root, &data, true, "initial").await;
+    let seed = std::env::var_os("JADE_PROBE_SEED_DATA_DIR").map(PathBuf::from);
+    if let Some(source) = &seed {
+        // Never copy an active writer's snapshots/journal. Holding its lease
+        // also prevents another server opening the seed while it is copied.
+        let lease = fs::File::options()
+            .read(true)
+            .write(true)
+            .open(source.join(".lock"))
+            .unwrap();
+        lease
+            .try_lock()
+            .expect("seed data must have no live writer");
+        copy_tree(source, &data);
+    }
+    let (mut process, base) = start(root, &data, seed.is_none(), "initial").await;
     let pid = process.0.id();
     let (stop, stopping) = tokio::sync::oneshot::channel();
     let memory = tokio::spawn(async move {
@@ -505,7 +520,7 @@ async fn probe(count: usize, duration: Duration, pace: Duration, report_path: Op
     );
     if let Some(path) = &report_path {
         // Retain the measurements even if a later recovery assertion fails.
-        let load = json!({"status":"load_completed_recovery_pending", "clients_per_format":count,
+        let load = json!({"status":"load_completed_recovery_pending", "seed_data":seed, "clients_per_format":count,
             "requested_seconds":duration.as_secs_f64(), "elapsed_seconds":elapsed, "fsync":"every",
             "checkpoint_every":101, "data_parent":root.parent(), "peak_server_rss_kib":peak_rss,
             "docx":doc_metrics, "xlsx":book_metrics, "pptx":deck_metrics});
@@ -557,7 +572,7 @@ async fn probe(count: usize, duration: Duration, pace: Duration, report_path: Op
     writable(&base, "probe.xlsx", &b, xlsx).await;
     writable(&base, "probe.pptx", &c, pptx).await;
     restored.kill();
-    let report = json!({"status":"passed", "checkpoint_every":101, "clients_per_format":count, "requested_seconds":duration.as_secs_f64(), "elapsed_seconds":elapsed,
+    let report = json!({"status":"passed", "seed_data":seed, "checkpoint_every":101, "clients_per_format":count, "requested_seconds":duration.as_secs_f64(), "elapsed_seconds":elapsed,
         "pace_ms":pace.as_millis(), "fsync":"every", "data_parent":root.parent(), "peak_server_rss_kib":peak_rss,
         "docx":doc_metrics, "xlsx":book_metrics, "pptx":deck_metrics, "crash_recovery_ms":crash_recovery_ms,
         "backup_restore_ms":backup_restore_ms, "acknowledged_edits_preserved":true,

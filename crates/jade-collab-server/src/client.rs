@@ -15,8 +15,8 @@ use tokio::sync::{oneshot, Notify};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{header, HeaderValue};
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{client_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::tungstenite::{protocol::WebSocketConfig, Message};
+use tokio_tungstenite::{client_async_with_config, MaybeTlsStream, WebSocketStream};
 
 use crate::wire::{ClientMessage, ServerMessage};
 mod pump;
@@ -24,6 +24,11 @@ mod pump;
 mod tests;
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+// Welcomes and inspections are sent as single frames. Keep the existing
+// 64 MiB aggregate message budget, but do not reject a valid snapshot merely
+// because tungstenite's default per-frame budget is only 16 MiB.
+const MAX_SERVER_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
 /// One deadline covering TCP/HTTP upgrade, the initial sync reply and resends.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -226,7 +231,10 @@ async fn open(url: &str, token: Option<&str>) -> Result<Socket, ClientError> {
     let address =
         crate::transport::TransportAddress::parse(request.uri()).map_err(ClientError::Connect)?;
     let stream = address.connect().await.map_err(ClientError::Connect)?;
-    let (socket, _) = client_async(request, stream)
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(MAX_SERVER_MESSAGE_BYTES))
+        .max_frame_size(Some(MAX_SERVER_MESSAGE_BYTES));
+    let (socket, _) = client_async_with_config(request, stream, Some(config))
         .await
         .map_err(|e| ClientError::Connect(e.to_string()))?;
     Ok(socket)

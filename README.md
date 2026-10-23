@@ -89,6 +89,13 @@ does not follow redirects, and its connection driver is dropped on completion,
 failure or cancellation. CLI/MCP URL-validation and join diagnostics omit the
 original URL so query credentials are not echoed in those errors.
 
+The SDK accepts server messages and individual frames up to 64 MiB, including
+initial snapshots and inspections; fragmented messages share that same total
+budget. Snapshot JSON includes CRDT history and can be much larger than the
+compressed Office file. Above this budget, joining fails with a protocol size
+error. A large snapshot within the budget can use the full configured connection
+deadline; callers can adjust it with `connect_with_timeout`/`resume_with_timeout`.
+
 `GET /documents/{name}` downloads the current file, `PUT /documents/{name}`
 uploads a new one. Programs use `jade_collab_server::Client<DocxModel>` /
 `Client<XlsxModel>`, which keep an optimistic replica in step in the
