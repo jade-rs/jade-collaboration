@@ -216,6 +216,106 @@ fn anchored_text(jade: &JadeDocx, key: &str) -> Vec<String> {
         .collect()
 }
 
+#[test]
+fn anchor_aware_edits_after_a_host_split_keep_their_story_on_clone_and_reopen() {
+    use jade_docx_collab::NoteKind;
+    for kind in 0..8 {
+        for restore in [false, true] {
+            let (mut model, mut jade) = open("footnote.docx");
+            let first = Id::new(model.max_lamport() + 1, ReplicaId(1));
+            commit(
+                &mut model,
+                &mut jade,
+                DocxOp::InsertNote {
+                    kind: NoteKind::Footnote,
+                    story: StoryId::Body,
+                    parent: None,
+                    id: first,
+                    text: "注".into(),
+                },
+            );
+            let body = model
+                .paragraphs()
+                .into_iter()
+                .find(|p| p.story == StoryId::Body)
+                .unwrap();
+            let mark = Id::new(model.max_lamport() + 1, ReplicaId(1));
+            commit(
+                &mut model,
+                &mut jade,
+                DocxOp::SplitParagraph {
+                    story: StoryId::Body,
+                    parent: Some(body.chars[2]),
+                    id: mark,
+                },
+            );
+            // The native cache can list the old note after both body parts;
+            // an edit later reorders it. Compare by story until reopening.
+            assert_stories_agree(&model, &jade.clone(), "cloned split host");
+            let reopened = JadeDocx::load(&jade.export(&model).unwrap()).unwrap();
+            assert_same_order(&model, &reopened, "reopened split host");
+            if restore {
+                jade = JadeDocx::restore(&jade.export_base().unwrap(), &model).unwrap();
+            }
+            let paragraph = model
+                .paragraphs()
+                .into_iter()
+                .find(|p| p.at == ParagraphStory::Body { index: 1 })
+                .unwrap();
+            let parent = if kind >= 6 {
+                paragraph.chars.last().copied()
+            } else {
+                Some(paragraph.anchors[0].id)
+            };
+            let first = Id::new(model.max_lamport() + 1, ReplicaId(1));
+            let op = match kind {
+                0 | 1 => DocxOp::InsertNote {
+                    kind: if kind == 0 {
+                        NoteKind::Footnote
+                    } else {
+                        NoteKind::Endnote
+                    },
+                    story: StoryId::Body,
+                    parent,
+                    id: first,
+                    text: "n🙂".into(),
+                },
+                2 => DocxOp::InsertTextBox {
+                    story: StoryId::Body,
+                    parent,
+                    id: first,
+                    text: "X🙂".into(),
+                    width_px: 216,
+                    height_px: 96,
+                },
+                3 => DocxOp::SplitParagraph {
+                    story: StoryId::Body,
+                    parent,
+                    id: first,
+                },
+                4 | 6 => DocxOp::InsertText {
+                    story: StoryId::Body,
+                    parent,
+                    first,
+                    text: "X🙂".into(),
+                },
+                _ => DocxOp::TrackInsertText {
+                    story: StoryId::Body,
+                    parent,
+                    first,
+                    text: "X🙂".into(),
+                    date: None,
+                },
+            };
+            commit(&mut model, &mut jade, op);
+            assert_stories_agree(&model, &jade.clone(), "cloned anchor-aware edit");
+            let reopened = JadeDocx::load(&jade.export(&model).unwrap()).unwrap();
+            assert_same_order(&model, &reopened, "reopened anchor-aware edit");
+            assert_revisions_agree(&model, &reopened, "reopened anchor-aware edit");
+        }
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(96))]
 

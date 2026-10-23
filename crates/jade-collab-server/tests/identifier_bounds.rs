@@ -16,6 +16,98 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 #[tokio::test(flavor = "multi_thread")]
+async fn invalid_tracked_edits_never_commit_author_registration() {
+    use jade_collab_server::Tokens;
+    let name = "author-admission.docx";
+    let server = Server::new()
+        .with_tokens(Tokens::from_json(r#"{"key":{"name":"Ada","role":"editor"}}"#).unwrap());
+    server.open(name, fixture("hello.docx")).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "ws://{}/documents/{name}/ws?token=key",
+        listener.local_addr().unwrap()
+    );
+    let serving = tokio::spawn(server.clone().serve(listener));
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    send(&mut socket, ClientMessage::Join).await;
+    let ServerMessage::Welcome {
+        replica, snapshot, ..
+    } = receive(&mut socket).await
+    else {
+        panic!("welcome")
+    };
+    let model: DocxModel = serde_json::from_value(snapshot).unwrap();
+    let first = Id::new(model.max_lamport() + 1, replica);
+    let missing = Id::new(u64::MAX, ReplicaId::ORIGIN);
+    let before = server.export(name).await.unwrap();
+    for (index, op) in [
+        DocxOp::TrackInsertText {
+            story: StoryId::Body,
+            parent: Some(missing),
+            first,
+            text: "x".into(),
+            date: None,
+        },
+        DocxOp::TrackInsertText {
+            story: StoryId::Body,
+            parent: None,
+            first,
+            text: String::new(),
+            date: None,
+        },
+        DocxOp::TrackDeleteText {
+            story: StoryId::Body,
+            ids: vec![missing],
+            revision: first,
+            date: None,
+        },
+        DocxOp::TrackInsertText {
+            story: StoryId::Footnote { id: missing },
+            parent: None,
+            first,
+            text: "x".into(),
+            date: None,
+        },
+        DocxOp::TrackInsertText {
+            story: StoryId::Body,
+            parent: Some(model.paragraphs()[0].chars[0]),
+            first: Id::new(0, replica),
+            text: "x".into(),
+            date: None,
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let ticket = index as u64 + 1;
+        send(
+            &mut socket,
+            ClientMessage::Submit(Submission {
+                client_seq: ticket,
+                base_seq: 0,
+                op: serde_json::to_value(op).unwrap(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(receive(&mut socket).await,ServerMessage::Rejected(rejected) if rejected.client_seq==ticket),
+            "logical refusal must precede author publication"
+        );
+        assert_eq!(server.seq(name).await.unwrap(), 0);
+        assert_eq!(server.export(name).await.unwrap(), before);
+        send(&mut socket, ClientMessage::Inspect { request: ticket }).await;
+        let ServerMessage::Inspected { snapshot, .. } = receive(&mut socket).await else {
+            panic!("inspection")
+        };
+        let model: DocxModel = serde_json::from_value(snapshot).unwrap();
+        assert_eq!(model.author(replica), None);
+    }
+    socket.close(None).await.unwrap();
+    serving.abort();
+    let _ = serving.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn an_owned_note_atom_cannot_be_reused_as_a_body_character() {
     let name = "unique.docx";
     let server = Server::new();

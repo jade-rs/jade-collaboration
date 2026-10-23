@@ -426,36 +426,39 @@ impl JadeDocx {
 
     /// Runs `command(offset)` — inserting a text box or note reference, or
     /// splitting, at a rendered offset — so that it takes effect `offset`
-    /// bytes into the paragraph at surface `s` after `anchors` of its text
+    /// bytes into the paragraph at `at` after `anchors` of its text
     /// boxes and note references.
     ///
     /// jade inserts before the anchors already at an offset, and its split
     /// takes them to the second half. To act after some of them, the
     /// materializer types a placeholder after those, acts right after the
     /// placeholder — before the anchors that moved on with it — and deletes
-    /// the placeholder again.
+    /// the placeholder again. Resolve `at` in each new native state: an edit
+    /// can change surface ordinals even while its story address stays valid.
+    /// The callback receives the current document, surface and rendered offset.
     fn at_anchors(
         &mut self,
-        s: usize,
+        at: &ParagraphStory,
         offset: usize,
         anchors: usize,
-        command: impl FnOnce(usize) -> HeadlessCommand,
+        command: impl FnOnce(&Self, usize, usize) -> Result<HeadlessCommand, String>,
         session: Option<&Session>,
     ) -> Result<(), String> {
-        self.among_anchors(s, offset, anchors, command, session, false)
+        self.among_anchors(at, offset, anchors, command, session, false)
     }
 
     /// [`Self::at_anchors`]; with `always`, through the placeholder even
     /// when jade would act in the right place by itself.
     fn among_anchors(
         &mut self,
-        s: usize,
+        at: &ParagraphStory,
         offset: usize,
         anchors: usize,
-        command: impl FnOnce(usize) -> HeadlessCommand,
+        command: impl FnOnce(&Self, usize, usize) -> Result<HeadlessCommand, String>,
         session: Option<&Session>,
         always: bool,
     ) -> Result<(), String> {
+        let s = self.surface(at)?;
         let before = self
             .word
             .paragraph_anchors(s)
@@ -463,8 +466,9 @@ impl JadeDocx {
             .filter(|a| a.offset < offset)
             .count();
         if anchors == before && !always {
-            let at = self.rendered(s, offset);
-            return self.run_as(command(at), session);
+            let offset = self.rendered(s, offset);
+            let command = command(self, s, offset)?;
+            return self.run_as(command, session);
         }
         let Some(after) = anchors.checked_sub(before) else {
             return Err(format!(
@@ -480,10 +484,12 @@ impl JadeDocx {
                 after_anchors: after,
                 text: PLACEHOLDER.to_string(),
             })?;
-            self.run_as(
-                command(self.rendered(s, offset + PLACEHOLDER.len())),
-                session,
-            )?;
+            // A native edit can reorder interleaved note/box surfaces after
+            // an earlier split. Keep the story address, not the old ordinal.
+            let s = self.surface(at)?;
+            let command = command(self, s, self.rendered(s, offset + PLACEHOLDER.len()))?;
+            self.run_as(command, session)?;
+            let s = self.surface(at)?;
             let start = self.rendered_after(s, offset, anchors)?;
             self.run(HeadlessCommand::ReplaceRange {
                 start_paragraph: s,
@@ -638,17 +644,22 @@ impl JadeDocx {
             .any(|a| a.offset == len);
         if trailing {
             let anchors = self.word.paragraph_anchors(first).len();
-            let end_offset = self.rendered(second, 0);
             return self.at_anchors(
-                first,
+                at,
                 len,
                 anchors,
-                |offset| HeadlessCommand::ReplaceRange {
-                    start_paragraph: first,
-                    start_offset: offset,
-                    end_paragraph: second,
-                    end_offset,
-                    text: String::new(),
+                |current, first, offset| {
+                    let second = current.surface(&next_paragraph(at))?;
+                    if first + 1 != second {
+                        return Err("a note or text box separates the paragraphs".into());
+                    }
+                    Ok(HeadlessCommand::ReplaceRange {
+                        start_paragraph: first,
+                        start_offset: offset,
+                        end_paragraph: second,
+                        end_offset: current.rendered(second, 0),
+                        text: String::new(),
+                    })
                 },
                 None,
             );
@@ -702,13 +713,15 @@ impl JadeDocx {
             // jade's insert_text_among_anchors writes plain text; a tracked
             // insertion is typed right after a placeholder there instead.
             return self.among_anchors(
-                s,
+                at,
                 offset,
                 anchors,
-                |offset| HeadlessCommand::InsertText {
-                    paragraph: s,
-                    offset,
-                    text,
+                |_, s, offset| {
+                    Ok(HeadlessCommand::InsertText {
+                        paragraph: s,
+                        offset,
+                        text,
+                    })
                 },
                 session,
                 true,
@@ -800,15 +813,16 @@ impl JadeDocx {
             } => {
                 // jade's split takes the anchors at the offset along to the
                 // second half; a placeholder keeps the ones that stay.
-                let s = self.surface(&paragraph)?;
                 return self.at_anchors(
-                    s,
+                    &paragraph,
                     offset,
                     anchors,
-                    |offset| HeadlessCommand::InsertParagraphBreak {
-                        paragraph: s,
-                        offset,
-                        count: 1,
+                    |_, s, offset| {
+                        Ok(HeadlessCommand::InsertParagraphBreak {
+                            paragraph: s,
+                            offset,
+                            count: 1,
+                        })
                     },
                     None,
                 );
@@ -954,23 +968,24 @@ impl JadeDocx {
                 anchors,
                 text,
             } => {
-                let s = self.surface(&paragraph)?;
                 let before = self.note_ids(kind);
                 self.at_anchors(
-                    s,
+                    &paragraph,
                     offset,
                     anchors,
-                    |offset| match kind {
-                        NoteKind::Footnote => HeadlessCommand::InsertFootnote {
-                            paragraph: s,
-                            offset,
-                            text,
-                        },
-                        NoteKind::Endnote => HeadlessCommand::InsertEndnote {
-                            paragraph: s,
-                            offset,
-                            text,
-                        },
+                    |_, s, offset| {
+                        Ok(match kind {
+                            NoteKind::Footnote => HeadlessCommand::InsertFootnote {
+                                paragraph: s,
+                                offset,
+                                text,
+                            },
+                            NoteKind::Endnote => HeadlessCommand::InsertEndnote {
+                                paragraph: s,
+                                offset,
+                                text,
+                            },
+                        })
                     },
                     None,
                 )?;
@@ -1034,21 +1049,22 @@ impl JadeDocx {
                 width_px,
                 height_px,
             } => {
-                let s = self.surface(&paragraph)?;
                 return self.at_anchors(
-                    s,
+                    &paragraph,
                     offset,
                     anchors,
-                    |offset| HeadlessCommand::InsertShape {
-                        paragraph: s,
-                        offset,
-                        shape: HeadlessShapeKind::Rectangle,
-                        width_px: f64::from(width_px),
-                        height_px: f64::from(height_px),
-                        fill_color: None,
-                        border_color: Some("000000".to_string()),
-                        border_width_px: 1.0,
-                        text,
+                    |_, s, offset| {
+                        Ok(HeadlessCommand::InsertShape {
+                            paragraph: s,
+                            offset,
+                            shape: HeadlessShapeKind::Rectangle,
+                            width_px: f64::from(width_px),
+                            height_px: f64::from(height_px),
+                            fill_color: None,
+                            border_color: Some("000000".to_string()),
+                            border_width_px: 1.0,
+                            text,
+                        })
                     },
                     None,
                 );

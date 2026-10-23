@@ -9,12 +9,64 @@ Lean 4 proofs of the properties `docs/design.md` §7 lists for the
 
 ```sh
 cd lean
-lake build            # the proofs and five executable differential oracles
+lake build            # proofs, axiom audit/self-tests, six differential oracles
 ```
 
 The toolchain is pinned in `lean-toolchain` (`leanprover/lean4:v4.34.0`).
+Rust/oracle commands below run from the repository root.
+
+## Proof trust audit
+
+The default build runs `AxiomAudit.lean` over every declaration in the
+`JadeCollab` namespace **or originating from a `JadeCollab` module**, including
+private definitions, generated helpers and opaque/transitive dependencies.
+Only `propext`, `Classical.choice` and `Quot.sound` are permitted. A missing
+namespace/module prefix fails instead of silently checking nothing. This uses
+Lean's compiled environment and axiom dependency collector, rather than trusting
+a text search. CI retains its separate source placeholder check too.
+
+`AuditTests.lean` checks rejection of public, private/unused and opaque
+transitive foreign postulates, rejection of an empty prefix, acceptance of
+standard axioms and coverage of definitions outside their module's namespace.
+Deliberately false fixtures are isolated from production proofs. The audit
+checks the compiled dependencies in the current pinned Lean toolchain; Rust
+implementation, native IO and the toolchain's trusted kernel remain boundaries.
 
 ## What is proved
+
+### `JadeCollab/StableSurfaces.lean`: native indices across helper steps
+
+Eight theorems prove that resolving a stable address in each faithful frame
+preserves its target and logical caret, prevents aliasing, and survives arbitrary
+surface reorderings. Join plans resolve both endpoints in the current frame
+and refuse a newly nonadjacent pair. Two counterexamples show why a cached
+ordinal or old adjacency result can select another story after a reorder.
+Native map fidelity, story preservation and offset conversion remain explicit
+assumptions. Rust replays the CI split/footnote counterexample and checks six
+anchor-aware edit kinds before/after restore, clone, native preflight and export.
+
+### `JadeCollab/AuthoredAdmission.lean`: author and edit preflight
+
+Sixteen theorems cover all-or-none logical author/edit admission, exact one/two
+log-position costs, invalid edits, missing author prerequisites, exact capacity,
+refused processed tickets, duplicate non-revival, monotonic watermarks and
+bounded stateful histories. Healthy snapshot restoration preserves those
+watermarks. Unexpected native errors retain the separate `NativeFailure`
+contract, including a healthy author prefix if that already committed.
+
+`authored-oracle` runs these exact definitions. Rust drives authenticated native
+DOCX sockets through valid/malformed tracked edits, altered duplicate payloads,
+checkpoints/journal-only restarts and log exhaustion. Observed inspections,
+exports and resume watermarks are checked against an independent reference;
+an additional differential PBT compares the resulting trace to Lean.
+
+```sh
+JADE_LEAN_AUTHORED_ORACLE="$PWD/lean/.lake/build/bin/authored-oracle" \
+  cargo test -p jade-collab-server --test authored_admission --locked -- --ignored
+```
+
+Successful native application, Rust model/field/context fidelity and durable IO
+are assumptions, verified by the native tests rather than proved in Lean.
 
 ### `JadeCollab/AtomIdentity.lean`: globally addressed DOCX flow atoms
 

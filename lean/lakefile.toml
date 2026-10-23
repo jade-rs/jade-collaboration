@@ -1,9 +1,18 @@
 name = "jade-collab-proofs"
 version = "0.1.0"
-defaultTargets = ["JadeCollab", "grid-oracle", "marks-oracle", "journal-oracle", "id-oracle", "address-oracle"]
+defaultTargets = ["JadeCollab", "AxiomAudit", "AuditTests", "grid-oracle", "marks-oracle", "journal-oracle", "id-oracle", "address-oracle", "authored-oracle"]
 
 [[lean_lib]]
 name = "JadeCollab"
+
+[[lean_lib]]
+name = "ProofAudit"
+
+[[lean_lib]]
+name = "AxiomAudit"
+
+[[lean_lib]]
+name = "AuditTests"
 
 [[lean_exe]]
 name = "grid-oracle"
@@ -24,3 +33,7 @@ root = "IdOracle"
 [[lean_exe]]
 name = "address-oracle"
 root = "AddressOracle"
+
+[[lean_exe]]
+name = "authored-oracle"
+root = "AuthoredOracle"

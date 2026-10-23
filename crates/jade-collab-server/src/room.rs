@@ -16,7 +16,7 @@ use std::thread;
 use jade_collab_core::id::ReplicaId;
 use jade_collab_sync::protocol::{Committed, Submission};
 use jade_collab_sync::{
-    Document, Materializer, Record, Rejection, Sequencer, SubmitOutcome, SyncError,
+    ApplyContext, Document, Materializer, Record, Rejection, Sequencer, SubmitOutcome, SyncError,
 };
 use jade_docx_collab::{DocxModel, DocxOp, JadeDocx};
 use jade_pptx_collab::{JadePptx, PptxModel};
@@ -347,6 +347,40 @@ struct Hosting<H: Hosted> {
 }
 
 impl<H: Hosted> Hosting<H> {
+    /// Check the complete logical author/edit pair before publishing either.
+    /// Only the first tracked edit (or a changed author) needs this clone;
+    /// ordinary typing keeps the existing path without a native file fork.
+    fn prepare_authored_edit(
+        &self,
+        named: &H::Op,
+        replica: ReplicaId,
+        base_seq: u64,
+        op: &H::Op,
+    ) -> Result<(), Rejection> {
+        let current = self.sequencer.seq();
+        let edit_seq = current
+            .checked_add(2)
+            .ok_or_else(|| Rejection::new(SyncError::LogExhausted.to_string()))?;
+        let mut trial = self.sequencer.document().clone();
+        trial.apply(
+            named,
+            &ApplyContext {
+                origin: ReplicaId::ORIGIN,
+                base_seq: current,
+                seq: Some(edit_seq - 1),
+            },
+        )?;
+        trial.apply(
+            op,
+            &ApplyContext {
+                origin: replica,
+                base_seq,
+                seq: Some(edit_seq),
+            },
+        )?;
+        Ok(())
+    }
+
     fn open(source: Source) -> Result<Self, String> {
         Ok(match source {
             Source::File(bytes) => {
@@ -591,7 +625,9 @@ impl<H: Hosted> Hosting<H> {
                         H::author_op(self.sequencer.document(), replica, author, &op)
                     });
                     if let Some(named) = named {
-                        match self.sequencer.commit_origin(named) {
+                        let prepared =
+                            self.prepare_authored_edit(&named, replica, submission.base_seq, &op);
+                        match prepared.and_then(|()| self.sequencer.commit_origin(named)) {
                             Ok(committed) => {
                                 self.journal(Record::Committed(committed.clone()))?;
                                 let json =
@@ -600,14 +636,15 @@ impl<H: Hosted> Hosting<H> {
                             }
                             Err(error) => {
                                 // Native errors are unknown outcomes and stop
-                                // this room. A healthy logical refusal of the
-                                // author prerequisite must refuse the edit too.
+                                // this room. Logical refusal of either the
+                                // author prerequisite or its edit changes only
+                                // the processed ticket.
                                 self.sequencer.check_health().map_err(|e| e.to_string())?;
                                 let outcome = self.sequencer.reject(
                                     replica,
                                     submission.client_seq,
                                     Rejection::new(format!(
-                                        "cannot register tracked-change author: {error}"
+                                        "cannot prepare authenticated tracked edit: {error}"
                                     )),
                                 );
                                 if let Some(record) = outcome.record(replica) {

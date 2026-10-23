@@ -2099,3 +2099,67 @@ geometry and revision metadata agree before and after export/reopen. Three
 additional `TextPositions.lean` theorems prove positional cleanup's exact atom
 order, anchor projection and preservation of matching user atoms; actual native
 XML edits and offset mapping remain Rust verification boundaries.
+
+
+### Authored edit logical admission and proof trust
+
+An authenticated raw socket could previously submit a tracked edit with an
+unknown parent, empty insertion, nonexistent story/target or an ID older than
+its parent: the actor committed `SetAuthor` before the sequencer refused the
+edit. One remaining log position likewise allowed the author to commit while
+leaving no capacity for its edit. These logical refusals had an observable
+metadata/log side effect despite leaving the file text unchanged.
+
+When an author prerequisite is needed, the actor now checks two available log
+positions and applies the author plus edit to an independent logical clone,
+using the same origins, base sequence numbers and committed positions as their
+actual applications. A refusal publishes neither operation and journals only
+the processed client ticket. Ordinary edits with a matching author use the
+existing path, needing only one position and no additional clone/file fork.
+The healthy author prefix remains separately durable on unexpected native
+errors, following the existing failure quarantine/recovery contract.
+
+Fixed socket regressions cover every invalid logical shape. Stateful native
+PBT mixes valid and malformed edits, changed duplicates, matching/new authors,
+checkpoint/journal-only restarts, and values near `u64::MAX`; native exports,
+inspection snapshots and resumed ticket watermarks agree with an independent
+reference. The sixth executable Lean oracle compares the same observed traces
+with `AuthoredAdmission.lean`, whose sixteen theorems establish logical refusal
+atomicity, exact capacity, duplicate non-revival and bounded histories.
+
+Lean's default build additionally audits compiled axiom dependencies for all
+production namespace/module declarations, including private/generated helpers,
+unused postulates and opaque transitive dependencies. Only the standard
+`propext`, `Classical.choice` and `Quot.sound` axioms are allowed; an empty audit
+scope fails. Negative fixtures exercise holes that a source search for proof
+placeholders would miss. This does not prove native execution or Rust/IO
+fidelity; the native differential histories test those explicit boundaries.
+
+
+### Stable story addresses across native helper commands
+
+[CI on the preceding commit](https://github.com/jade-rs/jade-collaboration/actions/runs/39724459767)
+found a stateful native counterexample: create a footnote before body text,
+split that body paragraph, then insert a note after a reference in the second
+part. Native split caches can list notes after both body parts; a later
+placeholder command rebuilds their order. The helper reused its old surface
+ordinal for the next command and cleanup, which could now address a different
+story. The saved seed `8efc1307470d2a563adab68a7dff0b3802cc1f39d2a8fb6324eeb4edc45ea409`
+reproduces the failure locally too.
+
+Anchor-aware helpers now keep the `ParagraphStory` address and resolve its
+current surface before the callback and before placeholder cleanup. Callbacks
+receive that current document/surface; joins additionally resolve the other
+endpoint and recheck adjacency then. Existing rollback protects a failed helper.
+This avoids a new full-document surface rebuild on every ordinary keystroke.
+The native engine submodule stays unchanged.
+
+A focused native matrix covers footnotes, endnotes, boxes, splits, plain text
+and tracked text after the split, with and without restore. Clone comparisons
+use story geometry because native surface order can legitimately lag until a
+later edit; exports/reopens must also match canonical order. Existing stateful
+native/session tests retain the CI seed rather than relaxing admission checks.
+`StableSurfaces.lean` adds eight theorems on current-frame target fidelity,
+arbitrary reordering histories, exact join endpoints and adjacency refusal,
+plus counterexamples for stale ordinals and stale adjacency. Native mapping,
+story preservation and UTF-8/rendered conversion are Rust verification boundaries.

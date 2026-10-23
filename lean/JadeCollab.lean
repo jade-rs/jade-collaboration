@@ -25,7 +25,9 @@ import JadeCollab.RecoveryBounds
 import JadeCollab.DerivedBatch
 import JadeCollab.PackageBudget
 import JadeCollab.TextPositions
+import JadeCollab.StableSurfaces
 import JadeCollab.AuthorIdentity
+import JadeCollab.AuthoredAdmission
 import JadeCollab.NativeFailure
 import JadeCollab.TextBoundary
 import JadeCollab.TableWork

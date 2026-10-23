@@ -171,7 +171,11 @@ The SDK and sequencer check this before applying the model or touching the
 native file; the socket also checks before registering a tracked-change author.
 Other replicas' existing text, rows, shapes and revision IDs remain shared edit
 targets. Refusals consume the server ticket without changing content, and a
-changed payload cannot revive a processed ticket. Trusted committed history
+changed payload cannot revive a processed ticket. A new tracked author and its
+edit are logically checked together before author publication, with two log
+positions reserved; a matching author needs one. Invalid parent/story/range
+references or insufficient capacity cannot publish an author alone.
+Trusted committed history
 and server-origin derived operations retain their original meaning.
 
 The CLI plans an `apply` array this way before sending any operation. A locally
