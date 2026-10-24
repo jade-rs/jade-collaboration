@@ -9,7 +9,7 @@ Lean 4 proofs of the properties `docs/design.md` §7 lists for the
 
 ```sh
 cd lean
-lake build            # proofs, axiom audit/self-tests, six differential oracles
+lake build            # proofs, axiom audit/self-tests, seven differential oracles
 ```
 
 The toolchain is pinned in `lean-toolchain` (`leanprover/lean4:v4.34.0`).
@@ -33,6 +33,45 @@ checks the compiled dependencies in the current pinned Lean toolchain; Rust
 implementation, native IO and the toolchain's trusted kernel remain boundaries.
 
 ## What is proved
+
+### `JadeCollab/TextCursor.lean`: ephemeral DOCX carets and selection endpoints
+
+Twenty-six theorems cover deferred unknown endpoints, refusal of reversed or
+equal neighbour IDs, endpoint affinity, bounded raw cuts, deletion retaining the
+identifier spine, idempotent/commuting deletions, zero-width anchors, paragraph
+mark resets, UTF-8 byte accumulation/bounds, prefix composition, suffix isolation
+and preservation of selection direction for ordered raw cuts. A counterexample
+shows why filtering tombstones before lookup loses a valid cursor even when
+both neighbouring characters are deleted.
+
+The model takes one story's canonical RGA walk and byte widths as inputs. RGA
+ordering/identifier uniqueness are verified separately; this module does not
+prove browser focus events, native Word geometry, Rust execution or that every
+pair of arbitrary forged endpoints represents a valid selection. A story that
+is no longer rendered has no visible cursor. With no right endpoint the cut is
+one atom after the left; with neither endpoint it is the story end.
+
+`cursor-oracle` executes the same proved prefix-fold specification. Two stateful
+Rust PBTs each run 96 generated histories over three replicas, retained cursors
+and ranges. Every transition compares exact paragraph/UTF-8 coordinates against
+an independent raw-prefix scan; the oracle variant also compares with Lean.
+Histories include edits, paragraph splits/joins, table merges/unmerges/deletion,
+row deletion, note/text-box deletion, delayed messages, reconnects and serialized
+checkpoint/rejoin. They include empty paragraphs, supplementary/combining Unicode,
+large 64-bit identities, unknown/reversed endpoints and zero-width references.
+Each query preserves the durable model; convergence and range direction are
+checked separately. The real mixed-story fixture supplies cells, notes and text
+boxes. These tests verify the document model; existing native-session and browser
+suites cover realization and editor integration.
+
+```sh
+(cd lean && lake build)
+JADE_LEAN_CURSOR_ORACLE="$PWD/lean/.lake/build/bin/cursor-oracle" \
+  cargo test -p jade-docx-collab --lib model::cursor::tests::stateful_cursors_match_lean --locked -- --ignored --exact
+```
+
+The regular cursor PBT and deterministic regressions run in ordinary `cargo test`;
+CI explicitly executes the Lean comparison as well.
 
 ### `JadeCollab/NotesRuns.lean`: bounded plain-note run maintenance
 

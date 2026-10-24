@@ -1,6 +1,6 @@
 name = "jade-collab-proofs"
 version = "0.1.0"
-defaultTargets = ["JadeCollab", "AxiomAudit", "AuditTests", "grid-oracle", "marks-oracle", "journal-oracle", "id-oracle", "address-oracle", "authored-oracle"]
+defaultTargets = ["JadeCollab", "AxiomAudit", "AuditTests", "grid-oracle", "marks-oracle", "journal-oracle", "id-oracle", "address-oracle", "authored-oracle", "cursor-oracle"]
 
 [[lean_lib]]
 name = "JadeCollab"
@@ -37,3 +37,7 @@ root = "AddressOracle"
 [[lean_exe]]
 name = "authored-oracle"
 root = "AuthoredOracle"
+
+[[lean_exe]]
+name = "cursor-oracle"
+root = "TextCursorOracle"

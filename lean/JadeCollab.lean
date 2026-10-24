@@ -40,3 +40,4 @@ import JadeCollab.Anchor
 import JadeCollab.Revision
 import JadeCollab.Marks
 import JadeCollab.MarksRga
+import JadeCollab.TextCursor
