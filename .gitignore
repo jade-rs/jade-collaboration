@@ -6,3 +6,5 @@ lean/.lake/
 /demos/browser/node_modules/
 /demos/browser/test-results/
 /demos/browser/playwright-report/
+
+/target-direct-editor/

@@ -33,7 +33,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: jade-rs/jade-office
-          ref: 1b2b3529c77144f7e4f0384955ee3adb22795dc5
+          ref: acb54c6278894faaa096dddd4faf697fdd4247bc
           path: jade-office
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
@@ -76,5 +76,6 @@ jobs:
             sleep 1
           done
           curl -fsS http://127.0.0.1:8787/ > /dev/null
+          node demos/browser/editor-e2e.mjs "$CARGO_TARGET_DIR/office-demo/www"
           node demos/browser/e2e.mjs "$CARGO_TARGET_DIR/office-demo/www"
           npm --prefix demos/browser run test:ui

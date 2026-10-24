@@ -37,7 +37,7 @@ cargo "+$toolchain" build --manifest-path "$root/demos/browser/Cargo.toml" --loc
 "$bindgen" "$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/jade_collab_browser.wasm" --target web --out-dir "$www/collab-pkg" --no-typescript
 cargo "+$toolchain" build --manifest-path "$source/demos/collaboration/renderer/Cargo.toml" --locked --release --target wasm32-unknown-unknown
 "$bindgen" "$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/jade_office_collab_preview.wasm" --target web --out-dir "$www/office-pkg" --no-typescript
-cp "$office/demos/collaboration/"{index.html,app.js,editing.mjs,browser-tests.html,browser-tests.js} "$www/"
+cp "$office/demos/collaboration/"{index.html,app.js,editing.mjs,canvas-editor.mjs,browser-tests.html,browser-tests.js} "$www/"
 cp "$source/jade-core/fonts/Noto_Sans_JP/static/"{NotoSansJP-Regular.ttf,NotoSansJP-Bold.ttf} "$www/fonts/"
 python3 "$root/demos/make-office-demo.py" "$demo/seed.docx"
 cargo build --manifest-path "$root/Cargo.toml" --locked --release -p jade-collab-server --example office_demo
