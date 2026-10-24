@@ -33,7 +33,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: jade-rs/jade-office
-          ref: 00b9148780e1c3dce62c9ec76fcf0fab8fbc509d
+          ref: 1b2b3529c77144f7e4f0384955ee3adb22795dc5
           path: jade-office
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
@@ -58,6 +58,11 @@ jobs:
           node --test ../jade-office/demos/collaboration/editing.test.mjs
       - name: Install matching WASM glue generator
         run: cargo +stable install wasm-bindgen-cli --version 0.2.128 --locked
+      - name: Install browser regression runner
+        working-directory: jade-collaboration/demos/browser
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
       - name: Build and exercise the integrated demo
         working-directory: jade-collaboration
         run: |
@@ -66,9 +71,10 @@ jobs:
           host=$!
           trap 'kill "$host" 2>/dev/null || true; cat "$RUNNER_TEMP/office-demo.log"' EXIT
           for attempt in $(seq 1 900); do
-            if curl -fsS http://127.0.0.1:8787/ > /dev/null; then break; fi
+            if curl -fsS http://127.0.0.1:8787/ > /dev/null 2>&1; then break; fi
             if ! kill -0 "$host" 2>/dev/null; then exit 1; fi
             sleep 1
           done
           curl -fsS http://127.0.0.1:8787/ > /dev/null
           node demos/browser/e2e.mjs "$CARGO_TARGET_DIR/office-demo/www"
+          npm --prefix demos/browser run test:ui

@@ -12,7 +12,7 @@ Check out `jade-office` next to this repository, with its
 `demos/collaboration` integration and both repositories' submodules initialized.
 The integration is available on jade-office's
 [`codex/collaboration-demo`](https://github.com/jade-rs/jade-office/tree/codex/collaboration-demo)
-branch (pinned to `00b9148780e1c3dce62c9ec76fcf0fab8fbc509d` in this repository's demo CI).
+branch (pinned to `1b2b3529c77144f7e4f0384955ee3adb22795dc5` in this repository's demo CI).
 Install Rust stable **1.99 or newer**, its `wasm32-unknown-unknown` target,
 the pinned native Rust toolchain, Python 3, and **wasm-bindgen-cli 0.2.128**:
 
@@ -79,6 +79,10 @@ cargo test --manifest-path demos/browser/Cargo.toml --locked
 node --test ../jade-office/demos/collaboration/editing.test.mjs
 # While the demo host is running (Node >=22):
 node demos/browser/e2e.mjs target-office-demo/office-demo/www
+# Optional real-browser composition/reconnection regression (Chromium):
+npm --prefix demos/browser ci
+(cd demos/browser && npx playwright install chromium)
+npm --prefix demos/browser run test:ui
 ```
 
 The adapter tests cover Unicode boundary validation, all-or-none local planning,
@@ -86,5 +90,10 @@ rejection rollback, identifiers above JavaScript's safe integer range, lost-ack
 resumption and stateful random delayed concurrent replacements. The real-socket
 test creates a separate document and checks concurrent Unicode inserts, offline
 resumption, same-table-cell edits, convergence and the actual exported DOCX XML.
+The browser regression opens `/browser-tests.html`, creates another separate
+document and drives two actual editor frames. It verifies composition text and
+caret retention during disconnect, queued peer commits followed by resume, and
+both final-input/compositionend event orders. Its test runner is pinned in
+`demos/browser/package-lock.json` and runs in the demo CI.
 The underlying replica/CRDT remains the implementation checked by the existing
 Lean models; these adapter tests do not constitute a proof of DOM/IME behavior.
