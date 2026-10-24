@@ -66,8 +66,10 @@ copy/paste and selection deletion work in the page. Enter inserts a Word line
 break inside the paragraph, and paste supports line breaks and tabs.
 Cmd/Ctrl+A selects the current paragraph. Each peer has a consistent color,
 a name-labelled caret and a highlighted text selection, including in table
-cells. Participant chips show whether they are editing, composing or unfocused;
-click one to scroll to their position. The final pointer/keyboard selection is
+cells. Carets, selected ranges and participant chips are visible only while the
+peer focuses the editor. Chips show editing or composition status; click one
+to scroll to their position. Refocusing restores the retained position without
+a document edit. The final pointer/keyboard selection is
 shared even during rapid gestures. CRDT boundaries follow insertions/deletions
 without transmitting the paragraph’s character list. Peer geometry does not
 change the local caret or IME. Disconnecting removes its overlays and reconnecting

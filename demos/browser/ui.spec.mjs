@@ -75,7 +75,7 @@ test('canvas editors preserve an IME composition through peer edits and reconnec
   await page.goto('/browser-tests.html');await page.getByRole('button',{name:'テストを実行',exact:true}).click();
   await expect(page.locator('#result')).toHaveAttribute('data-status',/passed|failed/,{timeout:70_000});
   const result=await page.locator('#result').textContent();
-  expect(result).toContain('"status": "passed"');expect(result).toContain('canvas-editor-without-textarea');expect(result).toContain('named-peer-caret-and-selection');expect(result).toContain('peer-left-and-resume');
+  expect(result).toContain('"status": "passed"');expect(result).toContain('canvas-editor-without-textarea');expect(result).toContain('named-peer-caret-and-selection');expect(result).toContain('peer-left-and-resume');expect(result).toContain('active-peers-only');
   expect(result).toContain('cancel-selected-composition');expect(result).toContain('ime-focus-survives-repagination');
   expect(result).toContain('final-input-before-compositionend');expect(result).toContain('final-input-after-compositionend');expect(errors).toEqual([]);
 });
@@ -98,9 +98,11 @@ test('named peer carets and selections track focus, table cells, edits, IME and 
   await expect(caret.locator('.peer-name')).toHaveText('Bob');expect(await selected.count()).toBeGreaterThan(0);
   // Exercise editor blur independently of window-manager tab activation.
   await b.locator('#connection').focus();
-  await a.bringToFront();await expect(caret).toHaveAttribute('data-focused','false');
-  await expect(caret.locator('.peer-name')).toContainText('未フォーカス');
+  await a.bringToFront();await expect(caret).toHaveCount(0);
+  await expect(selected).toHaveCount(0);await expect(a.locator(`.peer-chip[data-peer="${bid}"]`)).toHaveCount(0);
   await paragraph(a,1);await a.keyboard.insertText('PRE ');await converged(a,b);
+  await expect(caret).toHaveCount(0);
+  await b.bringToFront();await b.locator('#ime').focus();
   await expect(caret).toHaveAttribute('data-focus',JSON.stringify([range.focus[0],range.focus[1]+4]));
   const cell=(await model(b)).paragraphs.find(p=>p.story.startsWith('Cell')&&p.text.length>8);
   await b.bringToFront();await paragraph(b,cell.index);
@@ -113,17 +115,25 @@ test('named peer carets and selections track focus, table cells, edits, IME and 
   expect(rendered.x).toBeCloseTo(rectangles[0].x);expect(rendered.y).toBeCloseTo(rectangles[0].y);expect(rendered.width).toBeCloseTo(rectangles[0].width);
   // A received presence frame must not cancel or move the author's IME draft.
   await a.bringToFront();await a.locator('#ime').focus();
-  await a.locator('#ime').dispatchEvent('compositionstart',{data:''});
-  await a.locator('#ime').dispatchEvent('compositionupdate',{data:'入力中😀'});
+  // Playwright's dispatchEvent falls back to Event for composition events,
+  // which drops .data. Use the browser's real CompositionEvent constructor.
+  await a.locator('#ime').evaluate(el=>el.dispatchEvent(new CompositionEvent('compositionstart',{bubbles:true,data:''})));
+  await a.locator('#ime').evaluate(el=>el.dispatchEvent(new CompositionEvent('compositionupdate',{bubbles:true,data:'入力中😀'})));
   const draft=await editor(a);
-  await b.bringToFront();await b.keyboard.press('ArrowRight');await b.keyboard.press('ArrowRight');
+  expect(draft.composing).toBe(true);expect(draft.paragraphs[draft.selection.focus[0]]).toContain('入力中😀');
+  await b.bringToFront();await b.locator('#ime').focus();await b.keyboard.press('ArrowRight');await b.keyboard.press('ArrowRight');
   await expect(caret).toHaveAttribute('data-focus',JSON.stringify((await editor(b)).selection.focus));
   expect(await editor(a)).toEqual(draft);
-  await a.locator('#ime').dispatchEvent('compositionend',{data:'入力中😀'});await converged(a,b);
+  await a.locator('#ime').evaluate(el=>el.dispatchEvent(new CompositionEvent('compositionend',{bubbles:true,data:'入力中😀'})));await converged(a,b);
   await b.getByRole('button',{name:'オフラインにする',exact:true}).click();await expect(caret).toHaveCount(0);
-  await b.getByRole('button',{name:'再接続する',exact:true}).click();await ready(b);await expect(caret).toHaveCount(1);
+  await b.getByRole('button',{name:'再接続する',exact:true}).click();await ready(b);await expect(caret).toHaveCount(0);
+  await b.locator('#ime').focus();await expect(caret).toHaveCount(1);
   const c=await context.newPage();c.on('pageerror',error=>errors.push(String(error)));
   await c.goto(`/?name=Charlie&document=${name}`);await ready(c);
-  await expect(c.locator('.peer-caret')).toHaveCount(2);
+  await a.locator('#connection').focus();await b.locator('#connection').focus();
+  await expect(c.locator('.peer-caret')).toHaveCount(0);
+  await b.bringToFront();await b.locator('#ime').focus();
+  await expect(c.locator('.peer-caret')).toHaveCount(1);
+  await expect(c.locator('.peer-name')).toHaveText('Bob');
   expect(await a.locator('#notice').textContent()).toBe('');expect(errors).toEqual([]);
 });
