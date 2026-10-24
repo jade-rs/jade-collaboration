@@ -12,7 +12,7 @@ Check out `jade-office` next to this repository, with its
 `demos/collaboration` integration and both repositories' submodules initialized.
 The integration is available on jade-office's
 [`codex/collaboration-demo`](https://github.com/jade-rs/jade-office/tree/codex/collaboration-demo)
-branch (pinned to `acb54c6278894faaa096dddd4faf697fdd4247bc` in this repository's demo CI).
+branch (pinned to `894e822f78e5580a6045d3811b08f248abdec0d7` in this repository's demo CI).
 Install Rust stable **1.99 or newer**, its `wasm32-unknown-unknown` target,
 the pinned native Rust toolchain, Python 3, and **wasm-bindgen-cli 0.2.128**:
 
