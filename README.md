@@ -53,6 +53,11 @@ Use `git submodule update --init` if you cloned without
 
 ## Try it
 
+For a two-tab jade-office DOCX editing demo, see
+[demos/README.md](demos/README.md) and run `./demos/run-office.sh` with the sibling
+jade-office integration checkout. It edits paragraph and table-cell text,
+supports offline/resume, and previews/downloads the actual server DOCX.
+
 ```sh
 cargo install --path crates/jade-collab-server
 jade-collab serve --save contract.docx budget.xlsx deck.pptx

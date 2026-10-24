@@ -1,0 +1,74 @@
+name: Office collaboration demo
+
+on:
+  push:
+    branches: [main]
+    paths: ['demos/**', 'crates/jade-collab-*/**', 'crates/jade-docx-collab/**', 'Cargo.*', '.github/workflows/office-demo.yml']
+  pull_request:
+    paths: ['demos/**', 'crates/jade-collab-*/**', 'crates/jade-docx-collab/**', 'Cargo.*', '.github/workflows/office-demo.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: office-demo-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  demo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_PROFILE_RELEASE_DEBUG: 0
+      CARGO_BUILD_JOBS: 3
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: jade-collaboration
+          submodules: recursive
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: jade-rs/jade-office
+          ref: 00b9148780e1c3dce62c9ec76fcf0fab8fbc509d
+          path: jade-office
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            jade-collaboration
+            jade-collaboration/demos/browser
+      - name: Adapter formatting, lint and stateful properties
+        working-directory: jade-collaboration
+        run: |
+          cargo fmt --manifest-path demos/browser/Cargo.toml -- --check
+          cargo clippy --manifest-path demos/browser/Cargo.toml --all-targets --locked -- -D warnings
+          cargo test --manifest-path demos/browser/Cargo.toml --locked
+          cargo test -p jade-collab-server --example office_demo --locked
+          node --test ../jade-office/demos/collaboration/editing.test.mjs
+      - name: Install matching WASM glue generator
+        run: cargo +stable install wasm-bindgen-cli --version 0.2.128 --locked
+      - name: Build and exercise the integrated demo
+        working-directory: jade-collaboration
+        run: |
+          export CARGO_TARGET_DIR="$GITHUB_WORKSPACE/jade-collaboration/target"
+          ./demos/run-office.sh > "$RUNNER_TEMP/office-demo.log" 2>&1 &
+          host=$!
+          trap 'kill "$host" 2>/dev/null || true; cat "$RUNNER_TEMP/office-demo.log"' EXIT
+          for attempt in $(seq 1 900); do
+            if curl -fsS http://127.0.0.1:8787/ > /dev/null; then break; fi
+            if ! kill -0 "$host" 2>/dev/null; then exit 1; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8787/ > /dev/null
+          node demos/browser/e2e.mjs "$CARGO_TARGET_DIR/office-demo/www"

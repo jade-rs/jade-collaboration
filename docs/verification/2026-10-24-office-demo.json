@@ -1,0 +1,47 @@
+{
+  "status": "local_docx_demo_verified",
+  "date": "2026-10-24",
+  "collaboration_base": "8de75d7fd7a59788ae7693841c290a75ddbf4b20",
+  "office_integration_commit": "00b9148780e1c3dce62c9ec76fcf0fab8fbc509d",
+  "office_base": "e97451df9a83a87891a0fa79131cb7bbba59ad13",
+  "office_engine": "e3a59293ac31cbeecaec7de2511787e8d2373449",
+  "collaboration_engine": "cabfe3205b7e3320c23f229a1ea5880ccadfa5a6",
+  "clean_office_source_build": true,
+  "adapter_unit_tests": 6,
+  "stateful_property_cases": 64,
+  "dom_offset_tests": 2,
+  "demo_restart_regression_tests": 1,
+  "lint": "adapter all-targets and server example passed with -D warnings",
+  "real_socket_wasm_e2e": [
+    "concurrent Unicode insertion in the same paragraph",
+    "offline optimistic edits plus online peer edits resume and converge",
+    "concurrent insertion in the same native table cell",
+    "native DOCX export contains all markers",
+    "native exported DOCX reopens through HTTP upload"
+  ],
+  "browser_ui_verified": [
+    "Alice opens Bob through the demo button",
+    "Alice and Bob edits propagate in both directions",
+    "offline and online input both remain after reconnect",
+    "table cell text propagates",
+    "jade-office WASM preview repaints the exported DOCX",
+    "server shutdown and restart preserve acknowledged DOCX bytes exactly",
+    "typing while server is stopped reaches both tabs after restart",
+    "downloaded DOCX includes both users, offline input, table edits and restart-time input"
+  ],
+  "restart_export_sha256_before_and_after": "cee3df64a92e7647ea8a51d0ac83c8826facba0c4069ba8d0ce41d3d4c3a7418",
+  "demo_seq_after_ui_verification": "8",
+  "browser_console_errors_or_warnings_observed": 0,
+  "scope": "dedicated browser demo, existing DOCX paragraph and table-cell text",
+  "limits": [
+    "normal GPUI editor and native app are not connected",
+    "XLSX and PPTX controls are not connected",
+    "no paragraph creation, formatting, table structure controls or collaborative undo in this screen",
+    "offline edits live in tab memory and do not survive reload or tab closure",
+    "Japanese and emoji insertion verified; native OS IME composition was not manually exercised",
+    "bundled preview fonts can show missing-glyph boxes for emoji",
+    "preview reloads the small committed document",
+    "loopback-only unauthenticated host; not a production deployment acceptance"
+  ],
+  "lean": "existing production CRDT/replica implementation reused unchanged; no new DOM or WASM proof claimed"
+}
