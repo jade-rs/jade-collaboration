@@ -96,6 +96,8 @@ test('named peer carets and selections track focus, table cells, edits, IME and 
   await expect(caret).toHaveAttribute('data-focus',JSON.stringify(range.focus));
   await expect(caret).toHaveAttribute('data-focused','true');
   await expect(caret.locator('.peer-name')).toHaveText('Bob');expect(await selected.count()).toBeGreaterThan(0);
+  // Exercise editor blur independently of window-manager tab activation.
+  await b.locator('#connection').focus();
   await a.bringToFront();await expect(caret).toHaveAttribute('data-focused','false');
   await expect(caret.locator('.peer-name')).toContainText('未フォーカス');
   await paragraph(a,1);await a.keyboard.insertText('PRE ');await converged(a,b);
