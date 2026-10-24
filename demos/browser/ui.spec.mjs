@@ -115,13 +115,16 @@ test('named peer carets and selections track focus, table cells, edits, IME and 
   expect(rendered.x).toBeCloseTo(rectangles[0].x);expect(rendered.y).toBeCloseTo(rectangles[0].y);expect(rendered.width).toBeCloseTo(rectangles[0].width);
   // A received presence frame must not cancel or move the author's IME draft.
   await a.bringToFront();await a.locator('#ime').focus();
-  await a.locator('#ime').dispatchEvent('compositionstart',{data:''});
-  await a.locator('#ime').dispatchEvent('compositionupdate',{data:'入力中😀'});
+  // Playwright's dispatchEvent falls back to Event for composition events,
+  // which drops .data. Use the browser's real CompositionEvent constructor.
+  await a.locator('#ime').evaluate(el=>el.dispatchEvent(new CompositionEvent('compositionstart',{bubbles:true,data:''})));
+  await a.locator('#ime').evaluate(el=>el.dispatchEvent(new CompositionEvent('compositionupdate',{bubbles:true,data:'入力中😀'})));
   const draft=await editor(a);
+  expect(draft.composing).toBe(true);expect(draft.paragraphs[draft.selection.focus[0]]).toContain('入力中😀');
   await b.bringToFront();await b.locator('#ime').focus();await b.keyboard.press('ArrowRight');await b.keyboard.press('ArrowRight');
   await expect(caret).toHaveAttribute('data-focus',JSON.stringify((await editor(b)).selection.focus));
   expect(await editor(a)).toEqual(draft);
-  await a.locator('#ime').dispatchEvent('compositionend',{data:'入力中😀'});await converged(a,b);
+  await a.locator('#ime').evaluate(el=>el.dispatchEvent(new CompositionEvent('compositionend',{bubbles:true,data:'入力中😀'})));await converged(a,b);
   await b.getByRole('button',{name:'オフラインにする',exact:true}).click();await expect(caret).toHaveCount(0);
   await b.getByRole('button',{name:'再接続する',exact:true}).click();await ready(b);await expect(caret).toHaveCount(0);
   await b.locator('#ime').focus();await expect(caret).toHaveCount(1);
