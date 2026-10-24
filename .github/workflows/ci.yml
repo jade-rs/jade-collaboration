@@ -103,3 +103,8 @@ jobs:
         run: cargo test -p jade-collab-server --test authored_admission --locked -- --ignored
         env:
           JADE_LEAN_AUTHORED_ORACLE: ${{ github.workspace }}/lean/.lake/build/bin/authored-oracle
+
+      - name: Differential test of DOCX peer cursors against the Lean prefix model
+        run: cargo test -p jade-docx-collab --lib model::cursor::tests::stateful_cursors_match_lean --locked -- --ignored --exact
+        env:
+          JADE_LEAN_CURSOR_ORACLE: ${{ github.workspace }}/lean/.lake/build/bin/cursor-oracle
