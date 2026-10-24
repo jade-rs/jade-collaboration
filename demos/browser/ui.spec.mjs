@@ -26,11 +26,11 @@ async function converged(a,b){
   }).toBe(true);
 }
 
-test('page clicks and native keys edit the Word canvas and the same real table cell',async({browser,request})=>{
+test('page clicks and native keys edit the Word canvas and the same real table cell',async({context,request})=>{
   const seed=await request.get('/documents/demo.docx');
   const name=`ui-direct-${Date.now()}.docx`;
   expect((await request.put(`/documents/${name}`,{data:await seed.body()})).status()).toBe(201);
-  const context=await browser.newContext(),a=await context.newPage(),b=await context.newPage();
+  const a=await context.newPage(),b=await context.newPage();
   const errors=[];for(const page of [a,b])page.on('pageerror',error=>errors.push(String(error)));
   try{
     await Promise.all([a.goto(`/?name=Alice&document=${name}`),b.goto(`/?name=Bob&document=${name}`)]);
