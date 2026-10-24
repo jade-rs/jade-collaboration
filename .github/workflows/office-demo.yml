@@ -33,7 +33,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: jade-rs/jade-office
-          ref: 0970d9c54ae6449b3c662601fb0347bb875c5657
+          ref: 77ea63ef14b82721f35df4d66b9e40ddedf88a6d
           path: jade-office
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
@@ -55,7 +55,7 @@ jobs:
           cargo clippy --manifest-path demos/browser/Cargo.toml --all-targets --locked -- -D warnings
           cargo test --manifest-path demos/browser/Cargo.toml --locked
           cargo test -p jade-collab-server --example office_demo --locked
-          node --test ../jade-office/demos/collaboration/editing.test.mjs
+          node --test ../jade-office/demos/collaboration/editing.test.mjs ../jade-office/demos/collaboration/presence.test.mjs
       - name: Install matching WASM glue generator
         run: cargo +stable install wasm-bindgen-cli --version 0.2.128 --locked
       - name: Install browser regression runner

@@ -129,3 +129,83 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn peer_selection_survives_deleting_both_adjacent_characters() {
+    let mut server = Sequencer::new(DocxModel::from_paragraphs(&["ab😀cdef"]));
+    let mut clients = [join(&mut server), join(&mut server)];
+    let cursor = clients[0].capture_selection(0, 4, 0, 6).unwrap();
+    let wire = clients[1].replace(0, 2, 5, "").unwrap();
+    submit(&mut server, &mut clients, 1, &wire);
+    assert_eq!(
+        clients[0].resolve_selection(&cursor).unwrap(),
+        r#"{"anchor":[0,2],"focus":[0,3]}"#
+    );
+}
+
+#[test]
+fn peer_selection_is_compact_and_does_not_round_large_character_ids() {
+    let mut server = Sequencer::new(DocxModel::from_paragraphs(&[&"あ".repeat(20_000)]));
+    let mut welcome = server.join();
+    welcome.replica = jade_collab_core::id::ReplicaId(9_007_199_254_740_993);
+    let mut client = BrowserDocument::new(&serde_json::to_string(&welcome).unwrap()).unwrap();
+    client.replace(0, 0, 0, "😀").unwrap();
+    let before = client.state().unwrap();
+    let cursor = client.capture_selection(0, 2, 0, 3).unwrap();
+    assert!(cursor.len() < 1500);
+    assert!(cursor.contains("9007199254740993"));
+    assert_eq!(
+        client.resolve_selection(&cursor).unwrap(),
+        r#"{"anchor":[0,2],"focus":[0,3]}"#
+    );
+    assert_eq!(client.state().unwrap(), before);
+    assert!(client.capture_selection(0, 1, 0, 1).is_err());
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+    #[test]
+    fn stateful_peer_caret_rebases_through_insertions_and_deletions(
+        actions in prop::collection::vec((any::<u8>(),any::<u8>(),any::<bool>(),"[あ😀a-z]{0,4}"),1..70)
+    ) {
+        let mut server=Sequencer::new(DocxModel::from_paragraphs(&["あ😀abcdef"]));
+        let mut clients=[join(&mut server),join(&mut server)];
+        for (a,b,insert,value) in actions {
+            let old=text(&clients[0]);
+            let boundaries: Vec<_>=std::iter::once(0).chain(old.chars().scan(0,|n,c|{*n+=c.len_utf16();Some(*n)})).collect();
+            let start=boundaries[a as usize % boundaries.len()];
+            let end=if insert { start } else { boundaries[b as usize % boundaries.len()].max(start) };
+            let at=boundaries[(a as usize+b as usize)%boundaries.len()];
+            let saved=clients[0].capture_selection(0,at,0,at).unwrap();
+            let wire=clients[1].replace(0,start,end,&value).unwrap();
+            submit(&mut server,&mut clients,1,&wire);
+            let resolved: Value=serde_json::from_str(&clients[0].resolve_selection(&saved).unwrap()).unwrap();
+            prop_assert_ne!(&resolved, &Value::Null);
+            prop_assert_eq!(&resolved["anchor"], &resolved["focus"]);
+            let offset=resolved["focus"][1].as_u64().unwrap() as usize;
+            prop_assert!(utf16_byte(&text(&clients[0]),offset).is_ok());
+            if end < at {prop_assert_eq!(offset,at-(end-start)+value.encode_utf16().count());}
+            if start > at {prop_assert_eq!(offset,at);}
+        }
+    }
+}
+
+#[test]
+fn presence_waits_for_its_edit_and_keeps_server_identity_exact() {
+    let mut server = Sequencer::new(DocxModel::from_paragraphs(&["x"]));
+    let mut clients = [join(&mut server), join(&mut server)];
+    let wire = clients[0].replace(0, 0, 0, "😀").unwrap();
+    let cursor = clients[0].capture_selection(0, 2, 0, 2).unwrap();
+    assert_eq!(clients[1].resolve_selection(&cursor).unwrap(), "null");
+    submit(&mut server, &mut clients, 0, &wire);
+    assert_eq!(
+        clients[1].resolve_selection(&cursor).unwrap(),
+        r#"{"anchor":[0,2],"focus":[0,2]}"#
+    );
+    assert_eq!(
+        clients[1]
+            .presence_id(r#"{"replica":9007199254740993}"#)
+            .unwrap(),
+        "9007199254740993"
+    );
+}

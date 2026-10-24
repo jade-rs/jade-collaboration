@@ -12,7 +12,7 @@ Check out `jade-office` next to this repository, with its
 `demos/collaboration` integration and both repositories' submodules initialized.
 The integration is available on jade-office's
 [`codex/collaboration-demo`](https://github.com/jade-rs/jade-office/tree/codex/collaboration-demo)
-branch (pinned to `0970d9c54ae6449b3c662601fb0347bb875c5657` in this repository's demo CI).
+branch (pinned to `77ea63ef14b82721f35df4d66b9e40ddedf88a6d` in this repository's demo CI).
 Install Rust stable **1.99 or newer**, its `wasm32-unknown-unknown` target,
 the pinned native Rust toolchain, Python 3, and **wasm-bindgen-cli 0.2.128**:
 
@@ -42,6 +42,7 @@ Supported environment overrides:
 
 | Variable | Purpose |
 | --- | --- |
+| `JADE_OFFICE_REVISION` | committed Office source ref (optional; an unintegrated local main falls back to `codex/collaboration-demo`) |
 | `JADE_OFFICE_DIR` | jade-office checkout (default `../jade-office`) |
 | `CARGO_TARGET_DIR` | build/output directory (default `target-office-demo`) |
 | `WASM_BINDGEN` | path to the 0.2.128 executable |
@@ -63,9 +64,16 @@ navigation, selections, editing, IME drafts and layout use
 `jade-web::editing::EditableDocument`. Drag or use Shift + arrows to select;
 copy/paste and selection deletion work in the page. Enter inserts a Word line
 break inside the paragraph, and paste supports line breaks and tabs.
-Cmd/Ctrl+A selects the current paragraph. It shows peer names and active paragraphs.
-The native GPUI ribbon, XLSX/PPTX editing, paragraph creation, formatting, table
-structure controls, collaborative undo and graphical remote carets are not
+Cmd/Ctrl+A selects the current paragraph. Each peer has a consistent color,
+a name-labelled caret and a highlighted text selection, including in table
+cells. Participant chips show whether they are editing, composing or unfocused;
+click one to scroll to their position. The final pointer/keyboard selection is
+shared even during rapid gestures. CRDT boundaries follow insertions/deletions
+without transmitting the paragraph’s character list. Peer geometry does not
+change the local caret or IME. Disconnecting removes its overlays and reconnecting
+republishes the retained position, without requiring a new edit.
+The full GPUI ribbon/workspace, XLSX/PPTX editing, paragraph creation,
+formatting, table structure controls and collaborative undo are not
 connected in this first demo. The collaboration engine's broader API is
 independent of these demo controls.
 
@@ -83,7 +91,7 @@ and exported DOCX retain those Unicode characters.
 
 ```sh
 cargo test --manifest-path demos/browser/Cargo.toml --locked
-node --test ../jade-office/demos/collaboration/editing.test.mjs
+node --test ../jade-office/demos/collaboration/editing.test.mjs ../jade-office/demos/collaboration/presence.test.mjs
 # While the demo host is running (Node >=22):
 node demos/browser/editor-e2e.mjs target-office-demo/office-demo/www
 node demos/browser/e2e.mjs target-office-demo/office-demo/www
@@ -113,3 +121,5 @@ of 100 insert/delete deliveries to check Unicode caret boundaries. Its runner is
 `demos/browser/package-lock.json` and runs in the demo CI.
 The underlying replica/CRDT remains the implementation checked by the existing
 Lean models; these adapter tests do not constitute a proof of DOM/IME behavior.
+
+Peer cursors use compact opaque JSON anchors so 64-bit character IDs survive JavaScript unchanged. The model resolves deleted neighbours against retained tombstones. Unknown anchors are hidden until their corresponding edit arrives. The adapter includes stateful random caret-resolution histories, exact large-ID checks and bounded-payload regression tests. Chromium also verifies peer ranges against the native Word rectangles, focus/blur, table-cell selection, cursor rebasing, local IME preservation, disconnect/resume and snapshots for a third reader.

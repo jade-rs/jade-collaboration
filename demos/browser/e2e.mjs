@@ -23,7 +23,7 @@ async function until(predicate) {
   throw new Error('Timed out waiting for convergence');
 }
 class Editor {
-  constructor(){this.ready=false;this.deferred=[];this.delay=false;this.errors=[];}
+  constructor(){this.ready=false;this.deferred=[];this.delay=false;this.errors=[];this.peers=new Map();}
   async connect(){
     this.socket = new WebSocket(url);
     this.socket.onopen=()=>this.socket.send(this.doc?this.doc.resume_message():'{"type":"join"}');
@@ -32,7 +32,9 @@ class Editor {
   }
   message(wire){
     const m=JSON.parse(wire);const before=this.doc?this.state().paragraphs:null;
-    if(['presence','presence_left','presence_rejected'].includes(m.type))return;
+    if(m.type==='presence'){this.peers.set(this.doc.presence_id(wire),m.state);return;}
+    if(m.type==='presence_left'){this.peers.delete(this.doc.presence_id(wire));return;}
+    if(m.type==='presence_rejected')throw new Error(m.reason);
     if(this.delay){this.deferred.push(wire);return;}
     if(m.type==='welcome'){this.doc=new BrowserDocument(wire);this.native=new OfficeEditor(new Uint8Array(seed),fonts);projectDocument(this.native,this.state().paragraphs,this.state().paragraphs);this.ready=true;}
     else if(m.type==='resumed'){
@@ -64,8 +66,17 @@ try {
   const text=a.state().paragraphs[1].text;
   assert.ok(text.includes('ALICE😀 ')&&text.includes('BOBあ '));
   assert.deepEqual(a.state().paragraphs,b.state().paragraphs);
+  const aid=a.state().replica;
+  const seq=a.state().seq;
+  a.socket.send(JSON.stringify({type:'presence',state:{name:'Alice',focused:true,selection:JSON.parse(a.doc.capture_selection(1,0,1,2))}}));
+  await until(()=>b.peers.has(aid));
+  const peerRange=JSON.parse(b.doc.resolve_selection(JSON.stringify(b.peers.get(aid).selection)));
+  assert.deepEqual(peerRange,{anchor:[1,0],focus:[1,2]});
+  const beforeMeasure=b.native.state();
+  assert.ok(JSON.parse(b.native.selection_geometry(...peerRange.anchor,...peerRange.focus)).highlights.length);
+  assert.equal(b.native.state(),beforeMeasure);assert.equal(a.state().seq,seq);
   // Offline optimistic typing and a concurrent edit from the connected peer.
-  await a.close();a.edit(2,0,0,'OFFLINE復帰 ');b.edit(2,0,0,'ONLINE ');
+  await a.close();await until(()=>!b.peers.has(aid));a.edit(2,0,0,'OFFLINE復帰 ');b.edit(2,0,0,'ONLINE ');
   await until(()=>!b.state().pending);
   await a.connect();
   await until(()=>!a.state().pending&&!b.state().pending&&a.state().seq===b.state().seq);
@@ -92,5 +103,5 @@ try {
   const reopenedEditor=new OfficeEditor(archive,fonts);
   assert.deepEqual(JSON.parse(reopenedEditor.state()).paragraphs,a.state().paragraphs.map(p=>p.text));reopenedEditor.free();
   assert.deepEqual(a.errors,[]);assert.deepEqual(b.errors,[]);
-  console.log(JSON.stringify({status:'passed',document:name,seq:a.state().seq,checks:['concurrent_unicode','offline_resume','same_table_cell','native_docx_export','native_export_reopen','native_canvas_model_projection','remote_caret_rebase','word_line_break_and_tab']},null,2));
+  console.log(JSON.stringify({status:'passed',document:name,seq:a.state().seq,checks:['concurrent_unicode','offline_resume','same_table_cell','native_docx_export','native_export_reopen','native_canvas_model_projection','remote_caret_rebase','word_line_break_and_tab','peer_selection_transport_and_geometry','presence_left_without_document_edit']},null,2));
 }finally{if(a.socket?.readyState===WebSocket.OPEN)await a.close();if(b.socket?.readyState===WebSocket.OPEN)await b.close();a.doc?.free();b.doc?.free();a.native?.free();b.native?.free();fonts.free();}

@@ -11,6 +11,14 @@ const bytes = new Uint8Array(await fetch(`${origin}/documents/demo.docx`).then(r
 const doc = new office.OfficeEditor(bytes,fonts);
 try {
   const initial = JSON.parse(doc.state());
+  assert.equal(typeof doc.selection_geometry,'function','Peer geometry must not move the local editor');
+  const checkGeometry=()=>{
+    const before=doc.state();
+    const geometry=JSON.parse(doc.selection_geometry(1,0,1,2));
+    assert.ok(geometry.caret.height>0);assert.ok(geometry.highlights.length>0);
+    assert.equal(doc.state(),before,'measuring a peer must preserve local selection, caret and IME');
+  };
+  checkGeometry();
   assert.ok(initial.paragraphs.length>=8, 'body and real table paragraphs are editable');
   doc.select(1,0,1,0);doc.insert('直接😀編集');
   let state=JSON.parse(doc.state());
@@ -24,7 +32,7 @@ try {
   assert.ok(JSON.parse(doc.state()).paragraphs[1].startsWith('直接あ編集'));
   assert.throws(()=>doc.select(1,99999,1,99999));
   doc.select(1,0,1,0);doc.compose('に');doc.compose('日本語😀');
-  state=JSON.parse(doc.state());assert.ok(state.composing);
+  state=JSON.parse(doc.state());assert.ok(state.composing);checkGeometry();
   doc.commit('日本語😀');state=JSON.parse(doc.state());
   assert.ok(state.paragraphs[1].startsWith('日本語😀直接あ編集'));
   assert.equal(state.composing,false);
@@ -32,5 +40,5 @@ try {
   const pixels=doc.render_page(0);
   assert.equal(pixels.length,doc.width()*doc.height()*4);
   assert.ok(doc.width()>600);
-  console.log(JSON.stringify({status:'passed',checks:['actual_word_editing','utf16_selection','page_hit_test','range_replacement','ime_commit','render_after_edit']}));
+  console.log(JSON.stringify({status:'passed',checks:['actual_word_editing','utf16_selection','page_hit_test','range_replacement','ime_commit','render_after_edit','peer_geometry_preserves_local_selection_and_ime']}));
 } finally {doc.free();fonts.free();}

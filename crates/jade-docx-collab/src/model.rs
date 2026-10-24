@@ -15,6 +15,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+mod cursor;
+pub use cursor::TextCursor;
 mod positions;
 #[cfg(test)]
 mod table_walk_tests;

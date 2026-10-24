@@ -112,6 +112,56 @@ impl BrowserDocument {
         json!({"type":"resume", "replica":self.replica.id(), "seq":self.replica.seq()}).to_string()
     }
 
+    /// Compact raw-JSON anchors remain strings through JavaScript, preserving
+    /// all u64 IDs. Presence is ephemeral and never consumes edit tickets.
+    pub fn capture_selection(
+        &self,
+        ap: usize,
+        au: usize,
+        fp: usize,
+        fu: usize,
+    ) -> Result<String, String> {
+        let view = self.replica.view();
+        let paragraphs = view.paragraphs();
+        let capture = |p: usize, units: usize| -> Result<String, String> {
+            let text = &paragraphs.get(p).ok_or("Missing paragraph")?.text;
+            let cursor = view
+                .text_cursor(p, utf16_byte(text, units)?)
+                .ok_or("Invalid cursor")?;
+            serde_json::to_string(&cursor).map_err(|e| e.to_string())
+        };
+        Ok(json!({"anchor":capture(ap,au)?,"focus":capture(fp,fu)?}).to_string())
+    }
+
+    pub fn presence_id(&self, wire: &str) -> Result<String, String> {
+        let value: Value = serde_json::from_str(wire).map_err(|e| e.to_string())?;
+        value["replica"]
+            .as_u64()
+            .map(|id| id.to_string())
+            .ok_or("Missing presence identity".into())
+    }
+
+    pub fn resolve_selection(&self, wire: &str) -> Result<String, String> {
+        if wire.len() > 8192 {
+            return Err("Presence selection is too large".into());
+        }
+        let selection: Value = serde_json::from_str(wire).map_err(|e| e.to_string())?;
+        let view = self.replica.view();
+        let paragraphs = view.paragraphs();
+        let resolve = |key: &str| -> Result<Option<(usize, usize)>, String> {
+            let cursor = serde_json::from_str(selection[key].as_str().ok_or("Missing cursor")?)
+                .map_err(|e| e.to_string())?;
+            Ok(view
+                .resolve_text_cursor(&cursor)
+                .map(|(p, byte)| (p, paragraphs[p].text[..byte].encode_utf16().count())))
+        };
+        Ok(match (resolve("anchor")?, resolve("focus")?) {
+            (Some(a), Some(f)) => json!({"anchor":a,"focus":f}),
+            _ => Value::Null,
+        }
+        .to_string())
+    }
+
     pub fn pending(&self) -> Result<String, String> {
         let messages: Vec<_> = self
             .replica

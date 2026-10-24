@@ -21,8 +21,14 @@ fi
 mkdir -p "$www/collab-pkg" "$www/office-pkg" "$www/fonts"
 # Build the committed office/engine sources in an isolated generated tree.
 # This also lets the demo run next to an unrelated, unfinished Office edit.
-office_revision="$(git -C "$office" rev-parse HEAD)"
-core_revision="$(git -C "$office" rev-parse HEAD:jade-core)"
+office_ref="${JADE_OFFICE_REVISION:-HEAD}"
+# The local Office checkout may contain unrelated work on main, with only
+# this demo copied in. Its committed integration branch supplies the engine API.
+if test -z "${JADE_OFFICE_REVISION:-}" && ! git -C "$office" cat-file -e "$office_ref:demos/collaboration/renderer/Cargo.toml" 2>/dev/null; then
+  office_ref="codex/collaboration-demo"
+fi
+office_revision="$(git -C "$office" rev-parse "$office_ref")"
+core_revision="$(git -C "$office" rev-parse "$office_revision:jade-core")"
 source="$demo/sources/$office_revision-$core_revision"
 if ! test -f "$source/.demo-source-complete"; then
   mkdir -p "$source/jade-core"
@@ -37,7 +43,7 @@ cargo "+$toolchain" build --manifest-path "$root/demos/browser/Cargo.toml" --loc
 "$bindgen" "$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/jade_collab_browser.wasm" --target web --out-dir "$www/collab-pkg" --no-typescript
 cargo "+$toolchain" build --manifest-path "$source/demos/collaboration/renderer/Cargo.toml" --locked --release --target wasm32-unknown-unknown
 "$bindgen" "$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/jade_office_collab_preview.wasm" --target web --out-dir "$www/office-pkg" --no-typescript
-cp "$office/demos/collaboration/"{index.html,app.js,editing.mjs,canvas-editor.mjs,browser-tests.html,browser-tests.js} "$www/"
+cp "$office/demos/collaboration/"{index.html,app.js,editing.mjs,canvas-editor.mjs,presence.mjs,browser-tests.html,browser-tests.js} "$www/"
 cp "$source/jade-core/fonts/Noto_Sans_JP/static/"{NotoSansJP-Regular.ttf,NotoSansJP-Bold.ttf} "$www/fonts/"
 python3 "$root/demos/make-office-demo.py" "$demo/seed.docx"
 cargo build --manifest-path "$root/Cargo.toml" --locked --release -p jade-collab-server --example office_demo

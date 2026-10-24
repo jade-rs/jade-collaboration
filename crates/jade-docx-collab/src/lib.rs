@@ -27,6 +27,7 @@ pub use load::LoadError;
 pub use model::{
     Anchor, AnchorView, Atom, CommentContent, CommentView, DocxEffect, DocxModel, DocxOp,
     FormatChange, MarkKey, NoteKind, Numbered, Paragraph, ParagraphAlignment, ParagraphStory,
-    Placement, Revision, RevisionKind, RevisionView, StoryId, TableView, TextFormat, Tracked,
+    Placement, Revision, RevisionKind, RevisionView, StoryId, TableView, TextCursor, TextFormat,
+    Tracked,
 };
 pub use table_budget::{TableBudgetExceeded, MAX_TABLE_CELLS_PER_OPERATION};
