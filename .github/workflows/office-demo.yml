@@ -33,7 +33,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: jade-rs/jade-office
-          ref: 894e822f78e5580a6045d3811b08f248abdec0d7
+          ref: 0970d9c54ae6449b3c662601fb0347bb875c5657
           path: jade-office
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable

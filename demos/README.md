@@ -12,7 +12,7 @@ Check out `jade-office` next to this repository, with its
 `demos/collaboration` integration and both repositories' submodules initialized.
 The integration is available on jade-office's
 [`codex/collaboration-demo`](https://github.com/jade-rs/jade-office/tree/codex/collaboration-demo)
-branch (pinned to `894e822f78e5580a6045d3811b08f248abdec0d7` in this repository's demo CI).
+branch (pinned to `0970d9c54ae6449b3c662601fb0347bb875c5657` in this repository's demo CI).
 Install Rust stable **1.99 or newer**, its `wasm32-unknown-unknown` target,
 the pinned native Rust toolchain, Python 3, and **wasm-bindgen-cli 0.2.128**:
 
@@ -106,7 +106,7 @@ The browser regression opens `/browser-tests.html`, creates another separate
 document and drives two actual editor frames. It verifies composition text and
 caret retention during disconnect, queued peer commits followed by resume, and
 both final-input/compositionend event orders and cancellation over selected
-text. A separate Chromium test clicks the page, types through keyboard input,
+text, plus input focus while composition adds/removes native pages. A separate Chromium test clicks the page, types through keyboard input,
 replaces/deletes selections, edits the same table cell, inserts line breaks
 and resumes offline typing. The selection tests include 128 seeded histories
 of 100 insert/delete deliveries to check Unicode caret boundaries. Its runner is pinned in

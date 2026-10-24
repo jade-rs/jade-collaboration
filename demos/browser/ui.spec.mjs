@@ -76,6 +76,6 @@ test('canvas editors preserve an IME composition through peer edits and reconnec
   await expect(page.locator('#result')).toHaveAttribute('data-status',/passed|failed/,{timeout:70_000});
   const result=await page.locator('#result').textContent();
   expect(result).toContain('"status": "passed"');expect(result).toContain('canvas-editor-without-textarea');
-  expect(result).toContain('cancel-selected-composition');
+  expect(result).toContain('cancel-selected-composition');expect(result).toContain('ime-focus-survives-repagination');
   expect(result).toContain('final-input-before-compositionend');expect(result).toContain('final-input-after-compositionend');expect(errors).toEqual([]);
 });
