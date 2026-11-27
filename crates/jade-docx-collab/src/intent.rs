@@ -829,7 +829,21 @@ pub fn try_resolve_with(
     context: &Context,
     ids: &mut dyn FnMut(u64) -> Result<Id, IdError>,
 ) -> Result<Vec<DocxOp>, IntentError> {
-    let paragraphs = view.paragraphs();
+    let projected = std::cell::OnceCell::new();
+    let paragraphs = || projected.get_or_init(|| view.paragraphs()).as_slice();
+    let insertion = |paragraph, offset, after_leading_anchors| -> Result<_, IntentError> {
+        if let Some(target) =
+            view.indexed_insertion_parent(paragraph, offset, after_leading_anchors)
+        {
+            return Ok(target);
+        }
+        let at = caret(paragraphs(), paragraph, offset)?;
+        Ok(if after_leading_anchors {
+            (at.story, at.typing)
+        } else {
+            (at.story, at.parent)
+        })
+    };
     // Typing: a tracked insertion when the document tracks changes.
     let typing = |story: StoryId, parent: Option<Id>, first: Id, text: &str| {
         if view.tracking() {
@@ -855,13 +869,13 @@ pub fn try_resolve_with(
             offset,
             text,
         } => {
-            let at = caret(&paragraphs, *paragraph, *offset)?;
+            let (story, parent) = insertion(*paragraph, *offset, true)?;
             if text.is_empty() {
                 return Ok(Vec::new());
             }
             Ok(vec![typing(
-                at.story,
-                at.typing,
+                story,
+                parent,
                 ids(text.chars().count() as u64)?,
                 text,
             )])
@@ -871,16 +885,11 @@ pub fn try_resolve_with(
             offset,
             count,
         } => {
-            let at = caret(&paragraphs, *paragraph, *offset)?;
-            let mut parent = at.parent;
+            let (story, mut parent) = insertion(*paragraph, *offset, false)?;
             (0..*count)
                 .map(|_| {
                     let id = ids(1)?;
-                    let op = DocxOp::SplitParagraph {
-                        story: at.story,
-                        parent,
-                        id,
-                    };
+                    let op = DocxOp::SplitParagraph { story, parent, id };
                     parent = Some(id);
                     Ok(op)
                 })
@@ -892,8 +901,8 @@ pub fn try_resolve_with(
             direction,
             count,
         } => {
-            let at = caret(&paragraphs, *paragraph, *offset)?;
-            let atoms = story_atoms(&paragraphs, at.story);
+            let at = caret(paragraphs(), *paragraph, *offset)?;
+            let atoms = story_atoms(paragraphs(), at.story);
             let range = match direction {
                 HeadlessDeleteDirection::Forward => {
                     at.index..at.index.saturating_add(*count).min(atoms.len())
@@ -909,15 +918,15 @@ pub fn try_resolve_with(
             end_offset,
             text,
         } => {
-            let start = caret(&paragraphs, *start_paragraph, *start_offset)?;
-            let end = caret(&paragraphs, *end_paragraph, *end_offset)?;
+            let start = caret(paragraphs(), *start_paragraph, *start_offset)?;
+            let end = caret(paragraphs(), *end_paragraph, *end_offset)?;
             if start.story != end.story {
                 return Err(IntentError::CrossStory);
             }
             if start.index > end.index {
                 return Err(IntentError::InvertedRange);
             }
-            let atoms = story_atoms(&paragraphs, start.story);
+            let atoms = story_atoms(paragraphs(), start.story);
             let mut ops = deletion(
                 view,
                 start.story,
@@ -943,8 +952,8 @@ pub fn try_resolve_with(
             change,
         } => {
             change.validate().map_err(IntentError::InvalidFormat)?;
-            caret(&paragraphs, *start_paragraph, *start_offset)?;
-            caret(&paragraphs, *end_paragraph, *end_offset)?;
+            caret(paragraphs(), *start_paragraph, *start_offset)?;
+            caret(paragraphs(), *end_paragraph, *end_offset)?;
             if (*start_paragraph, *start_offset) > (*end_paragraph, *end_offset) {
                 return Err(IntentError::InvertedRange);
             }
@@ -952,7 +961,7 @@ pub fn try_resolve_with(
             // mark when the range runs past it.
             let slices: Vec<(StoryId, &[Id], Option<Id>)> = (*start_paragraph..=*end_paragraph)
                 .map(|n| {
-                    let p = &paragraphs[n];
+                    let p = &paragraphs()[n];
                     let from = if n == *start_paragraph {
                         chars_before(p, *start_offset)
                     } else {
@@ -1013,7 +1022,7 @@ pub fn try_resolve_with(
         } => {
             change.validate().map_err(IntentError::InvalidFormat)?;
             for n in [*start_paragraph, *end_paragraph] {
-                if n >= paragraphs.len() {
+                if n >= paragraphs().len() {
                     return Err(IntentError::NoSuchParagraph(n));
                 }
             }
@@ -1021,7 +1030,7 @@ pub fn try_resolve_with(
                 return Err(IntentError::InvertedRange);
             }
             let mut slices = Vec::new();
-            for (n, p) in paragraphs
+            for (n, p) in paragraphs()
                 .iter()
                 .enumerate()
                 .take(end_paragraph + 1)
@@ -1054,21 +1063,21 @@ pub fn try_resolve_with(
         } => {
             let end_offset = match end_offset {
                 Some(offset) => *offset,
-                None => paragraphs
+                None => paragraphs()
                     .get(*end_paragraph)
                     .ok_or(IntentError::NoSuchParagraph(*end_paragraph))?
                     .text
                     .len(),
             };
-            let start = caret(&paragraphs, *start_paragraph, start_offset.unwrap_or(0))?;
-            let end = caret(&paragraphs, *end_paragraph, end_offset)?;
+            let start = caret(paragraphs(), *start_paragraph, start_offset.unwrap_or(0))?;
+            let end = caret(paragraphs(), *end_paragraph, end_offset)?;
             if start.story != end.story {
                 return Err(IntentError::CrossStory);
             }
             if start.index > end.index {
                 return Err(IntentError::InvertedRange);
             }
-            let chars: Vec<Id> = story_atoms(&paragraphs, start.story)[start.index..end.index]
+            let chars: Vec<Id> = story_atoms(paragraphs(), start.story)[start.index..end.index]
                 .iter()
                 .filter_map(|a| a.ok())
                 .collect();
@@ -1128,7 +1137,7 @@ pub fn try_resolve_with(
             offset,
             text,
         } => {
-            let at = caret(&paragraphs, *paragraph, *offset)?;
+            let at = caret(paragraphs(), *paragraph, *offset)?;
             let kind = match op {
                 IntentOp::InsertFootnote { .. } => NoteKind::Footnote,
                 _ => NoteKind::Endnote,
@@ -1165,7 +1174,7 @@ pub fn try_resolve_with(
             width_px,
             height_px,
         } => {
-            let at = caret(&paragraphs, *paragraph, *offset)?;
+            let at = caret(paragraphs(), *paragraph, *offset)?;
             Ok(vec![DocxOp::InsertTextBox {
                 story: at.story,
                 parent: at.parent,
@@ -1183,7 +1192,7 @@ pub fn try_resolve_with(
                 paragraph: *paragraph,
                 text_box: *text_box,
             };
-            let p = paragraphs.get(*paragraph).ok_or(missing.clone())?;
+            let p = paragraphs().get(*paragraph).ok_or(missing.clone())?;
             let id = p
                 .anchors
                 .iter()

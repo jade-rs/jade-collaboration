@@ -89,6 +89,35 @@ impl Positions {
             .as_ref()
             .map(|index| index.paragraphs[ordinal].at.clone())
     }
+
+    /// Resolves a valid UTF-8 boundary in the warm insertion index.
+    pub(super) fn insertion_parent(
+        &self,
+        ordinal: usize,
+        offset: usize,
+        after_leading_anchors: bool,
+    ) -> Option<(StoryId, Option<Id>)> {
+        let cache = self.0.lock().unwrap();
+        let index = cache.index.as_ref()?;
+        let paragraph = index.paragraphs.get(ordinal)?;
+        let parent = if offset == 0 {
+            let anchor = after_leading_anchors
+                .then(|| {
+                    paragraph.ids.iter().rev().copied().find(|id| {
+                        let entry = &index.atoms[id];
+                        matches!(entry.kind, Kind::Anchor) && entry.at.offset == 0
+                    })
+                })
+                .flatten();
+            anchor.or(paragraph.previous_mark)
+        } else {
+            Some(paragraph.ids.iter().rev().copied().find(|id| {
+                let entry = &index.atoms[id];
+                matches!(entry.kind, Kind::Character) && entry.at.offset + entry.at.len == offset
+            })?)
+        };
+        Some((paragraph.story, parent))
+    }
 }
 #[derive(Clone, Copy)]
 enum Kind {
@@ -102,7 +131,9 @@ struct Entry {
 }
 struct IndexedParagraph {
     at: ParagraphStory,
+    story: StoryId,
     ids: Vec<Id>,
+    previous_mark: Option<Id>,
     next: Option<usize>,
 }
 pub(super) struct Index {
@@ -120,9 +151,12 @@ impl Index {
         let mut last = BTreeMap::new();
         for (ordinal, paragraph) in paragraphs.into_iter().enumerate() {
             index.first.entry(paragraph.story).or_insert(ordinal);
-            if let Some(previous) = last.insert(paragraph.story, ordinal) {
-                index.paragraphs[previous].next = Some(ordinal);
-            }
+            let previous_mark = last
+                .insert(paragraph.story, (ordinal, paragraph.mark))
+                .and_then(|(previous, mark)| {
+                    index.paragraphs[previous].next = Some(ordinal);
+                    mark
+                });
             let mut ids = Vec::new();
             let mut anchors = 0;
             for ((offset, ch), id) in paragraph.text.char_indices().zip(paragraph.chars) {
@@ -198,7 +232,9 @@ impl Index {
             }
             index.paragraphs.push(IndexedParagraph {
                 at: paragraph.at,
+                story: paragraph.story,
                 ids,
+                previous_mark,
                 next: None,
             });
         }

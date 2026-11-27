@@ -1457,6 +1457,16 @@ impl DocxModel {
         self.walk().paragraphs
     }
 
+    pub(crate) fn indexed_insertion_parent(
+        &self,
+        paragraph: usize,
+        offset: usize,
+        after_leading_anchors: bool,
+    ) -> Option<(StoryId, Option<Id>)> {
+        self.positions
+            .insertion_parent(paragraph, offset, after_leading_anchors)
+    }
+
     pub fn paragraph_texts(&self) -> Vec<String> {
         self.paragraphs().into_iter().map(|p| p.text).collect()
     }
