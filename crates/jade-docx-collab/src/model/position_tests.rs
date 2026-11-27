@@ -80,6 +80,73 @@ fn ordinary_typing_reuses_positions_instead_of_rewalking_unrelated_paragraphs() 
     }
 }
 
+#[test]
+fn warm_typing_and_split_intents_preserve_caret_resolution_across_stories() {
+    use crate::intent::{resolve, IntentOp};
+
+    let mut model = DocxModel::from_paragraphs(&["é文字", "tail", ""]);
+    let ctx = context();
+    for id in [100, 200] {
+        model
+            .apply(
+                &DocxOp::InsertTextBox {
+                    story: StoryId::Body,
+                    parent: None,
+                    id: Id::new(id, ReplicaId(1)),
+                    text: format!("box {id}"),
+                    width_px: 100,
+                    height_px: 60,
+                },
+                &ctx,
+            )
+            .unwrap();
+    }
+    model
+        .apply(
+            &DocxOp::InsertText {
+                story: StoryId::Body,
+                parent: Some(Id::new(1, ReplicaId::ORIGIN)),
+                first: Id::new(300, ReplicaId(1)),
+                text: "🙂".into(),
+            },
+            &ctx,
+        )
+        .unwrap();
+    let cold = model.clone();
+    for (paragraph, projected) in model.paragraphs().iter().enumerate() {
+        for offset in 0..=projected.text.len() {
+            for op in [
+                IntentOp::InsertText {
+                    paragraph,
+                    offset,
+                    text: "字".into(),
+                },
+                IntentOp::InsertParagraphBreak {
+                    paragraph,
+                    offset,
+                    count: 2,
+                },
+            ] {
+                let run = |view: &DocxModel| {
+                    let mut next = 400;
+                    resolve(view, &op, &mut |n| {
+                        let id = Id::new(next, ReplicaId(1));
+                        next += n;
+                        id
+                    })
+                };
+                let expected = run(&cold);
+                reset();
+                let actual = run(&model);
+                assert_eq!(actual, expected, "{op:?}");
+                if projected.text.is_char_boundary(offset) {
+                    assert_eq!(walks(), 0, "{op:?}");
+                }
+            }
+        }
+    }
+}
+
 #[path = "../../tests/common/mod.rs"]
 mod common;
 use proptest::prelude::*;
